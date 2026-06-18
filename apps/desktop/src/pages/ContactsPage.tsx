@@ -1,0 +1,50 @@
+import { Mail, MessageSquareText, Phone, Plus, Search, Star, UserPlus } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { Avatar, Modal } from '../components/ui'
+import { api } from '../lib/api'
+import { useApp } from '../state/AppContext'
+import type { Contact } from '../types'
+
+export function ContactsPage(): React.JSX.Element {
+  const navigate = useNavigate()
+  const { startDirectCall } = useApp()
+  const [contacts, setContacts] = useState<Contact[]>([])
+  const [search, setSearch] = useState('')
+  const [addOpen, setAddOpen] = useState(false)
+  const [email, setEmail] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [callingId, setCallingId] = useState<string | null>(null)
+  const load = () => void api.contacts().then((result) => setContacts(result.contacts))
+  useEffect(load, [])
+  const filtered = useMemo(() => contacts.filter((contact) => `${contact.displayName} ${contact.email}`.toLowerCase().includes(search.toLowerCase())), [contacts, search])
+
+  const add = async (): Promise<void> => {
+    setError(null)
+    try { await api.addContact(email); setEmail(''); setAddOpen(false); load() }
+    catch (reason) { setError(reason instanceof Error ? reason.message : 'Ошибка') }
+  }
+  const chat = async (contact: Contact): Promise<void> => {
+    await api.createConversation([contact.id])
+    navigate('/chat')
+  }
+  const toggleFavorite = async (contact: Contact): Promise<void> => {
+    const favorite = !contact.favorite
+    setContacts((current) => current.map((item) => item.id === contact.id ? { ...item, favorite } : item))
+    try {
+      await api.setContactFavorite(contact.id, favorite)
+    } catch {
+      setContacts((current) => current.map((item) => item.id === contact.id ? contact : item))
+    }
+  }
+  const call = async (contact: Contact): Promise<void> => {
+    setCallingId(contact.id)
+    try {
+      await startDirectCall(contact)
+    } finally {
+      setCallingId(null)
+    }
+  }
+
+  return <div className="page"><header className="page-header"><div><p className="eyebrow">Адресная книга</p><h1>Контакты</h1><span>Коллеги и участники ваших встреч.</span></div><button className="button primary" onClick={() => setAddOpen(true)}><UserPlus size={18} />Добавить контакт</button></header><div className="toolbar"><div className="search-box wide"><Search size={17} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Имя или email" /></div><span className="result-count">{filtered.length} контакта</span></div><section className="contact-grid">{filtered.map((contact) => <article className="contact-card" key={contact.id}><button className={`favorite ${contact.favorite ? 'active' : ''}`} onClick={() => void toggleFavorite(contact)} title={contact.favorite ? 'Убрать из избранного' : 'Добавить в избранное'} aria-label={contact.favorite ? 'Убрать из избранного' : 'Добавить в избранное'} aria-pressed={contact.favorite}><Star size={17} fill={contact.favorite ? 'currentColor' : 'none'} /></button><Avatar name={contact.displayName} src={contact.avatarUrl} status={contact.status} size="large" /><h3>{contact.alias || contact.displayName}</h3><p><Mail size={14} />{contact.email}</p><span className={`presence-label presence-text-${contact.status}`}>{contact.status === 'online' ? 'В сети' : contact.status === 'busy' ? 'Не беспокоить' : contact.status === 'away' ? 'Отошел' : 'Не в сети'}</span><footer><button className="button secondary small" onClick={() => void chat(contact)}><MessageSquareText size={16} />Сообщение</button><button className="icon-button call-button" onClick={() => void call(contact)} disabled={callingId === contact.id} title={`Позвонить: ${contact.displayName}`} aria-label={`Позвонить: ${contact.displayName}`}><Phone size={18} /></button></footer></article>)}</section><Modal open={addOpen} onClose={() => setAddOpen(false)} title="Добавить контакт"><div className="form-stack"><label><span>Email пользователя</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="name@company.com" autoFocus /></label>{error && <p className="form-error">Пользователь с таким email пока не зарегистрирован.</p>}<footer className="modal-actions"><button className="button secondary" onClick={() => setAddOpen(false)}>Отмена</button><button className="button primary" onClick={() => void add()} disabled={!email}><Plus size={17} />Добавить</button></footer></div></Modal></div>
+}

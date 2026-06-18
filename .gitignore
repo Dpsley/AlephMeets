@@ -1,0 +1,11 @@
+node_modules/
+dist/
+out/
+release/
+.env
+*.log
+coverage/
+uploads/*
+!uploads/.gitkeep
+.DS_Store
+Thumbs.db

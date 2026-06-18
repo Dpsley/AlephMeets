@@ -1,0 +1,74 @@
+{
+  "name": "@aleph/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AlephMeets desktop client",
+  "author": "Dmitry Dudarev",
+  "type": "module",
+  "main": "out/main/main.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "icons": "node scripts/generate-icons.mjs",
+    "build": "npm run icons && electron-vite build && electron-builder --dir",
+    "dist:win": "npm run icons && electron-vite build && electron-builder --win nsis",
+    "dist:mac": "npm run icons && electron-vite build && electron-builder --mac dmg zip",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@livekit/components-react": "^2.9.17",
+    "@livekit/components-styles": "^1.1.6",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
+    "livekit-client": "^2.15.7",
+    "lucide-react": "^0.554.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-router-dom": "^7.9.6",
+    "socket.io-client": "^4.8.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "electron": "39.8.10",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^4.0.1",
+    "png-to-ico": "^3.0.1",
+    "sharp": "^0.34.5",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.2",
+    "vitest": "^4.0.13"
+  },
+  "build": {
+    "appId": "com.alephmeets.desktop",
+    "productName": "AlephMeets",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "icon": "build/icon.png",
+      "category": "public.app-category.productivity",
+      "target": ["dmg", "zip"],
+      "hardenedRuntime": true,
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "extendInfo": {
+        "NSCameraUsageDescription": "AlephMeets uses the camera for video meetings.",
+        "NSMicrophoneUsageDescription": "AlephMeets uses the microphone for meetings and voice messages.",
+        "NSScreenCaptureDescription": "AlephMeets uses screen capture when you share your screen."
+      }
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

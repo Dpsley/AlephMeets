@@ -1,0 +1,86 @@
+export interface User {
+  id: string
+  phone?: string
+  email: string
+  displayName: string
+  firstName?: string
+  lastName?: string
+  avatarUrl: string | null
+  timezone: string
+  locale: string
+  status: 'online' | 'away' | 'busy' | 'offline'
+}
+
+export interface Attendee {
+  email: string
+  userId?: string
+  response: 'invited' | 'accepted' | 'declined' | 'tentative'
+}
+
+export interface Meeting {
+  id: string
+  hostId: string
+  title: string
+  description: string
+  roomName: string
+  startsAt: string
+  endsAt: string
+  timezone: string
+  status: 'scheduled' | 'live' | 'ended' | 'cancelled'
+  waitingRoom: boolean
+  muteOnEntry: boolean
+  allowJoinBeforeHost: boolean
+  attendees: Attendee[]
+}
+
+export interface Contact extends User {
+  alias?: string
+  favorite: boolean
+}
+
+export interface Attachment {
+  id: string
+  originalName: string
+  mimeType: string
+  byteSize: number
+  durationMs?: number
+  url: string
+}
+
+export interface Message {
+  id: string
+  conversationId: string
+  senderId: string
+  senderName: string
+  senderAvatarUrl: string | null
+  kind: 'text' | 'file' | 'audio' | 'system'
+  body?: string
+  createdAt: string
+  attachments: Attachment[]
+}
+
+export interface Conversation {
+  id: string
+  kind: 'direct' | 'group' | 'meeting'
+  title: string
+  avatarUrl: string | null
+  updatedAt: string
+  members: Array<User & { role?: 'owner' | 'admin' | 'member' }>
+  currentUserRole: 'owner' | 'admin' | 'member'
+  lastMessage: Pick<Message, 'id' | 'body' | 'kind' | 'createdAt' | 'senderId'> | null
+  unreadCount: number
+}
+
+export interface ExchangeSettings {
+  id?: string
+  serverUrl: string
+  email: string
+  username: string
+  domain: string
+  authMethod: 'basic' | 'ntlm'
+  verifyTls: boolean
+  syncEnabled?: boolean
+  lastSyncedAt?: string | null
+  lastSyncError?: string | null
+  password?: string
+}
