@@ -2,6 +2,7 @@ import { ArrowLeft, LockKeyhole, MessageSquareText, MonitorUp, Phone } from 'luc
 import { useState } from 'react'
 import { useApp } from '../state/AppContext'
 import { BrandMark } from '../components/BrandMark'
+import { WindowControls } from '../components/WindowControls'
 
 export function LoginPage(): React.JSX.Element {
   const { loading, error: sessionError, requestLoginCode, verifyLoginCode } = useApp()
@@ -40,7 +41,7 @@ export function LoginPage(): React.JSX.Element {
 
   return (
     <div className="auth-page">
-      <header><BrandMark /><strong>AlephMeets</strong></header>
+      <header><BrandMark /><strong>AlephMeets</strong><WindowControls /></header>
       <main className="auth-card">
         <span className="auth-icon">{step === 'phone' ? <Phone /> : <MessageSquareText />}</span>
         <p className="eyebrow">Aleph ID</p>

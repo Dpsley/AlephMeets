@@ -21,6 +21,7 @@ import { api } from '../lib/api'
 import { mediaErrorMessage, type MediaKind } from '../lib/media'
 import { useApp } from '../state/AppContext'
 import { BrandMark } from '../components/BrandMark'
+import { WindowControls } from '../components/WindowControls'
 
 type DeviceState = 'checking' | 'available' | 'unavailable'
 
@@ -82,11 +83,6 @@ export function MeetingPage(): React.JSX.Element {
     isHost: boolean
   } | null>(null)
   const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    window.alephDesktop?.setTitlebarTheme(joined ? 'dark' : 'light')
-    return () => window.alephDesktop?.setTitlebarTheme('light')
-  }, [joined])
 
   const addDeviceNotice = useCallback((message: string): void => {
     setDeviceNotices((current) => current.includes(message) ? current : [...current, message])
@@ -187,6 +183,7 @@ export function MeetingPage(): React.JSX.Element {
         <div className="meeting-topbar">
           <div><BrandMark small /><strong>{meeting.title}</strong></div>
           <div><ShieldCheck size={15} />Защищенное соединение</div>
+          <WindowControls theme="dark" />
         </div>
         <LiveKitRoom
           token={connection.token}
@@ -224,6 +221,7 @@ export function MeetingPage(): React.JSX.Element {
         <button className="icon-button" onClick={() => navigate(-1)}><ArrowLeft /></button>
         <div className="brand"><BrandMark /><strong>AlephMeets</strong></div>
         <button className="button ghost small"><Settings size={17} />Настройки</button>
+        <WindowControls />
       </header>
       <main className="prejoin-content">
         <section className="preview-card">

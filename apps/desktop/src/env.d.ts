@@ -7,7 +7,8 @@ interface Window {
     maximize: () => void
     close: () => void
     openNewWindow: () => void
-    setTitlebarTheme: (theme: 'light' | 'dark') => void
+    isMaximized: () => Promise<boolean>
+    onMaximizedChanged: (listener: (maximized: boolean) => void) => () => void
     getVersion: () => Promise<string>
     getAuthTokens: () => Promise<string | null>
     setAuthTokens: (value: string) => Promise<void>

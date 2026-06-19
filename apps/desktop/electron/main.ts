@@ -50,11 +50,8 @@ function createWindow(authSlot = 'primary'): BrowserWindow {
     title: 'AlephMeets',
     backgroundColor: '#f7f8fa',
     icon: app.isPackaged ? undefined : join(__dirname, '../../build/icon.ico'),
+    frame: process.platform !== 'win32',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
-    titleBarOverlay:
-      process.platform === 'win32'
-        ? { color: '#ffffff', symbolColor: '#555b66', height: 42 }
-        : undefined,
     webPreferences: {
       preload: join(__dirname, '../preload/preload.mjs'),
       contextIsolation: true,
@@ -68,6 +65,8 @@ function createWindow(authSlot = 'primary'): BrowserWindow {
     authSlots.delete(webContentsId)
     if (authSlot !== 'primary') transientAuth.delete(authSlot)
   })
+  browserWindow.on('maximize', () => browserWindow.webContents.send('window:maximized-changed', true))
+  browserWindow.on('unmaximize', () => browserWindow.webContents.send('window:maximized-changed', false))
 
   browserWindow.once('ready-to-show', () => browserWindow.show())
   browserWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -103,14 +102,7 @@ app.whenReady().then(() => {
   })
   ipcMain.on('window:close', (event) => BrowserWindow.fromWebContents(event.sender)?.close())
   ipcMain.on('window:new-test', () => createWindow(randomUUID()))
-  ipcMain.on('window:titlebar-theme', (event, theme: 'light' | 'dark') => {
-    if (process.platform !== 'win32') return
-    BrowserWindow.fromWebContents(event.sender)?.setTitleBarOverlay({
-      color: theme === 'dark' ? '#191c20' : '#ffffff',
-      symbolColor: theme === 'dark' ? '#e8e9eb' : '#555b66',
-      height: 42,
-    })
-  })
+  ipcMain.handle('window:is-maximized', (event) => BrowserWindow.fromWebContents(event.sender)?.isMaximized() ?? false)
   ipcMain.handle('app:version', () => app.getVersion())
   ipcMain.handle('auth:get', (event) => {
     const slot = authSlots.get(event.sender.id) ?? 'primary'

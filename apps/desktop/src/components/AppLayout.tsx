@@ -14,6 +14,7 @@ import { api } from '../lib/api'
 import { useApp } from '../state/AppContext'
 import { Avatar, Modal } from './ui'
 import { BrandMark } from './BrandMark'
+import { WindowControls } from './WindowControls'
 
 const navItems = [
   { to: '/chat', label: 'Чаты', icon: MessageSquareText },
@@ -68,6 +69,7 @@ export function AppLayout(): React.JSX.Element {
       <div className="titlebar">
         <BrandMark />
         <strong>AlephMeets</strong>
+        <WindowControls />
       </div>
       <aside className="sidebar">
         <div className="sidebar-meeting-actions">
