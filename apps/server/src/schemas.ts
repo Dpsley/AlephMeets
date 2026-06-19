@@ -18,7 +18,7 @@ export const messageInputSchema = z.object({
 })
 
 export const contactInputSchema = z.object({
-  email: z.email(),
+  email: z.string().trim().min(5).max(254),
   alias: z.string().trim().max(100).optional(),
   favorite: z.boolean().default(false),
 })

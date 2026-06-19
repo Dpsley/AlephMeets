@@ -3,6 +3,7 @@ dist/
 out/
 release/
 .env
+.env.production
 *.log
 coverage/
 uploads/*

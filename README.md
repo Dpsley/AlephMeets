@@ -80,6 +80,13 @@ Basic authentication is not supported there.
 Unsigned packages are suitable for internal testing. Public distribution still
 requires Windows code signing and Apple Developer ID signing/notarization.
 
+## Server deployment
+
+The production Docker stack and VPS instructions are in
+[`deploy/DEPLOY.md`](deploy/DEPLOY.md). It includes PostgreSQL, Redis, LiveKit,
+Caddy TLS, automatic migrations, persistent uploads and the required WebRTC
+firewall ports.
+
 ## Workspace
 
 - `apps/desktop` - Electron application

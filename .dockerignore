@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+.env
+.env.production
+node_modules
+**/node_modules
+**/dist
+**/out
+**/release
+uploads/*
+*.log

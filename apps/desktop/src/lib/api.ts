@@ -93,10 +93,10 @@ export const api = {
       body: JSON.stringify({ status }),
     }),
   contacts: () => request<{ contacts: Contact[] }>('/api/contacts'),
-  addContact: (email: string, favorite = false) =>
+  addContact: (identifier: string, favorite = false) =>
     request<{ contact: Contact }>('/api/contacts', {
       method: 'POST',
-      body: JSON.stringify({ email, favorite }),
+      body: JSON.stringify({ email: identifier, favorite }),
     }),
   setContactFavorite: (id: string, favorite: boolean) =>
     request<{ contact: Pick<Contact, 'id' | 'favorite'> }>(`/api/contacts/${id}/favorite`, {

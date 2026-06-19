@@ -49,13 +49,13 @@ export function LoginPage(): React.JSX.Element {
         {step === 'phone' ? (
           <label className="auth-field"><span>Номер телефона</span><input value={phone} onChange={(event) => setPhone(event.target.value)} onKeyDown={(event) => event.key === 'Enter' && void sendCode()} inputMode="tel" autoComplete="tel" autoFocus placeholder="+7 999 123-45-67" /></label>
         ) : (
-          <label className="auth-field"><span>Код подтверждения</span><input className="auth-code" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, '').slice(0, 6))} onKeyDown={(event) => event.key === 'Enter' && code.length === 6 && void verify()} inputMode="numeric" autoComplete="one-time-code" autoFocus placeholder="000000" /></label>
+          <label className="auth-field"><span>Код подтверждения</span><input className="auth-code" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, '').slice(0, 10))} onKeyDown={(event) => event.key === 'Enter' && code.length >= 5 && void verify()} inputMode="numeric" autoComplete="one-time-code" autoFocus placeholder="000000" /></label>
         )}
         {(error || sessionError) && <p className="form-error">{error || sessionError}</p>}
         {step === 'phone' ? (
           <button className="button primary full auth-submit" onClick={() => void sendCode()} disabled={phone.replace(/\D/g, '').length < 10 || submitting}>{submitting ? 'Отправка...' : 'Получить код'}</button>
         ) : <>
-          <button className="button primary full auth-submit" onClick={() => void verify()} disabled={code.length !== 6 || submitting}>{submitting ? 'Проверка...' : 'Войти'}</button>
+          <button className="button primary full auth-submit" onClick={() => void verify()} disabled={code.length < 5 || submitting}>{submitting ? 'Проверка...' : 'Войти'}</button>
           <div className="auth-secondary-actions"><button onClick={() => { setStep('phone'); setCode(''); setError(null) }}><ArrowLeft size={15} />Изменить номер</button><button onClick={() => void sendCode()}>Отправить повторно</button></div>
         </>}
         <small className="auth-security"><LockKeyhole size={14} />Сессия хранится в зашифрованном хранилище системы.</small>

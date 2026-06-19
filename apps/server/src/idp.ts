@@ -14,7 +14,6 @@ interface IdpUser {
   phone?: string | null
   name?: string | null
   second_name?: string | null
-  patronymic?: string | null
   email?: string | null
   avatar?: string | null
   time_zone?: string | null
@@ -59,9 +58,10 @@ export class IdpError extends Error {
 
 export function normalizePhone(phone: string): string {
   let normalized = phone.replace(/\D/g, '')
-  if (normalized.length === 11 && normalized.startsWith('8')) normalized = `7${normalized.slice(1)}`
-  if (normalized.length === 10) normalized = `7${normalized}`
-  if (normalized.length < 10 || normalized.length > 15) {
+  if (normalized.startsWith('8')) normalized = `7${normalized.slice(1)}`
+  if (!normalized.startsWith('7')) normalized = `7${normalized}`
+  normalized = normalized.slice(0, 11)
+  if (normalized.length !== 11) {
     throw new IdpError('Введите корректный номер телефона.', 400)
   }
   return normalized
@@ -101,51 +101,6 @@ export function decryptIdpPayload<T>(value: string, secret = config.idpDecodeKey
   return JSON.parse(plaintext) as T
 }
 
-async function directIdpRequest<T>(path: string, body: Record<string, string>): Promise<IdpResponse<T>> {
-  let response: Response
-  try {
-    response = await fetch(`${config.idpBaseUrl}${path}`, {
-      method: 'POST',
-      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(15_000),
-    })
-  } catch (error) {
-    throw new IdpError(`IDP недоступен: ${error instanceof Error ? error.message : String(error)}`)
-  }
-  const payload = await response.json().catch(() => ({
-    status: false,
-    message: response.statusText || 'IDP вернул некорректный ответ',
-  })) as IdpResponse<T>
-  if (!response.ok || !payload.status) {
-    const message = typeof payload.message === 'string' ? payload.message : 'Ошибка IDP'
-    throw new IdpError(message, response.status >= 400 && response.status < 500 ? response.status : 502)
-  }
-  return payload
-}
-
-async function getIdpSessionUser(accessToken: string, fallbackPhone: string): Promise<CurrentUser | null> {
-  let response: Response
-  try {
-    response = await fetch(`${config.idpBaseUrl}/login/session`, {
-      headers: { Accept: 'application/json', Authorization: `Bearer ${accessToken}` },
-      signal: AbortSignal.timeout(15_000),
-    })
-  } catch (error) {
-    throw new IdpError(`IDP недоступен: ${error instanceof Error ? error.message : String(error)}`)
-  }
-  if (response.status === 404 || response.status === 405) return null
-  const payload = await response.json().catch(() => ({
-    status: false,
-    message: response.statusText || 'IDP вернул некорректный ответ',
-  })) as IdpResponse<{ user: IdpUser }>
-  if (!response.ok || !payload.status || typeof payload.message === 'string') {
-    const message = typeof payload.message === 'string' ? payload.message : 'Ошибка IDP'
-    throw new IdpError(message, response.status >= 400 && response.status < 500 ? response.status : 502)
-  }
-  return syncLocalUser(mapIdpUser(payload.message.user, fallbackPhone))
-}
-
 async function serviceIdpRequest<T>(
   path: string,
   options: { method?: 'GET' | 'POST'; payload?: unknown; auid?: string } = {},
@@ -177,16 +132,16 @@ async function serviceIdpRequest<T>(
     if (Array.isArray(parsed) && typeof parsed[0] === 'string') encrypted = parsed[0]
     else if (typeof parsed === 'string') encrypted = parsed
   } catch {
-    // The reference client also accepts a raw encrypted response.
+    // The Python reference also accepts a raw encrypted response.
   }
 
   let payload: IdpResponse<T>
   try {
-    payload = decryptIdpPayload<IdpResponse<T>>(encrypted)
+    const decoded = decryptIdpPayload<unknown>(encrypted)
+    const wrapped = decoded as { original?: IdpResponse<T> }
+    payload = wrapped.original ?? decoded as IdpResponse<T>
   } catch (error) {
-    if (!response.ok) {
-      throw new IdpError(`IDP отклонил запрос (${response.status}).`, response.status)
-    }
+    if (!response.ok) throw new IdpError(`IDP отклонил запрос (${response.status}).`, response.status)
     throw error
   }
   if (!response.ok || !payload.status) {
@@ -282,19 +237,67 @@ export async function issueSession(userId: string): Promise<IdpTokens> {
   return inTransaction((client) => createSession(client, userId))
 }
 
-async function findIdpUser(phone: string): Promise<CurrentUser> {
+async function findIdpAuid(phone: string): Promise<string> {
   const probe = await serviceIdpRequest<string>('/service/phone_probe', {
     method: 'POST',
     payload: { phone },
   })
   if (typeof probe.message !== 'string') throw new IdpError('IDP не вернул AUID пользователя.')
-  const info = await serviceIdpRequest<IdpUser>('/service/user_info', { auid: probe.message })
+  return probe.message
+}
+
+async function loadIdpUser(auid: string, phone: string): Promise<CurrentUser> {
+  const info = await serviceIdpRequest<IdpUser>('/service/user_info', { auid })
   if (typeof info.message === 'string') throw new IdpError(info.message)
   return syncLocalUser(mapIdpUser(info.message, phone))
 }
 
+export async function findIdpUserByEmail(email: string): Promise<CurrentUser> {
+  const normalizedEmail = email.trim().toLowerCase()
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    throw new IdpError('Введите корректный email.', 400)
+  }
+  const lookup = await serviceIdpRequest<string>('/service/email/get/user', {
+    method: 'POST',
+    payload: { email: normalizedEmail },
+  }) as IdpResponse<string> & { aleph_id?: string }
+  if (!lookup.aleph_id) throw new IdpError('Пользователь с таким email не найден.', 404)
+  return loadIdpUser(lookup.aleph_id, '')
+}
+
+export async function findIdpContact(identifier: string): Promise<CurrentUser> {
+  const normalized = identifier.trim()
+  if (normalized.includes('@')) return findIdpUserByEmail(normalized)
+  const phone = normalizePhone(normalized)
+  return loadIdpUser(await findIdpAuid(phone), phone)
+}
+
 export async function requestSms(phone: string): Promise<void> {
-  await directIdpRequest<string>('/login/phone', { phone: normalizePhone(phone) })
+  const normalizedPhone = normalizePhone(phone)
+  const auid = await findIdpAuid(normalizedPhone)
+  await pool.query('DELETE FROM auth_login_challenges WHERE expires_at <= now()')
+  await pool.query(
+    `INSERT INTO auth_login_challenges (phone, auid, expires_at)
+     VALUES ($1,$2,now() + interval '10 minutes')
+     ON CONFLICT (phone) DO UPDATE SET
+       auid = EXCLUDED.auid,
+       attempts = 0,
+       expires_at = EXCLUDED.expires_at,
+       updated_at = now()`,
+    [normalizedPhone, auid],
+  )
+  try {
+    await serviceIdpRequest('/service/sms/send', {
+      method: 'POST',
+      payload: {
+        phone: normalizedPhone,
+        message: ' - код входа в AlephMeets. Никому не сообщайте его.',
+      },
+    })
+  } catch (error) {
+    // IDP rate-limits repeated sends for 60 seconds; the previous code remains valid.
+    if (!(error instanceof IdpError) || !/send timeout/i.test(error.message)) throw error
+  }
 }
 
 export async function verifySms(
@@ -302,16 +305,23 @@ export async function verifySms(
   code: string,
 ): Promise<{ tokens: IdpTokens; user: CurrentUser }> {
   const normalizedPhone = normalizePhone(phone)
-  if (!/^\d{6}$/.test(code)) throw new IdpError('Код должен содержать 6 цифр.', 400)
-  const verified = await directIdpRequest<{
-    access_token: string
-    refresh_token: string
-    expires_in: number
-  }>('/login/phone_code', { phone: normalizedPhone, code })
-  if (typeof verified.message === 'string') throw new IdpError(verified.message)
-  const user = await getIdpSessionUser(verified.message.access_token, normalizedPhone)
-    ?? await findIdpUser(normalizedPhone)
+  if (!/^\d{5,10}$/.test(code)) throw new IdpError('Код должен содержать от 5 до 10 цифр.', 400)
+  const challengeResult = await pool.query<{ auid: string }>(
+    `UPDATE auth_login_challenges SET attempts = attempts + 1, updated_at = now()
+     WHERE phone = $1 AND expires_at > now() AND attempts < 5
+     RETURNING auid`,
+    [normalizedPhone],
+  )
+  const challenge = challengeResult.rows[0]
+  if (!challenge) throw new IdpError('Запросите новый SMS-код.', 429)
+
+  await serviceIdpRequest('/service/sms/validate', {
+    method: 'POST',
+    payload: { phone: normalizedPhone, code },
+  })
+  const user = await loadIdpUser(challenge.auid, normalizedPhone)
   const tokens = await issueSession(user.id)
+  await pool.query('DELETE FROM auth_login_challenges WHERE phone = $1', [normalizedPhone])
   return { tokens, user }
 }
 

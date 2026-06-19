@@ -39,6 +39,7 @@ import {
 import { camelizeRow, camelizeRows } from './serializers.js'
 import {
   authenticateAccessToken,
+  findIdpContact,
   type IdpTokens,
   logoutSession,
   refreshSession,
@@ -367,7 +368,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
 
   app.get('/api/contacts', async () => {
     const result = await pool.query(
-      `SELECT u.id, u.email, u.display_name, u.first_name, u.last_name, u.avatar_url,
+      `SELECT u.id, u.phone, u.email, u.display_name, u.first_name, u.last_name, u.avatar_url,
               u.presence AS status, c.alias, c.favorite, c.created_at
        FROM contacts c JOIN users u ON u.id = c.contact_user_id
        WHERE c.owner_id = $1 ORDER BY c.favorite DESC, u.display_name`,
@@ -378,15 +379,18 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
 
   app.post('/api/contacts', async (request, reply) => {
     const input = contactInputSchema.parse(request.body)
+    const contactUser = await findIdpContact(input.email)
+    if (contactUser.id === currentUser.id) {
+      return reply.code(400).send({ error: 'cannot_add_self', message: 'Нельзя добавить себя в контакты.' })
+    }
     const result = await pool.query(
       `INSERT INTO contacts (owner_id, contact_user_id, alias, favorite)
-       SELECT $1, id, $3, $4 FROM users WHERE lower(email) = lower($2)
+       VALUES ($1,$2,$3,$4)
        ON CONFLICT (owner_id, contact_user_id)
        DO UPDATE SET alias = EXCLUDED.alias, favorite = EXCLUDED.favorite
        RETURNING *`,
-      [currentUser.id, input.email, input.alias ?? null, input.favorite],
+      [currentUser.id, contactUser.id, input.alias ?? null, input.favorite],
     )
-    if (!result.rowCount) return reply.code(404).send({ error: 'user_not_found' })
     return reply.code(201).send({ contact: camelizeRow(result.rows[0] as Record<string, unknown>) })
   })
 

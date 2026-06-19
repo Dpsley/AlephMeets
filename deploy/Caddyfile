@@ -1,0 +1,8 @@
+{$API_DOMAIN} {
+  encode zstd gzip
+  reverse_proxy api:4100
+}
+
+{$LIVEKIT_DOMAIN} {
+  reverse_proxy livekit:7880
+}
