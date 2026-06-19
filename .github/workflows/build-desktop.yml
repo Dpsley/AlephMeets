@@ -124,4 +124,5 @@ jobs:
           release-assets/*
           --verify-tag
           --generate-notes
+          --repo "${{ github.repository }}"
           --title "AlephMeets ${{ github.ref_name }}"
