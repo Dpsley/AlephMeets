@@ -44,21 +44,6 @@ opaque access/refresh tokens whose SHA-256 hashes are stored in PostgreSQL.
 - File attachments and recorded voice messages
 - Windows NSIS and macOS DMG/ZIP build configuration
 
-## Testing a call on one PC
-
-1. Run `npm run dev`. On the sign-in screen, click **Open second window**.
-2. Sign in with two different Aleph ID phone numbers. Each window has isolated
-   encrypted token storage.
-3. Start an instant meeting in the first window and call the second account.
-4. Keep the microphone enabled only in the first window. Disable the second microphone before
-   joining and listen in headphones to avoid an acoustic feedback loop.
-5. Verify that both names appear in the participant grid, the speaking indicator
-   reacts, and the second account receives the audio.
-
-LiveKit participant identities must be different in the two windows. Signing in
-with the same account twice is unsupported because LiveKit treats participant
-identity as unique within a room.
-
 ## Exchange / Outlook calendar
 
 Each user configures their own calendar under Settings by entering an OWA or EWS
@@ -79,6 +64,29 @@ Basic authentication is not supported there.
 
 Unsigned packages are suitable for internal testing. Public distribution still
 requires Windows code signing and Apple Developer ID signing/notarization.
+
+## Desktop releases and mandatory updates
+
+Packaged clients check the latest public GitHub Release before opening the main
+window. A newer version is mandatory: the user can install it or close the app.
+If GitHub cannot be reached, the gate only allows retrying or closing.
+
+Create a release by pushing a semantic version tag from the commit to publish:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The `Build desktop` workflow takes the version from the tag, builds Windows x64
+and macOS x64/arm64 packages, and creates the GitHub Release. Do not remove
+`latest.yml`, `latest-mac.yml`, installers, ZIP files, or blockmaps from a
+release: `electron-updater` needs them together. Tags must always increase the
+desktop semantic version.
+
+Production macOS updates require the Apple signing/notarization secrets described
+in `.github/workflows/build-desktop.yml`; ad-hoc signatures are only suitable for
+internal testing.
 
 ## Server deployment
 

@@ -16,7 +16,7 @@ for (const name of signingVariables) {
 const builderPath = process.platform === 'win32'
   ? 'electron-builder.cmd'
   : 'electron-builder'
-const result = spawnSync(builderPath, ['--mac', ...process.argv.slice(2)], {
+const result = spawnSync(builderPath, ['--mac', ...process.argv.slice(2), '--publish', 'never'], {
   env,
   stdio: 'inherit',
   shell: process.platform === 'win32',

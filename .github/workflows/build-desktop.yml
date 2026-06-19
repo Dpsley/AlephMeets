@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 jobs:
@@ -51,6 +52,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Set release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: npm version "${{ github.ref_name }}" --workspace @aleph/desktop --no-git-tag-version --allow-same-version
       - run: npm run dist:win -w @aleph/desktop
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
@@ -58,7 +62,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: AlephMeets-Windows
-          path: apps/desktop/release/*.exe
+          path: |
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.blockmap
+            apps/desktop/release/latest.yml
 
   package-macos:
     runs-on: macos-latest
@@ -69,6 +76,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Set release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: npm version "${{ github.ref_name }}" --workspace @aleph/desktop --no-git-tag-version --allow-same-version
       - run: npm run dist:mac -w @aleph/desktop
         env:
           CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
@@ -92,3 +102,26 @@ jobs:
           path: |
             apps/desktop/release/*.dmg
             apps/desktop/release/*.zip
+            apps/desktop/release/*.blockmap
+            apps/desktop/release/latest-mac.yml
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [verify, package-windows, package-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${{ github.ref_name }}"
+          release-assets/*
+          --verify-tag
+          --generate-notes
+          --title "AlephMeets ${{ github.ref_name }}"

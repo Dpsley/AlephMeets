@@ -1,4 +1,4 @@
-import { ArrowLeft, LockKeyhole, MessageSquareText, MonitorUp, Phone } from 'lucide-react'
+import { ArrowLeft, LockKeyhole, MessageSquareText, Phone } from 'lucide-react'
 import { useState } from 'react'
 import { useApp } from '../state/AppContext'
 import { BrandMark } from '../components/BrandMark'
@@ -60,7 +60,6 @@ export function LoginPage(): React.JSX.Element {
           <div className="auth-secondary-actions"><button onClick={() => { setStep('phone'); setCode(''); setError(null) }}><ArrowLeft size={15} />Изменить номер</button><button onClick={() => void sendCode()}>Отправить повторно</button></div>
         </>}
         <small className="auth-security"><LockKeyhole size={14} />Сессия хранится в зашифрованном хранилище системы.</small>
-        {window.alephDesktop && <button className="button secondary full auth-second-window" onClick={() => window.alephDesktop?.openNewWindow()}><MonitorUp size={17} />Открыть второе окно</button>}
       </main>
     </div>
   )

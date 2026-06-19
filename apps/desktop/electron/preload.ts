@@ -5,7 +5,6 @@ contextBridge.exposeInMainWorld('alephDesktop', {
   minimize: () => ipcRenderer.send('window:minimize'),
   maximize: () => ipcRenderer.send('window:maximize'),
   close: () => ipcRenderer.send('window:close'),
-  openNewWindow: () => ipcRenderer.send('window:new-test'),
   isMaximized: () => ipcRenderer.invoke('window:is-maximized') as Promise<boolean>,
   onMaximizedChanged: (listener: (maximized: boolean) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, maximized: boolean): void => listener(maximized)

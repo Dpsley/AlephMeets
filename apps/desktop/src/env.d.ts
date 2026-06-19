@@ -6,7 +6,6 @@ interface Window {
     minimize: () => void
     maximize: () => void
     close: () => void
-    openNewWindow: () => void
     isMaximized: () => Promise<boolean>
     onMaximizedChanged: (listener: (maximized: boolean) => void) => () => void
     getVersion: () => Promise<string>

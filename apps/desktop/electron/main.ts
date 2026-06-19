@@ -1,7 +1,7 @@
 import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage, session, shell } from 'electron'
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
-import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
+import { enforceMandatoryUpdate } from './mandatory-updater'
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 app.setName('AlephMeets')
@@ -82,7 +82,7 @@ function createWindow(authSlot = 'primary'): BrowserWindow {
   return browserWindow
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
     callback(['media', 'display-capture', 'notifications'].includes(permission))
   })
@@ -101,7 +101,6 @@ app.whenReady().then(() => {
     else target?.maximize()
   })
   ipcMain.on('window:close', (event) => BrowserWindow.fromWebContents(event.sender)?.close())
-  ipcMain.on('window:new-test', () => createWindow(randomUUID()))
   ipcMain.handle('window:is-maximized', (event) => BrowserWindow.fromWebContents(event.sender)?.isMaximized() ?? false)
   ipcMain.handle('app:version', () => app.getVersion())
   ipcMain.handle('auth:get', (event) => {
@@ -116,6 +115,8 @@ app.whenReady().then(() => {
     const slot = authSlots.get(event.sender.id) ?? 'primary'
     clearAuth(slot)
   })
+
+  if (!await enforceMandatoryUpdate()) return
 
   createWindow()
   app.on('activate', () => {
