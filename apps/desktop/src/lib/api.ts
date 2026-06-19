@@ -6,7 +6,8 @@ import {
   type AuthTokens,
 } from './auth'
 
-export const API_URL = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:4100'
+export const API_URL = import.meta.env.VITE_API_URL
+  || (import.meta.env.PROD ? 'https://meets-api.alephtrade.com' : 'http://127.0.0.1:4100')
 
 export class ApiError extends Error {
   status: number

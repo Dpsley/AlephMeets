@@ -9,6 +9,27 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://aleph_meets:aleph_meets_test@127.0.0.1:5432/aleph_meets
+      IDP_BASE_URL: https://idp.invalid.test/id
+      IDP_ENCODE_KEY: test-encode-key
+      IDP_DECODE_KEY: test-decode-key
+      IDP_ACCESS_KEY: test-access-key
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: aleph_meets
+          POSTGRES_PASSWORD: aleph_meets_test
+          POSTGRES_DB: aleph_meets
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aleph_meets -d aleph_meets"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -16,6 +37,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run db:migrate
+      - run: npm run db:seed
       - run: npm run typecheck
       - run: npm test
 
@@ -31,7 +54,7 @@ jobs:
       - run: npm run dist:win -w @aleph/desktop
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-          VITE_API_URL: ${{ vars.VITE_API_URL }}
+          VITE_API_URL: https://meets-api.alephtrade.com
       - uses: actions/upload-artifact@v4
         with:
           name: AlephMeets-Windows
@@ -49,7 +72,7 @@ jobs:
       - run: npm run dist:mac -w @aleph/desktop
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-          VITE_API_URL: ${{ vars.VITE_API_URL }}
+          VITE_API_URL: https://meets-api.alephtrade.com
       - uses: actions/upload-artifact@v4
         with:
           name: AlephMeets-macOS
