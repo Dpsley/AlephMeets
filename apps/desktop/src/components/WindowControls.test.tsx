@@ -7,10 +7,19 @@ describe('WindowControls', () => {
     Reflect.deleteProperty(globalThis, 'window')
   })
 
-  it('keeps all window actions visible when the platform bridge is unavailable', () => {
+  it('renders all actions when the Electron bridge is available', () => {
     Object.defineProperty(globalThis, 'window', {
       configurable: true,
-      value: { alephDesktop: undefined },
+      value: {
+        alephDesktop: {
+          platform: 'win32',
+          minimize: () => undefined,
+          maximize: () => undefined,
+          close: () => undefined,
+          isMaximized: async () => false,
+          onMaximizedChanged: () => () => undefined,
+        },
+      },
     })
 
     const markup = renderToStaticMarkup(<WindowControls />)

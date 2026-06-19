@@ -53,7 +53,7 @@ function createWindow(authSlot = 'primary'): BrowserWindow {
     frame: process.platform !== 'win32',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
     webPreferences: {
-      preload: join(__dirname, '../preload/preload.mjs'),
+      preload: join(__dirname, '../preload/preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
