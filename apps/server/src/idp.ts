@@ -27,7 +27,7 @@ interface IdpResponse<T> {
 interface LocalUserRow {
   id: string
   phone: string | null
-  email: string
+  email: string | null
   display_name: string
   first_name: string | null
   last_name: string | null
@@ -156,25 +156,25 @@ function mapIdpUser(user: IdpUser, fallbackPhone: string): CurrentUser {
   if (!id) throw new IdpError('IDP не вернул идентификатор пользователя.')
   const firstName = user.name?.trim() ?? ''
   const lastName = user.second_name?.trim() ?? ''
-  const phone = user.phone?.replace(/\D/g, '') || fallbackPhone
+  const phone = user.phone?.replace(/\D/g, '') || fallbackPhone || null
   return {
     id,
     phone,
-    email: user.email?.trim().toLowerCase() || `${id}@aleph-id.local`,
-    displayName: [firstName, lastName].filter(Boolean).join(' ') || phone,
+    email: user.email?.trim().toLowerCase() || null,
+    displayName: [firstName, lastName].filter(Boolean).join(' ') || phone || id,
     firstName,
     lastName,
     avatarUrl: user.avatar || null,
     timezone: user.time_zone || 'Europe/Moscow',
     locale: 'ru-RU',
-    status: 'online',
+    status: 'offline',
   }
 }
 
 function mapLocalUser(row: LocalUserRow): CurrentUser {
   return {
     id: row.id,
-    phone: row.phone ?? '',
+    phone: row.phone,
     email: row.email,
     displayName: row.display_name,
     firstName: row.first_name ?? '',
@@ -199,8 +199,7 @@ async function syncLocalUser(user: CurrentUser): Promise<CurrentUser> {
        last_name = EXCLUDED.last_name,
        avatar_url = EXCLUDED.avatar_url,
        timezone = EXCLUDED.timezone,
-       locale = EXCLUDED.locale,
-       presence = EXCLUDED.presence`,
+       locale = EXCLUDED.locale`,
     [
       user.id,
       user.phone,

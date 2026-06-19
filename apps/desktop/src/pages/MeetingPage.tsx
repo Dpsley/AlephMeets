@@ -4,6 +4,7 @@ import {
   useRoomContext,
   VideoConference,
 } from '@livekit/components-react'
+import { Track } from 'livekit-client'
 import {
   ArrowLeft,
   Camera,
@@ -16,9 +17,9 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
-import type { Meeting } from '../types'
+import type { DirectCallContext, Meeting } from '../types'
 import { api } from '../lib/api'
-import { mediaErrorMessage, type MediaKind } from '../lib/media'
+import { isRetryableMediaError, mediaErrorMessage, type MediaKind } from '../lib/media'
 import { useApp } from '../state/AppContext'
 import { BrandMark } from '../components/BrandMark'
 import { WindowControls } from '../components/WindowControls'
@@ -28,10 +29,14 @@ type DeviceState = 'checking' | 'available' | 'unavailable'
 function InitialMediaPublisher({
   audioEnabled,
   videoEnabled,
+  audioTrack,
+  videoTrack,
   onDeviceError,
 }: {
   audioEnabled: boolean
   videoEnabled: boolean
+  audioTrack?: MediaStreamTrack
+  videoTrack?: MediaStreamTrack
   onDeviceError: (kind: MediaKind, error: unknown) => void
 }): null {
   const room = useRoomContext()
@@ -41,14 +46,22 @@ function InitialMediaPublisher({
     const publish = async (): Promise<void> => {
       if (audioEnabled) {
         try {
-          await room.localParticipant.setMicrophoneEnabled(true)
+          if (audioTrack?.readyState === 'live') {
+            await room.localParticipant.publishTrack(audioTrack, { source: Track.Source.Microphone })
+          } else {
+            await room.localParticipant.setMicrophoneEnabled(true)
+          }
         } catch (error) {
           if (active) onDeviceError('audio', error)
         }
       }
       if (videoEnabled) {
         try {
-          await room.localParticipant.setCameraEnabled(true)
+          if (videoTrack?.readyState === 'live') {
+            await room.localParticipant.publishTrack(videoTrack, { source: Track.Source.Camera })
+          } else {
+            await room.localParticipant.setCameraEnabled(true)
+          }
         } catch (error) {
           if (active) onDeviceError('video', error)
         }
@@ -56,7 +69,7 @@ function InitialMediaPublisher({
     }
     void publish()
     return () => { active = false }
-  }, [audioEnabled, onDeviceError, room, videoEnabled])
+  }, [audioEnabled, audioTrack, onDeviceError, room, videoEnabled, videoTrack])
 
   return null
 }
@@ -66,7 +79,12 @@ export function MeetingPage(): React.JSX.Element {
   const navigate = useNavigate()
   const location = useLocation()
   const { meetings, user, loading } = useApp()
-  const meetingFromNavigation = (location.state as { meeting?: Meeting } | null)?.meeting
+  const navigationState = location.state as {
+    meeting?: Meeting
+    callContext?: DirectCallContext
+  } | null
+  const meetingFromNavigation = navigationState?.meeting
+  const callContext = navigationState?.callContext
   const meeting = meetings.find((item) => item.id === meetingId) ?? meetingFromNavigation
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
@@ -81,8 +99,11 @@ export function MeetingPage(): React.JSX.Element {
     token: string
     serverUrl: string
     isHost: boolean
+    audioTrack?: MediaStreamTrack
+    videoTrack?: MediaStreamTrack
   } | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const callFinishedRef = useRef(false)
 
   const addDeviceNotice = useCallback((message: string): void => {
     setDeviceNotices((current) => current.includes(message) ? current : [...current, message])
@@ -105,36 +126,38 @@ export function MeetingPage(): React.JSX.Element {
     const acquiredStreams: MediaStream[] = []
 
     const acquire = async (kind: MediaKind): Promise<MediaStreamTrack | null> => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia(
-          kind === 'audio' ? { audio: true, video: false } : { audio: false, video: true },
-        )
-        acquiredStreams.push(stream)
-        if (!active) {
-          stream.getTracks().forEach((track) => track.stop())
-          return null
+      let lastError: unknown
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia(
+            kind === 'audio'
+              ? { audio: { echoCancellation: true, noiseSuppression: true }, video: false }
+              : { audio: false, video: true },
+          )
+          acquiredStreams.push(stream)
+          if (!active) {
+            stream.getTracks().forEach((track) => track.stop())
+            return null
+          }
+          if (kind === 'audio') setAudioState('available')
+          else setVideoState('available')
+          return kind === 'audio' ? stream.getAudioTracks()[0] ?? null : stream.getVideoTracks()[0] ?? null
+        } catch (reason) {
+          lastError = reason
+          if (attempt === 0 && isRetryableMediaError(reason)) {
+            await new Promise((resolve) => setTimeout(resolve, 350))
+            continue
+          }
+          break
         }
-        if (kind === 'audio') setAudioState('available')
-        else setVideoState('available')
-        return kind === 'audio' ? stream.getAudioTracks()[0] ?? null : stream.getVideoTracks()[0] ?? null
-      } catch (reason) {
-        if (active) handleDeviceError(kind, reason)
-        return null
       }
+      if (active) handleDeviceError(kind, lastError)
+      return null
     }
 
     const prepareMedia = async (): Promise<void> => {
-      const devices = await navigator.mediaDevices.enumerateDevices().catch(() => [])
-      const hasAudio = devices.some((device) => device.kind === 'audioinput')
-      const hasVideo = devices.some((device) => device.kind === 'videoinput')
-
-      if (!hasAudio) handleDeviceError('audio', new DOMException('Device not found', 'NotFoundError'))
-      if (!hasVideo) handleDeviceError('video', new DOMException('Device not found', 'NotFoundError'))
-
-      const [audioTrack, videoTrack] = await Promise.all([
-        hasAudio ? acquire('audio') : Promise.resolve(null),
-        hasVideo ? acquire('video') : Promise.resolve(null),
-      ])
+      const audioTrack = await acquire('audio')
+      const videoTrack = await acquire('video')
       if (!active) return
       const preview = new MediaStream([audioTrack, videoTrack].filter(Boolean) as MediaStreamTrack[])
       streamRef.current = preview
@@ -163,18 +186,35 @@ export function MeetingPage(): React.JSX.Element {
     setError(null)
     try {
       const token = await api.meetingToken(meetingId)
+      const audioTrack = audioEnabled
+        ? streamRef.current?.getAudioTracks()[0]?.clone()
+        : undefined
+      const videoTrack = videoEnabled
+        ? streamRef.current?.getVideoTracks()[0]?.clone()
+        : undefined
       streamRef.current?.getTracks().forEach((track) => track.stop())
       streamRef.current = null
       if (token.isHost) await api.updateMeetingStatus(meetingId, 'live')
-      setConnection(token)
+      setConnection({ ...token, audioTrack, videoTrack })
       setJoined(true)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Не удалось подключиться к встрече.')
     }
   }
 
+  const finishDirectCall = (): void => {
+    if (!callContext || callFinishedRef.current) return
+    callFinishedRef.current = true
+    void api.finishCallLog(
+      callContext.conversationId,
+      callContext.messageId,
+      'ended',
+      Date.now() - new Date(callContext.startedAt).getTime(),
+    )
+  }
+
   if (loading || !meeting) {
-    return <div className="meeting-loading"><span className="spinner" />Загрузка встречи...</div>
+    return <div className="meeting-loading-screen"><WindowControls /><div className="meeting-loading"><span className="spinner" />Загрузка встречи...</div></div>
   }
 
   if (joined && connection) {
@@ -193,6 +233,7 @@ export function MeetingPage(): React.JSX.Element {
           video={false}
           onDisconnected={() => {
             if (connection.isHost) void api.updateMeetingStatus(meeting.id, 'ended')
+            finishDirectCall()
             navigate('/chat')
           }}
           onError={(reason) => setError(
@@ -204,6 +245,8 @@ export function MeetingPage(): React.JSX.Element {
           <InitialMediaPublisher
             audioEnabled={audioEnabled && audioState === 'available'}
             videoEnabled={videoEnabled && videoState === 'available'}
+            audioTrack={connection.audioTrack}
+            videoTrack={connection.videoTrack}
             onDeviceError={handleDeviceError}
           />
           <VideoConference />

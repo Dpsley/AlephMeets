@@ -42,7 +42,7 @@ const settingsSections: Array<{
 ]
 
 export function SettingsPage(): React.JSX.Element {
-  const { user } = useApp()
+  const { user, presenceByUserId } = useApp()
   const [activeSection, setActiveSection] = useState<SettingsSection>('general')
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([])
   const [exchange, setExchange] = useState<ExchangeSettings | null>(null)
@@ -144,10 +144,11 @@ export function SettingsPage(): React.JSX.Element {
           <div className="settings-section profile-settings" data-settings-section="general">
             <h2>Профиль</h2>
             <div>
-              <Avatar name={user?.displayName ?? 'User'} src={user?.avatarUrl} status={user?.status} size="large" />
+              <Avatar name={user?.displayName ?? 'User'} src={user?.avatarUrl} status={user ? presenceByUserId[user.id] ?? user.status : undefined} size="large" />
               <span>
                 <strong>{user?.displayName}</strong>
-                <small>{user?.email}</small>
+                {user?.email && <small>{user.email}</small>}
+                {!user?.email && user?.phone && <small>{user.phone}</small>}
                 <em>Aleph ID · вход по SMS</em>
               </span>
             </div>
@@ -260,11 +261,6 @@ export function SettingsPage(): React.JSX.Element {
             <div className="setting-row">
               <span className="setting-icon"><ShieldCheck /></span>
               <div><strong>Камера и микрофон</strong><small>Включаются только при входе во встречу и управляются кнопками звонка.</small></div>
-              <CheckCircle2 />
-            </div>
-            <div className="setting-row">
-              <span className="setting-icon"><HardDrive /></span>
-              <div><strong>Локальный профиль</strong><small>Сейчас используется статичная сессия разработки без внешней авторизации.</small></div>
               <CheckCircle2 />
             </div>
           </div>

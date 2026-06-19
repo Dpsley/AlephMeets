@@ -9,8 +9,8 @@ dotenv.config({ path: resolve(rootDir, '.env') })
 
 export interface CurrentUser {
   id: string
-  phone: string
-  email: string
+  phone: string | null
+  email: string | null
   displayName: string
   firstName: string
   lastName: string

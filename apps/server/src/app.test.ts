@@ -122,6 +122,177 @@ test('creates a meeting with a registered attendee', async () => {
   }
 })
 
+test('creates a meeting attendee that has no email', async () => {
+  const app = await createTestApp()
+  const attendeeId = '10000000-0000-4000-8000-000000000099'
+  let meetingId: string | undefined
+  try {
+    await pool.query(
+      `INSERT INTO users (id, phone, email, display_name, timezone, locale)
+       VALUES ($1,$2,NULL,$3,'Europe/Moscow','ru-RU')`,
+      [attendeeId, '79990000099', 'No Email User'],
+    )
+    const startsAt = new Date(Date.now() + 60_000)
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/meetings',
+      headers: dmitryAuth,
+      payload: {
+        title: '__attendee_without_email_test__',
+        startsAt: startsAt.toISOString(),
+        endsAt: new Date(startsAt.getTime() + 60 * 60_000).toISOString(),
+        timezone: 'Europe/Moscow',
+        attendees: [],
+        attendeeUserIds: [attendeeId],
+      },
+    })
+    assert.equal(response.statusCode, 201, response.body)
+    meetingId = response.json().meeting.id
+    const attendee = await pool.query(
+      'SELECT user_id, email FROM meeting_attendees WHERE meeting_id = $1',
+      [meetingId],
+    )
+    assert.deepEqual(attendee.rows[0], { user_id: attendeeId, email: null })
+  } finally {
+    if (meetingId) await pool.query('DELETE FROM meetings WHERE id = $1', [meetingId])
+    await pool.query('DELETE FROM users WHERE id = $1', [attendeeId])
+    await app.close()
+  }
+})
+
+test('reports presence as online only while the heartbeat is fresh', async () => {
+  const app = await createTestApp()
+  const annaId = '10000000-0000-4000-8000-000000000002'
+  try {
+    await pool.query(
+      `UPDATE users SET presence = 'online', last_seen_at = now() WHERE id = $1`,
+      [annaId],
+    )
+    const online = await app.inject({ method: 'GET', url: '/api/contacts', headers: dmitryAuth })
+    assert.equal(
+      online.json().contacts.find((contact: { id: string }) => contact.id === annaId)?.status,
+      'online',
+    )
+
+    await pool.query(
+      `UPDATE users SET last_seen_at = now() - interval '2 minutes' WHERE id = $1`,
+      [annaId],
+    )
+    const offline = await app.inject({ method: 'GET', url: '/api/contacts', headers: dmitryAuth })
+    assert.equal(
+      offline.json().contacts.find((contact: { id: string }) => contact.id === annaId)?.status,
+      'offline',
+    )
+  } finally {
+    await pool.query(
+      `UPDATE users SET presence = 'offline', last_seen_at = NULL WHERE id = $1`,
+      [annaId],
+    )
+    await app.close()
+  }
+})
+
+test('reuses direct conversations and reports message read status', async () => {
+  const app = await createTestApp()
+  let messageId: string | undefined
+  try {
+    const createPayload = { memberIds: ['10000000-0000-4000-8000-000000000002'] }
+    const firstConversation = await app.inject({
+      method: 'POST',
+      url: '/api/conversations',
+      headers: dmitryAuth,
+      payload: createPayload,
+    })
+    const secondConversation = await app.inject({
+      method: 'POST',
+      url: '/api/conversations',
+      headers: dmitryAuth,
+      payload: createPayload,
+    })
+    assert.equal(firstConversation.statusCode, 200, firstConversation.body)
+    assert.equal(secondConversation.json().conversation.id, firstConversation.json().conversation.id)
+    const conversationId = firstConversation.json().conversation.id as string
+
+    const sent = await app.inject({
+      method: 'POST',
+      url: `/api/conversations/${conversationId}/messages`,
+      headers: dmitryAuth,
+      payload: { body: '__delivery_status_test__' },
+    })
+    assert.equal(sent.statusCode, 201, sent.body)
+    messageId = sent.json().message.id
+    assert.equal(sent.json().message.deliveryStatus, 'delivered')
+
+    await app.inject({
+      method: 'GET',
+      url: `/api/conversations/${conversationId}/messages`,
+      headers: annaAuth,
+    })
+    const senderView = await app.inject({
+      method: 'GET',
+      url: `/api/conversations/${conversationId}/messages`,
+      headers: dmitryAuth,
+    })
+    const message = senderView.json().messages.find((item: { id: string }) => item.id === messageId)
+    assert.equal(message?.deliveryStatus, 'read')
+  } finally {
+    if (messageId) await pool.query('DELETE FROM messages WHERE id = $1', [messageId])
+    await app.close()
+  }
+})
+
+test('stores a completed direct call in the conversation history', async () => {
+  const app = await createTestApp()
+  let meetingId: string | undefined
+  let messageId: string | undefined
+  try {
+    const conversationResponse = await app.inject({
+      method: 'POST',
+      url: '/api/conversations',
+      headers: dmitryAuth,
+      payload: { memberIds: ['10000000-0000-4000-8000-000000000002'] },
+    })
+    const conversationId = conversationResponse.json().conversation.id as string
+    const startsAt = new Date()
+    const meetingResponse = await app.inject({
+      method: 'POST',
+      url: '/api/meetings',
+      headers: dmitryAuth,
+      payload: {
+        title: '__direct_call_history_test__',
+        startsAt: startsAt.toISOString(),
+        endsAt: new Date(startsAt.getTime() + 60 * 60_000).toISOString(),
+        timezone: 'Europe/Moscow',
+        attendees: [],
+        attendeeUserIds: ['10000000-0000-4000-8000-000000000002'],
+      },
+    })
+    meetingId = meetingResponse.json().meeting.id
+    const started = await app.inject({
+      method: 'POST',
+      url: `/api/conversations/${conversationId}/calls`,
+      headers: dmitryAuth,
+      payload: { meetingId },
+    })
+    assert.equal(started.statusCode, 201, started.body)
+    messageId = started.json().message.id
+
+    const finished = await app.inject({
+      method: 'PATCH',
+      url: `/api/conversations/${conversationId}/calls/${messageId}`,
+      headers: annaAuth,
+      payload: { status: 'ended', durationMs: 65_000 },
+    })
+    assert.equal(finished.statusCode, 200, finished.body)
+    assert.equal(finished.json().message.metadata.status, 'ended')
+    assert.match(finished.json().message.body, /1:05/)
+  } finally {
+    if (messageId) await pool.query('DELETE FROM messages WHERE id = $1', [messageId])
+    if (meetingId) await pool.query('DELETE FROM meetings WHERE id = $1', [meetingId])
+    await app.close()
+  }
+})
+
 test('allows only the group owner to manage title and members', async () => {
   const app = await createTestApp()
   let conversationId: string | undefined

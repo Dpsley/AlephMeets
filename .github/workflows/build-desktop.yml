@@ -71,8 +71,21 @@ jobs:
       - run: npm ci
       - run: npm run dist:mac -w @aleph/desktop
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           VITE_API_URL: https://meets-api.alephtrade.com
+      - name: Verify macOS architectures
+        run: |
+          count=0
+          for binary in $(find apps/desktop/release -path '*/Contents/MacOS/AlephMeets' -type f); do
+            echo "$binary: $(lipo -archs "$binary")"
+            codesign --verify --deep --strict "$(dirname "$(dirname "$(dirname "$binary")")")"
+            count=$((count + 1))
+          done
+          test "$count" -eq 2
       - uses: actions/upload-artifact@v4
         with:
           name: AlephMeets-macOS

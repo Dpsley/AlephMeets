@@ -11,7 +11,7 @@
     "icons": "node scripts/generate-icons.mjs",
     "build": "npm run icons && electron-vite build && electron-builder --dir",
     "dist:win": "npm run icons && electron-vite build && electron-builder --win nsis",
-    "dist:mac": "npm run icons && electron-vite build && electron-builder --mac --universal",
+    "dist:mac": "npm run icons && electron-vite build && electron-builder --mac --x64 --arm64",
     "dist:mac:x64": "npm run icons && electron-vite build && electron-builder --mac --x64",
     "dist:mac:arm64": "npm run icons && electron-vite build && electron-builder --mac --arm64",
     "typecheck": "tsc --noEmit -p tsconfig.json",
@@ -52,17 +52,19 @@
       "out/**/*",
       "package.json"
     ],
+    "afterPack": "scripts/adhoc-sign-mac.mjs",
     "mac": {
       "icon": "build/icon.png",
       "category": "public.app-category.productivity",
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}",
       "target": [
         {
           "target": "dmg",
-          "arch": ["universal"]
+          "arch": ["x64", "arm64"]
         },
         {
           "target": "zip",
-          "arch": ["universal"]
+          "arch": ["x64", "arm64"]
         }
       ],
       "hardenedRuntime": true,

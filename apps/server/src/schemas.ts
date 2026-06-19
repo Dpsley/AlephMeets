@@ -7,6 +7,7 @@ export const meetingInputSchema = z.object({
   endsAt: z.iso.datetime(),
   timezone: z.string().min(1).max(100).default('UTC'),
   attendees: z.array(z.email()).max(200).default([]),
+  attendeeUserIds: z.array(z.uuid()).max(200).default([]),
   waitingRoom: z.boolean().default(true),
   muteOnEntry: z.boolean().default(true),
   allowJoinBeforeHost: z.boolean().default(false),
@@ -20,11 +21,15 @@ export const messageInputSchema = z.object({
 export const contactInputSchema = z.object({
   email: z.string().trim().min(5).max(254),
   alias: z.string().trim().max(100).optional(),
-  favorite: z.boolean().default(false),
 })
 
-export const contactFavoriteSchema = z.object({
-  favorite: z.boolean(),
+export const callLogStartSchema = z.object({
+  meetingId: z.uuid(),
+})
+
+export const callLogFinishSchema = z.object({
+  status: z.enum(['ended', 'declined', 'missed']),
+  durationMs: z.number().int().min(0).max(24 * 60 * 60 * 1000).default(0),
 })
 
 export const conversationInputSchema = z.object({

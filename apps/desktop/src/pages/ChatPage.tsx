@@ -1,5 +1,5 @@
 import { io, type Socket } from 'socket.io-client'
-import { FileText, Mic, Paperclip, Phone, Search, Send, Settings2, Square, UserMinus, UserPlus, Users, X } from 'lucide-react'
+import { Check, CheckCheck, FileText, Mic, Paperclip, Phone, Search, Send, Settings2, Square, UserMinus, UserPlus, Users, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { Avatar, EmptyState, Modal } from '../components/ui'
@@ -11,7 +11,7 @@ import type { Contact, Conversation, Message } from '../types'
 
 export function ChatPage(): React.JSX.Element {
   const location = useLocation()
-  const { user, startDirectCall } = useApp()
+  const { user, presenceByUserId, startDirectCall } = useApp()
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -71,6 +71,15 @@ export function ChatPage(): React.JSX.Element {
       }
     })
     socket.on('conversation:updated', () => void loadConversations())
+    socket.on('message:updated', (message: Message) => {
+      setMessages((current) => current.map((item) => item.id === message.id ? { ...item, ...message } : item))
+      void loadConversations()
+    })
+    socket.on('conversation:read', (read: { conversationId: string; userId: string }) => {
+      if (read.userId !== user?.id && read.conversationId === selectedIdRef.current) {
+        void api.messages(read.conversationId).then((result) => setMessages(result.messages))
+      }
+    })
     return () => { socket.disconnect() }
   }, [])
 
@@ -101,6 +110,9 @@ export function ChatPage(): React.JSX.Element {
   const selected = conversations.find((item) => item.id === selectedId)
   const directContact = selected?.kind === 'direct'
     ? selected.members.find((member) => member.id !== user?.id)
+    : undefined
+  const directStatus = directContact
+    ? presenceByUserId[directContact.id] ?? directContact.status
     : undefined
   const filtered = conversations.filter((item) => item.title?.toLowerCase().includes(search.toLowerCase()))
   const visibleMessages = messageSearch.trim()
@@ -251,14 +263,30 @@ export function ChatPage(): React.JSX.Element {
       </aside>
       <section className="chat-main">
         {selected ? <>
-          <header className="chat-header"><div><Avatar name={selected.title || 'Чат'} src={directContact?.avatarUrl ?? selected.avatarUrl} status={directContact?.status} /><div><h2>{selected.title}</h2><span>{selected.kind === 'group' ? `${selected.members.length} участников` : 'В сети'}</span></div></div><div><button className={`icon-button ${messageSearchOpen ? 'active' : ''}`} onClick={() => setMessageSearchOpen((open) => !open)} title="Поиск по сообщениям" aria-label="Поиск по сообщениям"><Search size={19} /></button>{selected.kind === 'group' && selected.currentUserRole === 'owner' && <button className="icon-button" onClick={openGroupManagement} title="Управление группой" aria-label="Управление группой"><Settings2 size={19} /></button>}{directContact && <button className="icon-button call-button" onClick={() => void startCall()} disabled={calling} title={`Позвонить: ${directContact.displayName}`} aria-label={`Позвонить: ${directContact.displayName}`}><Phone size={19} /></button>}</div></header>
+          <header className="chat-header"><div><Avatar name={selected.title || 'Чат'} src={directContact?.avatarUrl ?? selected.avatarUrl} status={directStatus} /><div><h2>{selected.title}</h2><span className={selected.kind === 'direct' ? `chat-presence-${directStatus ?? 'offline'}` : ''}>{selected.kind === 'group' ? `${selected.members.length} участников` : directStatus === 'online' ? 'В сети' : 'Не в сети'}</span></div></div><div><button className={`icon-button ${messageSearchOpen ? 'active' : ''}`} onClick={() => setMessageSearchOpen((open) => !open)} title="Поиск по сообщениям" aria-label="Поиск по сообщениям"><Search size={19} /></button>{selected.kind === 'group' && selected.currentUserRole === 'owner' && <button className="icon-button" onClick={openGroupManagement} title="Управление группой" aria-label="Управление группой"><Settings2 size={19} /></button>}{directContact && <button className="icon-button call-button" onClick={() => void startCall()} disabled={calling} title={`Позвонить: ${directContact.displayName}`} aria-label={`Позвонить: ${directContact.displayName}`}><Phone size={19} /></button>}</div></header>
           {messageSearchOpen && <div className="message-search-bar"><Search size={18} /><input value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="Поиск по сообщениям" autoFocus /><button className="icon-button" onClick={() => { setMessageSearch(''); setMessageSearchOpen(false) }} title="Закрыть поиск"><X size={17} /></button></div>}
           {callError && <div className="chat-call-error">{callError}</div>}
           <div className="message-scroll">
             <div className="message-date"><span>Сегодня</span></div>
             {visibleMessages.map((message) => {
               const own = message.senderId === user?.id
-              return <div className={`message ${own ? 'own' : ''}`} key={message.id}>{!own && <Avatar name={message.senderName || 'User'} src={message.senderAvatarUrl} size="small" />}<div className="message-body">{!own && <strong>{message.senderName}</strong>}{message.body && <p>{message.body}</p>}{message.attachments?.map((attachment) => attachment.mimeType.startsWith('audio/') ? <audio controls src={attachment.url} key={attachment.id} /> : <a className="file-attachment" href={attachment.url} target="_blank" rel="noreferrer" key={attachment.id}><span><FileText size={20} /></span><div><strong>{attachment.originalName}</strong><small>{Math.max(1, Math.round(attachment.byteSize / 1024))} КБ</small></div></a>)}<time>{shortTime(message.createdAt)}</time></div></div>
+              const callMetadata = message.kind === 'system' && message.metadata?.type === 'call'
+                ? message.metadata
+                : null
+              if (callMetadata) {
+                return <div className="call-history-message" key={message.id}><span><Phone size={18} /></span><div><strong>{own ? 'Исходящий звонок' : 'Входящий звонок'}</strong><small>{message.body || 'Звонок'}</small></div><time>{shortTime(message.createdAt)}</time></div>
+              }
+              return <div className={`message ${own ? 'own' : ''}`} key={message.id}>
+                {!own && <Avatar name={message.senderName || 'User'} src={message.senderAvatarUrl} size="small" />}
+                <div className="message-body">
+                  {!own && <strong>{message.senderName}</strong>}
+                  {message.body && <p>{message.body}</p>}
+                  {message.attachments?.map((attachment) => attachment.mimeType.startsWith('audio/')
+                    ? <audio controls src={attachment.url} key={attachment.id} />
+                    : <a className="file-attachment" href={attachment.url} target="_blank" rel="noreferrer" key={attachment.id}><span><FileText size={20} /></span><div><strong>{attachment.originalName}</strong><small>{Math.max(1, Math.round(attachment.byteSize / 1024))} КБ</small></div></a>)}
+                  <span className="message-meta"><time>{shortTime(message.createdAt)}</time>{own && (message.deliveryStatus === 'read' ? <CheckCheck aria-label="Прочитано" /> : <Check aria-label="Доставлено" />)}</span>
+                </div>
+              </div>
             })}
             <div ref={bottomRef} />
           </div>
@@ -271,7 +299,7 @@ export function ChatPage(): React.JSX.Element {
         <label><span>Название группы</span><input value={groupTitle} onChange={(event) => setGroupTitle(event.target.value)} maxLength={150} autoFocus placeholder="Например, Команда проекта" /></label>
         <div className="group-member-picker">
           <strong>Участники</strong>
-          {contacts.map((contact) => <label key={contact.id} className="group-member-option"><input type="checkbox" checked={groupMemberIds.includes(contact.id)} onChange={() => setGroupMemberIds((current) => current.includes(contact.id) ? current.filter((id) => id !== contact.id) : [...current, contact.id])} /><div className="group-member-avatar"><Avatar name={contact.displayName} src={contact.avatarUrl} size="small" /></div><span className="group-member-copy">{contact.displayName}<small>{contact.email}</small></span></label>)}
+          {contacts.map((contact) => <label key={contact.id} className="group-member-option"><input type="checkbox" checked={groupMemberIds.includes(contact.id)} onChange={() => setGroupMemberIds((current) => current.includes(contact.id) ? current.filter((id) => id !== contact.id) : [...current, contact.id])} /><div className="group-member-avatar"><Avatar name={contact.displayName} src={contact.avatarUrl} size="small" /></div><span className="group-member-copy">{contact.displayName}{contact.email && <small>{contact.email}</small>}{!contact.email && contact.phone && <small>{contact.phone}</small>}</span></label>)}
           {!contacts.length && <p className="group-empty">Сначала добавьте пользователей в контакты.</p>}
         </div>
         {groupError && <p className="form-error">{groupError}</p>}
@@ -281,8 +309,8 @@ export function ChatPage(): React.JSX.Element {
     <Modal open={manageGroupOpen} onClose={() => setManageGroupOpen(false)} title="Управление группой" width={520}>
       {selected?.kind === 'group' && <div className="form-stack">
         <label><span>Название группы</span><div className="group-title-editor"><input value={groupTitle} onChange={(event) => setGroupTitle(event.target.value)} maxLength={150} /><button className="button secondary" onClick={() => void renameGroup()} disabled={!groupTitle.trim() || groupSaving}>Сохранить</button></div></label>
-        <div className="group-management-list"><strong>Участники</strong>{selected.members.map((member) => <div className="group-management-row" key={member.id}><div className="group-member-avatar"><Avatar name={member.displayName} src={member.avatarUrl} size="small" /></div><span className="group-member-copy">{member.displayName}<small>{member.role === 'owner' ? 'Владелец' : member.email}</small></span>{member.role !== 'owner' && <button className="icon-button danger" onClick={() => void removeGroupMember(member.id)} title="Удалить участника"><UserMinus size={17} /></button>}</div>)}</div>
-        <div className="group-management-list"><strong>Добавить участника</strong>{contacts.filter((contact) => !selected.members.some((member) => member.id === contact.id)).map((contact) => <div className="group-management-row" key={contact.id}><div className="group-member-avatar"><Avatar name={contact.displayName} src={contact.avatarUrl} size="small" /></div><span className="group-member-copy">{contact.displayName}<small>{contact.email}</small></span><button className="icon-button accent" onClick={() => void addGroupMember(contact.id)} title="Добавить участника"><UserPlus size={17} /></button></div>)}{contacts.every((contact) => selected.members.some((member) => member.id === contact.id)) && <p className="group-empty">Все контакты уже добавлены.</p>}</div>
+        <div className="group-management-list"><strong>Участники</strong>{selected.members.map((member) => <div className="group-management-row" key={member.id}><div className="group-member-avatar"><Avatar name={member.displayName} src={member.avatarUrl} size="small" /></div><span className="group-member-copy">{member.displayName}<small>{member.role === 'owner' ? 'Владелец' : member.email || member.phone || 'Контакт Aleph ID'}</small></span>{member.role !== 'owner' && <button className="icon-button danger" onClick={() => void removeGroupMember(member.id)} title="Удалить участника"><UserMinus size={17} /></button>}</div>)}</div>
+        <div className="group-management-list"><strong>Добавить участника</strong>{contacts.filter((contact) => !selected.members.some((member) => member.id === contact.id)).map((contact) => <div className="group-management-row" key={contact.id}><div className="group-member-avatar"><Avatar name={contact.displayName} src={contact.avatarUrl} size="small" /></div><span className="group-member-copy">{contact.displayName}<small>{contact.email || contact.phone || 'Контакт Aleph ID'}</small></span><button className="icon-button accent" onClick={() => void addGroupMember(contact.id)} title="Добавить участника"><UserPlus size={17} /></button></div>)}{contacts.every((contact) => selected.members.some((member) => member.id === contact.id)) && <p className="group-empty">Все контакты уже добавлены.</p>}</div>
         {groupError && <p className="form-error">{groupError}</p>}
       </div>}
     </Modal>

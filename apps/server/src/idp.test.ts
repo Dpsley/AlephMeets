@@ -198,7 +198,6 @@ test('resolves a contact through phone_probe and user_info', async () => {
             phone: '79990000006',
             name: 'Phone',
             second_name: 'Contact',
-            email: 'phone-contact-test@aleph.local',
             time_zone: 'Europe/Moscow',
           },
         }
@@ -209,6 +208,7 @@ test('resolves a contact through phone_probe and user_info', async () => {
   try {
     const user = await findIdpContact('8 (999) 000-00-06')
     assert.equal(user.id, testId)
+    assert.equal(user.email, null)
     assert.deepEqual(paths, ['/id/service/phone_probe', '/id/service/user_info'])
   } finally {
     globalThis.fetch = originalFetch

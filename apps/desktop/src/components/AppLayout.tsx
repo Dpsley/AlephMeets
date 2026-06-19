@@ -25,7 +25,7 @@ const navItems = [
 
 export function AppLayout(): React.JSX.Element {
   const navigate = useNavigate()
-  const { user, loading, error, logout, reloadMeetings } = useApp()
+  const { user, presenceByUserId, loading, error, logout, reloadMeetings } = useApp()
   const [joinOpen, setJoinOpen] = useState(false)
   const [joinValue, setJoinValue] = useState('')
   const [joinError, setJoinError] = useState<string | null>(null)
@@ -96,10 +96,10 @@ export function AppLayout(): React.JSX.Element {
             <span>Настройки</span>
           </NavLink>
           <div className="profile-compact">
-            <Avatar name={user?.displayName ?? 'User'} src={user?.avatarUrl} status={user?.status} />
+            <Avatar name={user?.displayName ?? 'User'} src={user?.avatarUrl} status={user ? presenceByUserId[user.id] ?? user.status : undefined} />
             <div>
               <strong>{user?.displayName ?? 'Загрузка...'}</strong>
-              <small>{user?.email ?? ''}</small>
+              {(user?.email || user?.phone) && <small>{user.email || user.phone}</small>}
             </div>
             <button className="profile-switch" onClick={() => void logout()} title="Выйти">
               <LogOut size={15} />

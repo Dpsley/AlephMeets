@@ -9,7 +9,7 @@ import {
   saveAuthTokens,
 } from '../lib/auth'
 import { API_URL, api } from '../lib/api'
-import type { Meeting, Message, User } from '../types'
+import type { DirectCallContext, Meeting, Message, User } from '../types'
 
 interface AppState {
   user: User | null
@@ -17,17 +17,19 @@ interface AppState {
   meetings: Meeting[]
   loading: boolean
   error: string | null
+  presenceByUserId: Record<string, User['status']>
   requestLoginCode: (phone: string) => Promise<void>
   verifyLoginCode: (phone: string, code: string) => Promise<void>
   logout: () => Promise<void>
   reloadMeetings: () => Promise<void>
-  inviteToCall: (targetUserId: string, meeting: Meeting) => void
+  inviteToCall: (targetUserId: string, meeting: Meeting, callContext: DirectCallContext) => void
   startDirectCall: (contact: User) => Promise<void>
 }
 
 interface IncomingCall {
   meeting: Meeting
   caller: User
+  callContext?: DirectCallContext
 }
 
 interface MessageNotice {
@@ -44,6 +46,7 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
   const [meetings, setMeetings] = useState<Meeting[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [presenceByUserId, setPresenceByUserId] = useState<Record<string, User['status']>>({})
   const [incomingCall, setIncomingCall] = useState<IncomingCall | null>(null)
   const [messageNotice, setMessageNotice] = useState<MessageNotice | null>(null)
   const callSocketRef = useRef<Socket | null>(null)
@@ -111,32 +114,41 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
       setMeetings([])
       setIncomingCall(null)
       setMessageNotice(null)
+      setPresenceByUserId({})
       setError(null)
       navigate('/chat')
     }
   }, [navigate])
 
-  const inviteToCall = useCallback((targetUserId: string, meeting: Meeting) => {
-    callSocketRef.current?.emit('call:invite', { targetUserId, meeting })
+  const inviteToCall = useCallback((targetUserId: string, meeting: Meeting, callContext: DirectCallContext) => {
+    callSocketRef.current?.emit('call:invite', { targetUserId, meeting, callContext })
   }, [])
 
   const startDirectCall = useCallback(async (contact: User): Promise<void> => {
     if (!user) throw new Error('Профиль пользователя не загружен.')
     const start = new Date()
+    const conversation = await api.createConversation([contact.id])
     const created = await api.createMeeting({
       title: `Звонок: ${user.displayName} — ${contact.displayName}`,
       startsAt: start.toISOString(),
       endsAt: new Date(start.getTime() + 60 * 60_000).toISOString(),
       timezone: user.timezone,
-      attendees: [contact.email],
+      attendees: contact.email ? [contact.email] : [],
+      attendeeUserIds: [contact.id],
       waitingRoom: false,
       muteOnEntry: false,
       allowJoinBeforeHost: true,
     })
     const activated = await api.updateMeetingStatus(created.meeting.id, 'live')
-    inviteToCall(contact.id, activated.meeting)
+    const callLog = await api.startCallLog(conversation.conversation.id, activated.meeting.id)
+    const callContext: DirectCallContext = {
+      conversationId: conversation.conversation.id,
+      messageId: callLog.message.id,
+      startedAt: start.toISOString(),
+    }
+    inviteToCall(contact.id, activated.meeting, callContext)
     await reloadMeetings()
-    navigate(`/meeting/${activated.meeting.id}`)
+    navigate(`/meeting/${activated.meeting.id}`, { state: { callContext } })
   }, [inviteToCall, navigate, reloadMeetings, user])
 
   useEffect(() => {
@@ -146,6 +158,14 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
       auth: (callback) => callback({ token: getAccessToken() }),
     })
     callSocketRef.current = socket
+    const heartbeat = setInterval(() => socket.emit('presence:heartbeat'), 30_000)
+    socket.on('connect', () => {
+      socket.emit('presence:heartbeat')
+      setPresenceByUserId((current) => ({ ...current, [user.id]: 'online' }))
+    })
+    socket.on('presence:changed', (presence: { userId: string; status: User['status'] }) => {
+      setPresenceByUserId((current) => ({ ...current, [presence.userId]: presence.status }))
+    })
     socket.on('call:incoming', (call: IncomingCall) => setIncomingCall(call))
     socket.on('message:new', (message: Message) => {
       if (message.senderId === user.id) return
@@ -167,6 +187,7 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
       }
     })
     return () => {
+      clearInterval(heartbeat)
       socket.disconnect()
       callSocketRef.current = null
       if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current)
@@ -207,12 +228,26 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
     }
   }, [incomingCall])
 
+  const declineIncomingCall = useCallback((): void => {
+    if (!incomingCall) return
+    if (incomingCall.callContext) {
+      void api.finishCallLog(
+        incomingCall.callContext.conversationId,
+        incomingCall.callContext.messageId,
+        'declined',
+        Date.now() - new Date(incomingCall.callContext.startedAt).getTime(),
+      )
+    }
+    setIncomingCall(null)
+  }, [incomingCall])
+
   const value = useMemo(() => ({
     user,
     authenticated: Boolean(user),
     meetings,
     loading,
     error,
+    presenceByUserId,
     requestLoginCode,
     verifyLoginCode,
     logout,
@@ -224,6 +259,7 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
     meetings,
     loading,
     error,
+    presenceByUserId,
     requestLoginCode,
     verifyLoginCode,
     logout,
@@ -235,17 +271,19 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
   return (
     <AppContext.Provider value={value}>
       {children}
-      <Modal open={Boolean(incomingCall)} onClose={() => setIncomingCall(null)} title="Входящий вызов" width={380}>
+      <Modal open={Boolean(incomingCall)} onClose={declineIncomingCall} title="Входящий вызов" width={380}>
         {incomingCall && <div className="incoming-call">
           <Avatar name={incomingCall.caller.displayName} src={incomingCall.caller.avatarUrl} size="large" />
           <strong>{incomingCall.caller.displayName}</strong>
           <span>приглашает вас в аудио- и видеозвонок</span>
           <div>
-            <button className="button secondary" onClick={() => setIncomingCall(null)}>Отклонить</button>
+            <button className="button secondary" onClick={declineIncomingCall}>Отклонить</button>
             <button className="button primary" onClick={() => {
               const call = incomingCall
               setIncomingCall(null)
-              navigate(`/meeting/${call.meeting.id}`, { state: { meeting: call.meeting } })
+              navigate(`/meeting/${call.meeting.id}`, {
+                state: { meeting: call.meeting, callContext: call.callContext },
+              })
             }}>Принять</button>
           </div>
         </div>}

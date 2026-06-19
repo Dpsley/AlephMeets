@@ -94,15 +94,10 @@ export const api = {
       body: JSON.stringify({ status }),
     }),
   contacts: () => request<{ contacts: Contact[] }>('/api/contacts'),
-  addContact: (identifier: string, favorite = false) =>
+  addContact: (identifier: string) =>
     request<{ contact: Contact }>('/api/contacts', {
       method: 'POST',
-      body: JSON.stringify({ email: identifier, favorite }),
-    }),
-  setContactFavorite: (id: string, favorite: boolean) =>
-    request<{ contact: Pick<Contact, 'id' | 'favorite'> }>(`/api/contacts/${id}/favorite`, {
-      method: 'PATCH',
-      body: JSON.stringify({ favorite }),
+      body: JSON.stringify({ email: identifier }),
     }),
   conversations: () => request<{ conversations: Conversation[] }>('/api/conversations'),
   createConversation: (memberIds: string[], title?: string) =>
@@ -133,6 +128,20 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ body }),
     }),
+  startCallLog: (conversationId: string, meetingId: string) =>
+    request<{ message: Message }>(`/api/conversations/${conversationId}/calls`, {
+      method: 'POST',
+      body: JSON.stringify({ meetingId }),
+    }),
+  finishCallLog: (
+    conversationId: string,
+    messageId: string,
+    status: 'ended' | 'declined' | 'missed',
+    durationMs: number,
+  ) => request<{ message: Message }>(`/api/conversations/${conversationId}/calls/${messageId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ status, durationMs }),
+  }),
   upload: (conversationId: string, file: Blob, name: string, kind = 'file', durationMs?: number) => {
     const form = new FormData()
     form.append('file', file, name)

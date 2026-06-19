@@ -27,7 +27,8 @@ import {
   testExchangeConnection,
 } from './exchange.js'
 import {
-  contactFavoriteSchema,
+  callLogFinishSchema,
+  callLogStartSchema,
   contactInputSchema,
   conversationInputSchema,
   conversationMembersSchema,
@@ -87,6 +88,15 @@ function bearerToken(authorization: string | undefined): string {
   return match?.[1]?.trim() ?? ''
 }
 
+function callSummary(status: 'ended' | 'declined' | 'missed', durationMs: number): string {
+  if (status === 'declined') return 'Отклоненный звонок'
+  if (status === 'missed') return 'Пропущенный звонок'
+  const totalSeconds = Math.max(0, Math.round(durationMs / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = String(totalSeconds % 60).padStart(2, '0')
+  return `Звонок завершен · ${minutes}:${seconds}`
+}
+
 export async function createApp(dependencies: AppDependencies = {}): Promise<FastifyInstance> {
   const authenticate = dependencies.authenticate ?? authenticateAccessToken
   const app = Fastify({ logger: true, bodyLimit: config.maxUploadBytes })
@@ -94,17 +104,34 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     cors: { origin: '*' },
     transports: ['websocket', 'polling'],
   })
+  const presenceDisconnectTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+  const setPresence = async (userId: string, status: 'online' | 'offline'): Promise<void> => {
+    await pool.query(
+      'UPDATE users SET presence = $2, last_seen_at = now() WHERE id = $1',
+      [userId, status],
+    )
+    io.emit('presence:changed', { userId, status })
+  }
 
   const emitMessageToMembers = async (
     conversationId: string,
     message: Record<string, unknown>,
+  ): Promise<void> => {
+    await emitToConversationMembers(conversationId, 'message:new', message)
+  }
+
+  const emitToConversationMembers = async (
+    conversationId: string,
+    event: string,
+    payload: Record<string, unknown>,
   ): Promise<void> => {
     const members = await pool.query(
       'SELECT user_id FROM conversation_members WHERE conversation_id = $1',
       [conversationId],
     )
     for (const member of members.rows) {
-      io.to(`user:${String(member.user_id)}`).emit('message:new', message)
+      io.to(`user:${String(member.user_id)}`).emit(event, payload)
     }
   }
 
@@ -187,6 +214,13 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     const socketUser = socket.data.user as CurrentUser
     socket.data.userId = socketUser.id
     socket.join(`user:${socketUser.id}`)
+    const disconnectTimer = presenceDisconnectTimers.get(socketUser.id)
+    if (disconnectTimer) clearTimeout(disconnectTimer)
+    presenceDisconnectTimers.delete(socketUser.id)
+    void setPresence(socketUser.id, 'online')
+    socket.on('presence:heartbeat', () => {
+      void pool.query('UPDATE users SET last_seen_at = now() WHERE id = $1', [socketUser.id])
+    })
     socket.on('conversation:join', async (conversationId: string) => {
       const membership = await pool.query(
         'SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2',
@@ -197,7 +231,11 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     socket.on('conversation:leave', (conversationId: string) => {
       socket.leave(`conversation:${conversationId}`)
     })
-    socket.on('call:invite', async (payload: { targetUserId?: string; meeting?: Record<string, unknown> }) => {
+    socket.on('call:invite', async (payload: {
+      targetUserId?: string
+      meeting?: Record<string, unknown>
+      callContext?: Record<string, unknown>
+    }) => {
       const targetUserId = payload.targetUserId
       const meetingId = typeof payload.meeting?.id === 'string' ? payload.meeting.id : undefined
       if (!targetUserId || !meetingId || targetUserId === socketUser.id) return
@@ -211,8 +249,23 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       io.to(`user:${targetUserId}`).emit('call:incoming', {
         meeting: payload.meeting,
         caller: socketUser,
+        callContext: payload.callContext,
       })
     })
+    socket.on('disconnect', () => {
+      const timer = setTimeout(() => {
+        presenceDisconnectTimers.delete(socketUser.id)
+        const activeSockets = io.sockets.adapter.rooms.get(`user:${socketUser.id}`)?.size ?? 0
+        if (activeSockets === 0) void setPresence(socketUser.id, 'offline')
+      }, 5_000)
+      presenceDisconnectTimers.set(socketUser.id, timer)
+    })
+  })
+
+  app.addHook('onClose', (_instance, done) => {
+    for (const timer of presenceDisconnectTimers.values()) clearTimeout(timer)
+    presenceDisconnectTimers.clear()
+    done()
   })
 
   app.get('/health', async () => {
@@ -245,7 +298,9 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
 
   app.get('/api/session', async () => {
     const result = await pool.query(
-      `SELECT id, phone, email, display_name, first_name, last_name, avatar_url, timezone, locale, presence AS status
+      `SELECT id, phone, email, display_name, first_name, last_name, avatar_url, timezone, locale,
+              CASE WHEN presence = 'online' AND last_seen_at >= now() - interval '90 seconds'
+                THEN 'online'::user_presence ELSE 'offline'::user_presence END AS status
        FROM users WHERE id = $1`,
       [currentUser.id],
     )
@@ -257,7 +312,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       `SELECT m.*,
          COALESCE(json_agg(json_build_object(
            'email', ma.email, 'userId', ma.user_id, 'response', ma.response
-         )) FILTER (WHERE ma.email IS NOT NULL), '[]') AS attendees
+         )) FILTER (WHERE ma.email IS NOT NULL OR ma.user_id IS NOT NULL), '[]') AS attendees
        FROM meetings m
        LEFT JOIN meeting_attendees ma ON ma.meeting_id = m.id
        WHERE m.host_id = $1 OR EXISTS (
@@ -275,7 +330,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       `SELECT m.*,
          COALESCE(json_agg(json_build_object(
            'email', ma.email, 'userId', ma.user_id, 'response', ma.response
-         )) FILTER (WHERE ma.email IS NOT NULL), '[]') AS attendees
+         )) FILTER (WHERE ma.email IS NOT NULL OR ma.user_id IS NOT NULL), '[]') AS attendees
        FROM meetings m
        LEFT JOIN meeting_attendees ma ON ma.meeting_id=m.id
        WHERE m.id::text=$1 OR lower(m.room_name)=lower($1)
@@ -316,8 +371,17 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
         await client.query(
           `INSERT INTO meeting_attendees (meeting_id, user_id, email)
            SELECT $1::uuid, id, $2 FROM users WHERE lower(email) = $2
-           UNION ALL SELECT $1::uuid, NULL, $2 WHERE NOT EXISTS (SELECT 1 FROM users WHERE lower(email) = $2)`,
+           UNION ALL SELECT $1::uuid, NULL, $2 WHERE NOT EXISTS (SELECT 1 FROM users WHERE lower(email) = $2)
+           ON CONFLICT DO NOTHING`,
           [row.id, email],
+        )
+      }
+      for (const userId of new Set(input.attendeeUserIds)) {
+        await client.query(
+          `INSERT INTO meeting_attendees (meeting_id, user_id, email)
+           SELECT $1::uuid, id, email FROM users WHERE id = $2
+           ON CONFLICT DO NOTHING`,
+          [row.id, userId],
         )
       }
       return camelizeRow(row)
@@ -369,9 +433,11 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
   app.get('/api/contacts', async () => {
     const result = await pool.query(
       `SELECT u.id, u.phone, u.email, u.display_name, u.first_name, u.last_name, u.avatar_url,
-              u.presence AS status, c.alias, c.favorite, c.created_at
+              CASE WHEN u.presence = 'online' AND u.last_seen_at >= now() - interval '90 seconds'
+                THEN 'online'::user_presence ELSE 'offline'::user_presence END AS status,
+              c.alias, c.created_at
        FROM contacts c JOIN users u ON u.id = c.contact_user_id
-       WHERE c.owner_id = $1 ORDER BY c.favorite DESC, u.display_name`,
+       WHERE c.owner_id = $1 ORDER BY u.display_name`,
       [currentUser.id],
     )
     return { contacts: camelizeRows(result.rows) }
@@ -384,26 +450,14 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       return reply.code(400).send({ error: 'cannot_add_self', message: 'Нельзя добавить себя в контакты.' })
     }
     const result = await pool.query(
-      `INSERT INTO contacts (owner_id, contact_user_id, alias, favorite)
-       VALUES ($1,$2,$3,$4)
+      `INSERT INTO contacts (owner_id, contact_user_id, alias)
+       VALUES ($1,$2,$3)
        ON CONFLICT (owner_id, contact_user_id)
-       DO UPDATE SET alias = EXCLUDED.alias, favorite = EXCLUDED.favorite
+       DO UPDATE SET alias = EXCLUDED.alias
        RETURNING *`,
-      [currentUser.id, contactUser.id, input.alias ?? null, input.favorite],
+      [currentUser.id, contactUser.id, input.alias ?? null],
     )
     return reply.code(201).send({ contact: camelizeRow(result.rows[0] as Record<string, unknown>) })
-  })
-
-  app.patch<{ Params: IdParams }>('/api/contacts/:id/favorite', async (request, reply) => {
-    const input = contactFavoriteSchema.parse(request.body)
-    const result = await pool.query(
-      `UPDATE contacts SET favorite = $3
-       WHERE owner_id = $1 AND contact_user_id = $2
-       RETURNING contact_user_id AS id, favorite`,
-      [currentUser.id, request.params.id, input.favorite],
-    )
-    if (!result.rowCount) return reply.code(404).send({ error: 'contact_not_found' })
-    return { contact: camelizeRow(result.rows[0] as Record<string, unknown>) }
   })
 
   app.get('/api/conversations', async () => {
@@ -412,8 +466,11 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
           COALESCE(c.title, max(u.display_name) FILTER (WHERE u.id <> $1)) AS title,
           c.avatar_url, c.updated_at, self_member.role AS current_user_role,
           COALESCE(json_agg(json_build_object(
-            'id', u.id, 'displayName', u.display_name, 'email', u.email,
-            'avatarUrl', u.avatar_url, 'status', u.presence, 'role', member.role
+            'id', u.id, 'displayName', u.display_name, 'email', u.email, 'phone', u.phone,
+            'avatarUrl', u.avatar_url,
+            'status', CASE WHEN u.presence = 'online' AND u.last_seen_at >= now() - interval '90 seconds'
+              THEN 'online' ELSE 'offline' END,
+            'role', member.role
           ) ORDER BY u.display_name), '[]') AS members,
           (SELECT json_build_object(
             'id', m.id, 'body', m.body, 'kind', m.kind, 'createdAt', m.created_at,
@@ -439,6 +496,28 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     const input = conversationInputSchema.parse(request.body)
     const memberIds = [...new Set([currentUser.id, ...input.memberIds])]
     const kind = memberIds.length === 2 && !input.title ? 'direct' : 'group'
+    if (kind === 'direct') {
+      const otherUserId = memberIds.find((id) => id !== currentUser.id)
+      const existing = await pool.query(
+        `SELECT conversation.* FROM conversations conversation
+         WHERE conversation.kind = 'direct'
+           AND EXISTS (
+             SELECT 1 FROM conversation_members member
+             WHERE member.conversation_id = conversation.id AND member.user_id = $1
+           )
+           AND EXISTS (
+             SELECT 1 FROM conversation_members member
+             WHERE member.conversation_id = conversation.id AND member.user_id = $2
+           )
+           AND (SELECT count(*) FROM conversation_members member
+                WHERE member.conversation_id = conversation.id) = 2
+         LIMIT 1`,
+        [currentUser.id, otherUserId],
+      )
+      if (existing.rowCount) {
+        return { conversation: camelizeRow(existing.rows[0] as Record<string, unknown>) }
+      }
+    }
     const conversation = await inTransaction(async (client) => {
       const created = await client.query(
         `INSERT INTO conversations (kind, title, created_by) VALUES ($1,$2,$3) RETURNING *`,
@@ -530,6 +609,12 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     if (!membership.rowCount) return reply.code(404).send({ error: 'conversation_not_found' })
     const result = await pool.query(
       `SELECT m.*, u.display_name AS sender_name, u.avatar_url AS sender_avatar_url,
+        CASE WHEN NOT EXISTS (
+          SELECT 1 FROM conversation_members recipient
+          WHERE recipient.conversation_id = m.conversation_id
+            AND recipient.user_id IS DISTINCT FROM m.sender_id
+            AND COALESCE(recipient.last_read_at, 'epoch') < m.created_at
+        ) THEN 'read' ELSE 'delivered' END AS delivery_status,
         COALESCE(json_agg(json_build_object(
           'id', a.id, 'originalName', a.original_name, 'mimeType', a.mime_type,
           'byteSize', a.byte_size, 'durationMs', a.duration_ms,
@@ -543,22 +628,54 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
        ORDER BY m.created_at`,
       [request.params.id, config.apiUrl],
     )
-    await pool.query(
-      `UPDATE conversation_members SET last_read_at = now()
-       WHERE conversation_id = $1 AND user_id = $2`,
+    const read = await pool.query(
+      `UPDATE conversation_members member SET last_read_at = latest.created_at
+       FROM (
+         SELECT max(created_at) AS created_at FROM messages
+         WHERE conversation_id = $1 AND sender_id IS DISTINCT FROM $2 AND deleted_at IS NULL
+       ) latest
+       WHERE member.conversation_id = $1 AND member.user_id = $2
+         AND latest.created_at IS NOT NULL
+         AND COALESCE(member.last_read_at, 'epoch') < latest.created_at
+       RETURNING member.last_read_at`,
       [request.params.id, currentUser.id],
     )
+    if (read.rows[0]) {
+      await emitToConversationMembers(request.params.id, 'conversation:read', {
+        conversationId: request.params.id,
+        userId: currentUser.id,
+        readAt: read.rows[0].last_read_at,
+      })
+    }
     return { messages: camelizeRows(result.rows) }
   })
 
   app.patch<{ Params: IdParams }>('/api/conversations/:id/read', async (request, reply) => {
     const result = await pool.query(
-      `UPDATE conversation_members SET last_read_at = now()
-       WHERE conversation_id = $1 AND user_id = $2
-       RETURNING conversation_id`,
+      `UPDATE conversation_members member SET last_read_at = latest.created_at
+       FROM (
+         SELECT max(created_at) AS created_at FROM messages
+         WHERE conversation_id = $1 AND sender_id IS DISTINCT FROM $2 AND deleted_at IS NULL
+       ) latest
+       WHERE member.conversation_id = $1 AND member.user_id = $2
+         AND latest.created_at IS NOT NULL
+         AND COALESCE(member.last_read_at, 'epoch') < latest.created_at
+       RETURNING member.conversation_id, member.last_read_at`,
       [request.params.id, currentUser.id],
     )
-    if (!result.rowCount) return reply.code(404).send({ error: 'conversation_not_found' })
+    if (result.rows[0]) {
+      await emitToConversationMembers(request.params.id, 'conversation:read', {
+        conversationId: request.params.id,
+        userId: currentUser.id,
+        readAt: result.rows[0].last_read_at,
+      })
+    } else {
+      const membership = await pool.query(
+        'SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND user_id = $2',
+        [request.params.id, currentUser.id],
+      )
+      if (!membership.rowCount) return reply.code(404).send({ error: 'conversation_not_found' })
+    }
     return { success: true }
   })
 
@@ -577,10 +694,74 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       ...camelizeRow(result.rows[0] as Record<string, unknown>),
       senderName: currentUser.displayName,
       senderAvatarUrl: currentUser.avatarUrl,
+      deliveryStatus: 'delivered',
       attachments: [],
     }
     await emitMessageToMembers(request.params.id, message)
     return reply.code(201).send({ message })
+  })
+
+  app.post<{ Params: IdParams }>('/api/conversations/:id/calls', async (request, reply) => {
+    const input = callLogStartSchema.parse(request.body)
+    const allowed = await pool.query(
+      `SELECT 1 FROM conversations conversation
+       JOIN conversation_members caller
+         ON caller.conversation_id = conversation.id AND caller.user_id = $2
+       JOIN conversation_members recipient
+         ON recipient.conversation_id = conversation.id AND recipient.user_id <> $2
+       JOIN meetings meeting ON meeting.id = $3 AND meeting.host_id = $2
+       JOIN meeting_attendees attendee
+         ON attendee.meeting_id = meeting.id AND attendee.user_id = recipient.user_id
+       WHERE conversation.id = $1 AND conversation.kind = 'direct'`,
+      [request.params.id, currentUser.id, input.meetingId],
+    )
+    if (!allowed.rowCount) return reply.code(403).send({ error: 'call_log_not_allowed' })
+    const result = await pool.query(
+      `INSERT INTO messages (conversation_id, sender_id, kind, body, metadata)
+       VALUES ($1,$2,'system','Звонок',jsonb_build_object(
+         'type','call','meetingId',$3::text,'status','started','startedAt',now()
+       )) RETURNING *`,
+      [request.params.id, currentUser.id, input.meetingId],
+    )
+    await pool.query('UPDATE conversations SET updated_at = now() WHERE id = $1', [request.params.id])
+    const message = {
+      ...camelizeRow(result.rows[0] as Record<string, unknown>),
+      senderName: currentUser.displayName,
+      senderAvatarUrl: currentUser.avatarUrl,
+      deliveryStatus: 'delivered',
+      attachments: [],
+    }
+    await emitMessageToMembers(request.params.id, message)
+    return reply.code(201).send({ message })
+  })
+
+  app.patch<{ Params: { id: string; messageId: string } }>('/api/conversations/:id/calls/:messageId', async (request, reply) => {
+    const input = callLogFinishSchema.parse(request.body)
+    const body = callSummary(input.status, input.durationMs)
+    const result = await pool.query(
+      `UPDATE messages message SET
+         body = $4,
+         metadata = message.metadata || jsonb_build_object(
+           'status',$3::text,'durationMs',$5::int,'endedAt',now()
+         ),
+         edited_at = now()
+       WHERE message.id = $2 AND message.conversation_id = $1
+         AND message.kind = 'system' AND message.metadata->>'type' = 'call'
+         AND EXISTS (
+           SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = message.conversation_id AND member.user_id = $6
+         )
+       RETURNING *`,
+      [request.params.id, request.params.messageId, input.status, body, input.durationMs, currentUser.id],
+    )
+    if (!result.rowCount) return reply.code(404).send({ error: 'call_log_not_found' })
+    const message = {
+      ...camelizeRow(result.rows[0] as Record<string, unknown>),
+      deliveryStatus: 'delivered',
+      attachments: [],
+    }
+    await emitToConversationMembers(request.params.id, 'message:updated', message)
+    return { message }
   })
 
   app.post<{ Params: IdParams }>('/api/conversations/:id/attachments', async (request, reply) => {
@@ -623,6 +804,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
         ...camelizeRow(row),
         senderName: currentUser.displayName,
         senderAvatarUrl: currentUser.avatarUrl,
+        deliveryStatus: 'delivered',
         attachments: [
           {
             ...camelizeRow(attachment.rows[0] as Record<string, unknown>),

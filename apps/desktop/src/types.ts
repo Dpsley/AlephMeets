@@ -1,7 +1,7 @@
 export interface User {
   id: string
-  phone?: string
-  email: string
+  phone?: string | null
+  email: string | null
   displayName: string
   firstName?: string
   lastName?: string
@@ -12,7 +12,7 @@ export interface User {
 }
 
 export interface Attendee {
-  email: string
+  email: string | null
   userId?: string
   response: 'invited' | 'accepted' | 'declined' | 'tentative'
 }
@@ -35,7 +35,15 @@ export interface Meeting {
 
 export interface Contact extends User {
   alias?: string
-  favorite: boolean
+}
+
+export interface CallMessageMetadata {
+  type: 'call'
+  meetingId: string
+  status: 'started' | 'ended' | 'declined' | 'missed'
+  startedAt: string
+  endedAt?: string
+  durationMs?: number
 }
 
 export interface Attachment {
@@ -56,7 +64,16 @@ export interface Message {
   kind: 'text' | 'file' | 'audio' | 'system'
   body?: string
   createdAt: string
+  editedAt?: string | null
+  deliveryStatus: 'delivered' | 'read'
+  metadata: CallMessageMetadata | Record<string, unknown>
   attachments: Attachment[]
+}
+
+export interface DirectCallContext {
+  conversationId: string
+  messageId: string
+  startedAt: string
 }
 
 export interface Conversation {

@@ -37,7 +37,7 @@ export function LoginPage(): React.JSX.Element {
     }
   }
 
-  if (loading) return <div className="auth-page"><span className="spinner" /></div>
+  if (loading) return <div className="auth-page"><header><BrandMark /><strong>AlephMeets</strong><WindowControls /></header><span className="spinner" /></div>
 
   return (
     <div className="auth-page">

@@ -1,5 +1,6 @@
 import clsx from 'clsx'
 import { X } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { initials } from '../lib/format'
 
 export function Avatar({
@@ -13,9 +14,15 @@ export function Avatar({
   status?: string
   size?: 'small' | 'medium' | 'large'
 }): React.JSX.Element {
+  const [imageFailed, setImageFailed] = useState(false)
+
+  useEffect(() => setImageFailed(false), [src])
+
   return (
     <span className={clsx('avatar', `avatar-${size}`)} aria-label={name}>
-      {src ? <img src={src} alt="" /> : <span>{initials(name)}</span>}
+      {src && !imageFailed
+        ? <img src={src} alt="" onError={() => setImageFailed(true)} />
+        : <span>{initials(name)}</span>}
       {status && <i className={clsx('presence', `presence-${status}`)} />}
     </span>
   )
