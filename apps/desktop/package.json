@@ -11,7 +11,9 @@
     "icons": "node scripts/generate-icons.mjs",
     "build": "npm run icons && electron-vite build && electron-builder --dir",
     "dist:win": "npm run icons && electron-vite build && electron-builder --win nsis",
-    "dist:mac": "npm run icons && electron-vite build && electron-builder --mac dmg zip",
+    "dist:mac": "npm run icons && electron-vite build && electron-builder --mac --universal",
+    "dist:mac:x64": "npm run icons && electron-vite build && electron-builder --mac --x64",
+    "dist:mac:arm64": "npm run icons && electron-vite build && electron-builder --mac --arm64",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run"
   },
@@ -53,13 +55,23 @@
     "mac": {
       "icon": "build/icon.png",
       "category": "public.app-category.productivity",
-      "target": ["dmg", "zip"],
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["universal"]
+        },
+        {
+          "target": "zip",
+          "arch": ["universal"]
+        }
+      ],
       "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
       "extendInfo": {
         "NSCameraUsageDescription": "AlephMeets uses the camera for video meetings.",
         "NSMicrophoneUsageDescription": "AlephMeets uses the microphone for meetings and voice messages.",
-        "NSScreenCaptureDescription": "AlephMeets uses screen capture when you share your screen."
+        "NSScreenCaptureUsageDescription": "AlephMeets uses screen capture when you share your screen."
       }
     },
     "win": {

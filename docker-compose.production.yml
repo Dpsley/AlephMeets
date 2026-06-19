@@ -62,8 +62,8 @@ services:
     image: caddy:2-alpine
     restart: unless-stopped
     environment:
-      API_DOMAIN: ${API_DOMAIN:?API_DOMAIN is required}
-      LIVEKIT_DOMAIN: ${LIVEKIT_DOMAIN:?LIVEKIT_DOMAIN is required}
+      API_DOMAIN: ${API_DOMAIN:-meets-api.alephtrade.com}
+      LIVEKIT_DOMAIN: ${LIVEKIT_DOMAIN:-meets-livekit.alephtrade.com}
     depends_on:
       api:
         condition: service_healthy
