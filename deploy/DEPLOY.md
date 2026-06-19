@@ -11,7 +11,28 @@ expected public certificates before DNS propagation completes.
 
 ## 1. Prepare the host
 
-Install Docker Engine with the Compose plugin, then allow the required ports:
+Install Docker Engine with the Compose plugin from Docker's Ubuntu repository:
+
+```bash
+apt-get update
+apt-get install -y ca-certificates curl
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo \"${UBUNTU_CODENAME:-$VERSION_CODENAME}\") stable" \
+  > /etc/apt/sources.list.d/docker.list
+
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
+docker version
+docker compose version
+```
+
+Then allow the required ports:
 
 ```bash
 sudo ufw allow OpenSSH
@@ -73,6 +94,40 @@ curl https://meets-api.alephtrade.com/health
 ```
 
 Expected response: `{"status":"ok"}`.
+
+### Existing Nginx already owns ports 80/443
+
+Do not stop a shared web server blindly. Remove the failed Caddy container and
+publish API/LiveKit signaling on loopback only:
+
+```bash
+docker compose --env-file .env.production -f docker-compose.production.yml \
+  rm -sf caddy
+
+docker compose --env-file .env.production \
+  -f docker-compose.production.yml \
+  -f deploy/docker-compose.nginx.yml \
+  up -d --build postgres redis livekit api
+
+cp deploy/alephmeets.nginx.conf /etc/nginx/sites-available/alephmeets
+ln -sfn /etc/nginx/sites-available/alephmeets \
+  /etc/nginx/sites-enabled/alephmeets
+nginx -t
+systemctl reload nginx
+```
+
+Issue certificates with the Nginx Certbot plugin:
+
+```bash
+apt-get update
+apt-get install -y certbot python3-certbot-nginx
+certbot --nginx \
+  -d meets-api.alephtrade.com \
+  -d meets-livekit.alephtrade.com
+```
+
+The override binds `4100` and `7880` to `127.0.0.1`, so they are available to
+host Nginx but are not exposed directly to the internet.
 
 ## 4. Build desktop clients for this server
 
