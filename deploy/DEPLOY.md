@@ -129,6 +129,35 @@ certbot --nginx \
 The override binds `4100` and `7880` to `127.0.0.1`, so they are available to
 host Nginx but are not exposed directly to the internet.
 
+### Existing Apache already owns ports 80/443
+
+Use the Apache override and virtual hosts instead of Caddy:
+
+```bash
+docker compose --env-file .env.production -f docker-compose.production.yml \
+  rm -sf caddy
+
+docker compose --env-file .env.production \
+  -f docker-compose.production.yml \
+  -f deploy/docker-compose.apache.yml \
+  up -d --build postgres redis livekit api
+
+a2enmod proxy proxy_http proxy_wstunnel ssl headers
+cp deploy/alephmeets.apache.conf /etc/apache2/sites-available/alephmeets.conf
+a2ensite alephmeets.conf
+apache2ctl configtest
+systemctl reload apache2
+
+apt-get update
+apt-get install -y certbot python3-certbot-apache
+certbot --apache \
+  -d meets-api.alephtrade.com \
+  -d meets-livekit.alephtrade.com
+```
+
+The Apache configuration supports regular HTTP, Socket.IO WebSocket upgrades,
+LiveKit signaling and uploads up to 100 MB.
+
 ## 4. Build desktop clients for this server
 
 `VITE_API_URL` is compiled into Electron. A package built without it uses
