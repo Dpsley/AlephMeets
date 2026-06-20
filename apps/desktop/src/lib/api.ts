@@ -93,6 +93,13 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     }),
+  transferMeetingHost: (id: string, newHostId: string) =>
+    request<{ meeting: Meeting }>(`/api/meetings/${id}/host`, {
+      method: 'POST',
+      body: JSON.stringify({ newHostId }),
+    }),
+  endMeetingForEveryone: (id: string) =>
+    request<{ meeting: Meeting }>(`/api/meetings/${id}/end`, { method: 'POST' }),
   contacts: () => request<{ contacts: Contact[] }>('/api/contacts'),
   addContact: (identifier: string) =>
     request<{ contact: Contact }>('/api/contacts', {

@@ -176,3 +176,8 @@ html:not([data-platform="darwin"]) .auth-page > header { padding-right: 152px; }
 .call-history-message small, .call-history-message time { color: #7f8791; font-size: 10px; }
 .call-history-message time { margin-left: 8px; }
 .chat-header .chat-presence-offline { color: #8b929c; }
+.meeting-room .modal-card { color: #202124; }
+.meeting-exit-form > p { margin: 0; color: #666e78; font-size: 13px; line-height: 1.5; }
+.meeting-exit-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.meeting-end-button { color: #fff; background: #d84343; }
+.meeting-end-button:hover:not(:disabled) { background: #bd3535; }

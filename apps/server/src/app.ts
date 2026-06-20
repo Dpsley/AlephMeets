@@ -6,7 +6,7 @@ import cors from '@fastify/cors'
 import multipart from '@fastify/multipart'
 import fastifyStatic from '@fastify/static'
 import Fastify, { type FastifyInstance } from 'fastify'
-import { AccessToken } from 'livekit-server-sdk'
+import { AccessToken, RoomServiceClient } from 'livekit-server-sdk'
 import { nanoid } from 'nanoid'
 import { Server as SocketServer } from 'socket.io'
 import { ZodError } from 'zod'
@@ -34,6 +34,7 @@ import {
   conversationMembersSchema,
   conversationTitleSchema,
   exchangeSettingsSchema,
+  meetingHostTransferSchema,
   meetingInputSchema,
   messageInputSchema,
 } from './schemas.js'
@@ -54,6 +55,7 @@ interface IdParams {
 
 interface AppDependencies {
   authenticate?: (accessToken: string) => Promise<CurrentUser>
+  roomService?: Pick<RoomServiceClient, 'deleteRoom' | 'listParticipants' | 'listRooms'>
 }
 
 interface ExchangeAccountRow {
@@ -206,6 +208,11 @@ function callSummary(status: 'ended' | 'declined' | 'missed', durationMs: number
 
 export async function createApp(dependencies: AppDependencies = {}): Promise<FastifyInstance> {
   const authenticate = dependencies.authenticate ?? authenticateAccessToken
+  const roomService = dependencies.roomService ?? new RoomServiceClient(
+    config.livekitUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:'),
+    config.livekitApiKey,
+    config.livekitApiSecret,
+  )
   const app = Fastify({ logger: true, bodyLimit: config.maxUploadBytes })
   const io = new SocketServer(app.server, {
     cors: { origin: '*' },
@@ -308,6 +315,21 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     ])
     for (const userId of userIds) {
       io.to(`user:${userId}`).emit('conversation:updated', { conversationId })
+    }
+  }
+
+  const emitMeetingUpdated = async (
+    meetingId: string,
+    payload: Record<string, unknown>,
+  ): Promise<void> => {
+    const recipients = await pool.query(
+      `SELECT host_id AS user_id FROM meetings WHERE id=$1
+       UNION
+       SELECT user_id FROM meeting_attendees WHERE meeting_id=$1 AND user_id IS NOT NULL`,
+      [meetingId],
+    )
+    for (const recipient of recipients.rows) {
+      io.to(`user:${String(recipient.user_id)}`).emit('meeting:updated', payload)
     }
   }
 
@@ -560,6 +582,104 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     )
     if (!result.rowCount) return reply.code(404).send({ error: 'meeting_not_found' })
     return { meeting: camelizeRow(result.rows[0] as Record<string, unknown>) }
+  })
+
+  app.post<{ Params: IdParams }>('/api/meetings/:id/host', async (request, reply) => {
+    const { newHostId } = meetingHostTransferSchema.parse(request.body)
+    const meetingResult = await pool.query(
+      'SELECT id, host_id, room_name, status FROM meetings WHERE id=$1',
+      [request.params.id],
+    )
+    const meeting = meetingResult.rows[0] as {
+      id: string
+      host_id: string
+      room_name: string
+      status: string
+    } | undefined
+    if (!meeting) return reply.code(404).send({ error: 'meeting_not_found', message: 'Встреча не найдена.' })
+    if (meeting.host_id !== currentUser.id) {
+      return reply.code(403).send({ error: 'organizer_required', message: 'Передать роль может только организатор.' })
+    }
+    if (meeting.status !== 'live') {
+      return reply.code(409).send({ error: 'meeting_not_live', message: 'Встреча сейчас не активна.' })
+    }
+    if (newHostId === currentUser.id) {
+      return reply.code(400).send({ error: 'already_organizer', message: 'Вы уже являетесь организатором.' })
+    }
+
+    const participants = await roomService.listParticipants(meeting.room_name)
+    if (!participants.some((participant) => participant.identity === newHostId)) {
+      return reply.code(409).send({
+        error: 'participant_not_connected',
+        message: 'Выбранный участник уже вышел из конференции.',
+      })
+    }
+
+    const updated = await inTransaction(async (client) => {
+      const locked = await client.query(
+        'SELECT host_id, status FROM meetings WHERE id=$1 FOR UPDATE',
+        [meeting.id],
+      )
+      if (locked.rows[0]?.host_id !== currentUser.id) {
+        throw Object.assign(new Error('Организатор встречи уже изменился.'), { statusCode: 409 })
+      }
+      if (locked.rows[0]?.status !== 'live') {
+        throw Object.assign(new Error('Встреча уже завершена.'), { statusCode: 409 })
+      }
+      const newHost = await client.query('SELECT id FROM users WHERE id=$1', [newHostId])
+      if (!newHost.rowCount) {
+        throw Object.assign(new Error('Участник не найден.'), { statusCode: 404 })
+      }
+      await client.query(
+        `INSERT INTO meeting_attendees (meeting_id, user_id, email)
+         SELECT $1, id, email FROM users WHERE id IN ($2,$3)
+         ON CONFLICT DO NOTHING`,
+        [meeting.id, currentUser.id, newHostId],
+      )
+      const result = await client.query(
+        'UPDATE meetings SET host_id=$1, updated_at=now() WHERE id=$2 RETURNING *',
+        [newHostId, meeting.id],
+      )
+      return camelizeRow(result.rows[0] as Record<string, unknown>)
+    })
+    await emitMeetingUpdated(meeting.id, {
+      meetingId: meeting.id,
+      hostId: newHostId,
+      status: 'live',
+    })
+    return { meeting: updated }
+  })
+
+  app.post<{ Params: IdParams }>('/api/meetings/:id/end', async (request, reply) => {
+    const updated = await inTransaction(async (client) => {
+      const result = await client.query(
+        'SELECT * FROM meetings WHERE id=$1 FOR UPDATE',
+        [request.params.id],
+      )
+      const meeting = result.rows[0] as Record<string, unknown> | undefined
+      if (!meeting) {
+        throw Object.assign(new Error('Встреча не найдена.'), { statusCode: 404 })
+      }
+      if (meeting.host_id !== currentUser.id) {
+        throw Object.assign(new Error('Завершить встречу может только организатор.'), { statusCode: 403 })
+      }
+      if (meeting.status === 'ended' || meeting.status === 'cancelled') {
+        throw Object.assign(new Error('Встреча уже завершена.'), { statusCode: 409 })
+      }
+      const roomName = String(meeting.room_name)
+      const activeRooms = await roomService.listRooms([roomName])
+      if (activeRooms.length) await roomService.deleteRoom(roomName)
+      const ended = await client.query(
+        `UPDATE meetings SET status='ended', updated_at=now() WHERE id=$1 RETURNING *`,
+        [request.params.id],
+      )
+      return camelizeRow(ended.rows[0] as Record<string, unknown>)
+    })
+    await emitMeetingUpdated(request.params.id, {
+      meetingId: request.params.id,
+      status: 'ended',
+    })
+    return { meeting: updated }
   })
 
   app.post<{ Params: IdParams }>('/api/meetings/:id/token', async (request, reply) => {

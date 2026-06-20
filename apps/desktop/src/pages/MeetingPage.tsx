@@ -1,6 +1,7 @@
 import {
   LiveKitRoom,
   RoomAudioRenderer,
+  useParticipants,
   useRoomContext,
   VideoConference,
 } from '@livekit/components-react'
@@ -21,6 +22,7 @@ import { api } from '../lib/api'
 import { isRetryableMediaError, mediaErrorMessage, type MediaKind } from '../lib/media'
 import { useApp } from '../state/AppContext'
 import { BrandMark } from '../components/BrandMark'
+import { Modal } from '../components/ui'
 import { WindowControls } from '../components/WindowControls'
 
 type DeviceState = 'checking' | 'available' | 'unavailable'
@@ -73,6 +75,113 @@ function InitialMediaPublisher({
   return null
 }
 
+function MeetingConference({
+  meeting,
+  isOrganizer,
+  onError,
+}: {
+  meeting: Meeting
+  isOrganizer: boolean
+  onError: (message: string) => void
+}): React.JSX.Element {
+  const room = useRoomContext()
+  const participants = useParticipants()
+  const candidates = participants.filter(
+    (participant) => participant.identity !== room.localParticipant.identity,
+  )
+  const [exitOpen, setExitOpen] = useState(false)
+  const [newHostId, setNewHostId] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  useEffect(() => {
+    if (!candidates.some((participant) => participant.identity === newHostId)) {
+      setNewHostId(candidates[0]?.identity ?? '')
+    }
+  }, [candidates, newHostId])
+
+  const handleExitClick = (event: React.MouseEvent<HTMLDivElement>): void => {
+    if (!(event.target instanceof Element) || !event.target.closest('.lk-disconnect-button')) return
+    event.preventDefault()
+    event.stopPropagation()
+    event.nativeEvent.stopImmediatePropagation()
+    if (isOrganizer) setExitOpen(true)
+    else void room.disconnect()
+  }
+
+  const transferAndLeave = async (): Promise<void> => {
+    if (!newHostId || submitting) return
+    setSubmitting(true)
+    try {
+      await api.transferMeetingHost(meeting.id, newHostId)
+      await room.disconnect()
+    } catch (reason) {
+      onError(reason instanceof Error ? reason.message : 'Не удалось передать роль организатора.')
+      setSubmitting(false)
+    }
+  }
+
+  const endForEveryone = async (): Promise<void> => {
+    if (submitting) return
+    setSubmitting(true)
+    try {
+      await api.endMeetingForEveryone(meeting.id)
+    } catch (reason) {
+      onError(reason instanceof Error ? reason.message : 'Не удалось завершить встречу.')
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <>
+      <VideoConference onClickCapture={handleExitClick} />
+      <Modal
+        open={exitOpen}
+        onClose={() => { if (!submitting) setExitOpen(false) }}
+        title="Выход организатора"
+        width={470}
+      >
+        <div className="form-stack meeting-exit-form">
+          <p>Перед выходом назначьте нового организатора или завершите встречу для всех.</p>
+          <label>
+            <span>Новый организатор</span>
+            <select value={newHostId} onChange={(event) => setNewHostId(event.target.value)}>
+              {candidates.map((participant) => (
+                <option value={participant.identity} key={participant.identity}>
+                  {participant.name || participant.identity}
+                </option>
+              ))}
+            </select>
+          </label>
+          {!candidates.length && <p className="form-error">В конференции пока нет другого участника.</p>}
+          <footer className="meeting-exit-actions">
+            <button
+              className="button secondary"
+              onClick={() => setExitOpen(false)}
+              disabled={submitting}
+            >
+              Остаться
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => void transferAndLeave()}
+              disabled={!newHostId || submitting}
+            >
+              Передать и выйти
+            </button>
+            <button
+              className="button meeting-end-button"
+              onClick={() => void endForEveryone()}
+              disabled={submitting}
+            >
+              Завершить для всех
+            </button>
+          </footer>
+        </div>
+      </Modal>
+    </>
+  )
+}
+
 export function MeetingPage(): React.JSX.Element {
   const { meetingId } = useParams()
   const navigate = useNavigate()
@@ -102,6 +211,7 @@ export function MeetingPage(): React.JSX.Element {
     videoTrack?: MediaStreamTrack
   } | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [cancelling, setCancelling] = useState(false)
   const callFinishedRef = useRef(false)
 
   const addDeviceNotice = useCallback((message: string): void => {
@@ -212,6 +322,23 @@ export function MeetingPage(): React.JSX.Element {
     )
   }
 
+  const leavePrejoin = async (): Promise<void> => {
+    if (!meeting || cancelling) return
+    if (!callContext || meeting.hostId !== user?.id) {
+      navigate(-1)
+      return
+    }
+    setCancelling(true)
+    try {
+      await api.endMeetingForEveryone(meeting.id)
+      finishDirectCall()
+      navigate('/chat')
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Не удалось отменить звонок.')
+      setCancelling(false)
+    }
+  }
+
   if (loading || !meeting) {
     return <div className="meeting-loading-screen"><WindowControls /><div className="meeting-loading"><span className="spinner" />Загрузка встречи...</div></div>
   }
@@ -231,7 +358,6 @@ export function MeetingPage(): React.JSX.Element {
           audio={false}
           video={false}
           onDisconnected={() => {
-            if (connection.isHost) void api.updateMeetingStatus(meeting.id, 'ended')
             finishDirectCall()
             navigate('/chat')
           }}
@@ -248,7 +374,11 @@ export function MeetingPage(): React.JSX.Element {
             videoTrack={connection.videoTrack}
             onDeviceError={handleDeviceError}
           />
-          <VideoConference />
+          <MeetingConference
+            meeting={meeting}
+            isOrganizer={meeting.hostId === user?.id}
+            onError={setError}
+          />
           <RoomAudioRenderer />
         </LiveKitRoom>
         {deviceNotices.length > 0 && <div className="meeting-notice">{deviceNotices.join(' ')}</div>}
@@ -260,7 +390,7 @@ export function MeetingPage(): React.JSX.Element {
   return (
     <div className="prejoin-page">
       <header>
-        <button className="icon-button" onClick={() => navigate(-1)}><ArrowLeft /></button>
+        <button className="icon-button" onClick={() => void leavePrejoin()} disabled={cancelling}><ArrowLeft /></button>
         <div className="brand"><BrandMark /><strong>AlephMeets</strong></div>
         <WindowControls />
       </header>

@@ -31,12 +31,24 @@ const testUsers: Record<string, CurrentUser> = {
   },
 }
 
+const deletedLiveKitRooms: string[] = []
+let liveKitRoomExists = true
+
 async function createTestApp() {
   return createApp({
     authenticate: async (token) => {
       const user = testUsers[token]
       if (!user) throw Object.assign(new Error('Authentication required'), { statusCode: 401 })
       return user
+    },
+    roomService: {
+      listParticipants: async () => [
+        { identity: testUsers.anna!.id, name: testUsers.anna!.displayName } as never,
+      ],
+      listRooms: async (roomNames) => liveKitRoomExists
+        ? roomNames?.map((name) => ({ name }) as never) ?? []
+        : [],
+      deleteRoom: async (roomName) => { deletedLiveKitRooms.push(roomName) },
     },
   })
 }
@@ -160,6 +172,112 @@ test('creates a meeting attendee that has no email', async () => {
   } finally {
     if (meetingId) await pool.query('DELETE FROM meetings WHERE id = $1', [meetingId])
     await pool.query('DELETE FROM users WHERE id = $1', [attendeeId])
+    await app.close()
+  }
+})
+
+test('transfers organizer role and lets only the new organizer end the room', async () => {
+  const app = await createTestApp()
+  let meetingId: string | undefined
+  deletedLiveKitRooms.length = 0
+  try {
+    const startsAt = new Date()
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/meetings',
+      headers: dmitryAuth,
+      payload: {
+        title: '__organizer_transfer_test__',
+        startsAt: startsAt.toISOString(),
+        endsAt: new Date(startsAt.getTime() + 60 * 60_000).toISOString(),
+        timezone: 'Europe/Moscow',
+        attendees: [],
+        attendeeUserIds: [testUsers.anna!.id],
+      },
+    })
+    assert.equal(created.statusCode, 201, created.body)
+    meetingId = created.json().meeting.id
+    const roomName = created.json().meeting.roomName as string
+    await pool.query("UPDATE meetings SET status='live' WHERE id=$1", [meetingId])
+
+    const forbidden = await app.inject({
+      method: 'POST',
+      url: `/api/meetings/${meetingId}/host`,
+      headers: annaAuth,
+      payload: { newHostId: testUsers.dmitry!.id },
+    })
+    assert.equal(forbidden.statusCode, 403, forbidden.body)
+
+    const transferred = await app.inject({
+      method: 'POST',
+      url: `/api/meetings/${meetingId}/host`,
+      headers: dmitryAuth,
+      payload: { newHostId: testUsers.anna!.id },
+    })
+    assert.equal(transferred.statusCode, 200, transferred.body)
+    assert.equal(transferred.json().meeting.hostId, testUsers.anna!.id)
+
+    const oldOrganizer = await pool.query(
+      'SELECT 1 FROM meeting_attendees WHERE meeting_id=$1 AND user_id=$2',
+      [meetingId, testUsers.dmitry!.id],
+    )
+    assert.equal(oldOrganizer.rowCount, 1)
+
+    const oldHostEnd = await app.inject({
+      method: 'POST',
+      url: `/api/meetings/${meetingId}/end`,
+      headers: dmitryAuth,
+    })
+    assert.equal(oldHostEnd.statusCode, 403, oldHostEnd.body)
+
+    const ended = await app.inject({
+      method: 'POST',
+      url: `/api/meetings/${meetingId}/end`,
+      headers: annaAuth,
+    })
+    assert.equal(ended.statusCode, 200, ended.body)
+    assert.equal(ended.json().meeting.status, 'ended')
+    assert.deepEqual(deletedLiveKitRooms, [roomName])
+  } finally {
+    if (meetingId) await pool.query('DELETE FROM meetings WHERE id=$1', [meetingId])
+    await app.close()
+  }
+})
+
+test('ends a direct call before the LiveKit room exists', async () => {
+  const app = await createTestApp()
+  let meetingId: string | undefined
+  liveKitRoomExists = false
+  deletedLiveKitRooms.length = 0
+  try {
+    const startsAt = new Date()
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/meetings',
+      headers: dmitryAuth,
+      payload: {
+        title: '__cancel_before_answer_test__',
+        startsAt: startsAt.toISOString(),
+        endsAt: new Date(startsAt.getTime() + 60 * 60_000).toISOString(),
+        timezone: 'Europe/Moscow',
+        attendees: [],
+        attendeeUserIds: [testUsers.anna!.id],
+      },
+    })
+    meetingId = created.json().meeting.id
+    await pool.query("UPDATE meetings SET status='live' WHERE id=$1", [meetingId])
+
+    const ended = await app.inject({
+      method: 'POST',
+      url: `/api/meetings/${meetingId}/end`,
+      headers: dmitryAuth,
+    })
+    assert.equal(ended.statusCode, 200, ended.body)
+    assert.equal(ended.json().meeting.status, 'ended')
+    assert.deepEqual(deletedLiveKitRooms, [])
+  } finally {
+    liveKitRoomExists = true
+    if (meetingId) await pool.query('DELETE FROM meetings WHERE id=$1', [meetingId])
     await app.close()
   }
 })

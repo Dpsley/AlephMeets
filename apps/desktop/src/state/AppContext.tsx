@@ -178,6 +178,12 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
       setLastCalendarSyncedAt(result.syncedAt)
       void reloadMeetings()
     })
+    socket.on('meeting:updated', (update: { meetingId: string; status?: Meeting['status'] }) => {
+      void reloadMeetings()
+      if (update.status === 'ended' || update.status === 'cancelled') {
+        setIncomingCall((current) => current?.meeting.id === update.meetingId ? null : current)
+      }
+    })
     socket.on('call:incoming', (call: IncomingCall) => setIncomingCall(call))
     socket.on('message:new', (message: Message) => {
       if (message.senderId === user.id) return
