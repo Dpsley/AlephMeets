@@ -11,7 +11,6 @@ import {
   CameraOff,
   Mic,
   MicOff,
-  Settings,
   ShieldCheck,
   Video,
 } from 'lucide-react'
@@ -263,7 +262,6 @@ export function MeetingPage(): React.JSX.Element {
       <header>
         <button className="icon-button" onClick={() => navigate(-1)}><ArrowLeft /></button>
         <div className="brand"><BrandMark /><strong>AlephMeets</strong></div>
-        <button className="button ghost small"><Settings size={17} />Настройки</button>
         <WindowControls />
       </header>
       <main className="prejoin-content">
