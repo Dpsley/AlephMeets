@@ -57,6 +57,12 @@ desktop client. The current adapter targets on-premises Exchange with EWS and
 Basic/NTLM. Exchange Online requires a future Microsoft OAuth/Graph adapter;
 Basic authentication is not supported there.
 
+EWS requests originate from the AlephMeets API server, not from the desktop
+client. The EWS host must therefore be reachable from the production VPS. A
+working Outlook installation on a workstation does not prove server-side EWS
+reachability because Outlook can use Autodiscover, MAPI/HTTP, OAuth, a local VPN,
+or other network routes unavailable to the VPS.
+
 ## Packaging
 
 - Windows: `npm run dist:win -w @aleph/desktop`

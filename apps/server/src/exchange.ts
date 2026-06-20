@@ -33,6 +33,12 @@ export interface ExchangeEventInput {
   attendees?: string[]
 }
 
+interface NtlmCredentials {
+  username: string
+  password: string
+  domain: string
+}
+
 export class ExchangeIntegrationError extends Error {
   constructor(
     public readonly code:
@@ -87,6 +93,44 @@ function envelope(body: string): string {
 </soap:Envelope>`
 }
 
+export function normalizeNtlmCredentials(credentials: ExchangeCredentials): NtlmCredentials {
+  const slashIndex = credentials.username.indexOf('\\')
+  if (slashIndex > 0) {
+    return {
+      domain: credentials.domain || credentials.username.slice(0, slashIndex),
+      username: credentials.username.slice(slashIndex + 1),
+      password: credentials.password,
+    }
+  }
+  return {
+    domain: credentials.domain,
+    username: credentials.username,
+    password: credentials.password,
+  }
+}
+
+export function buildEwsRequestConfig(
+  credentials: ExchangeCredentials,
+  body: string,
+): AxiosRequestConfig {
+  return {
+    url: normalizeEwsUrl(credentials.serverUrl),
+    method: 'POST',
+    data: envelope(body),
+    headers: {
+      'Content-Type': 'text/xml; charset=utf-8',
+      Accept: 'text/xml',
+      'X-AnchorMailbox': credentials.email,
+    },
+    timeout: 20_000,
+    maxRedirects: 0,
+    httpsAgent: new https.Agent({
+      keepAlive: true,
+      rejectUnauthorized: credentials.verifyTls,
+    }),
+  }
+}
+
 function getText(value: unknown): string {
   if (value === undefined || value === null) return ''
   if (typeof value === 'object' && '#text' in value) return String((value as { '#text': unknown })['#text'])
@@ -124,25 +168,11 @@ function responseError(data: unknown): ExchangeIntegrationError | null {
 }
 
 async function requestEws(credentials: ExchangeCredentials, body: string): Promise<Record<string, unknown>> {
-  const url = normalizeEwsUrl(credentials.serverUrl)
-  const request: AxiosRequestConfig = {
-    url,
-    method: 'POST',
-    data: envelope(body),
-    headers: { 'Content-Type': 'text/xml; charset=utf-8', Accept: 'text/xml' },
-    timeout: 20_000,
-    maxRedirects: 0,
-    httpsAgent: new https.Agent({ rejectUnauthorized: credentials.verifyTls }),
-    validateStatus: () => true,
-  }
+  const request = buildEwsRequestConfig(credentials, body)
   let response: AxiosResponse<string>
   try {
     if (credentials.authMethod === 'ntlm') {
-      response = await NtlmClient({
-        username: credentials.username,
-        password: credentials.password,
-        domain: credentials.domain,
-      }).request<string>(request)
+      response = await NtlmClient(normalizeNtlmCredentials(credentials)).request<string>(request)
     } else {
       response = await axios.request<string>({
         ...request,
@@ -155,14 +185,34 @@ async function requestEws(credentials: ExchangeCredentials, body: string): Promi
       })
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+    if (axios.isAxiosError<string>(error) && error.response) {
+      response = error.response
+    } else {
+      const message = error instanceof Error ? error.message : String(error)
+      throw new ExchangeIntegrationError(
+        'exchange_connection_failed',
+        `Не удалось подключиться к серверу Exchange ${new URL(String(request.url)).host}: ${message}`,
+      )
+    }
+  }
+  if (response.status >= 300 && response.status < 400) {
+    const redirect = typeof response.headers.location === 'string'
+      ? response.headers.location
+      : 'другой адрес'
     throw new ExchangeIntegrationError(
-      'exchange_connection_failed',
-      `Не удалось подключиться к серверу Exchange: ${message}`,
+      'exchange_endpoint_not_found',
+      `Exchange перенаправил EWS-запрос на ${redirect}. Укажите конечный HTTPS-адрес EWS без редиректа.`,
     )
   }
   if (response.status === 401 || response.status === 403) {
-    throw new ExchangeIntegrationError('exchange_auth_failed', 'Exchange отклонил логин или пароль.')
+    const authenticate = String(response.headers['www-authenticate'] ?? '')
+    const schemes = [...new Set(authenticate.match(/(?:^|,\s*)(Basic|NTLM|Negotiate|Bearer)(?=\s|,|$)/gi)?.map((value) => value.trim()) ?? [])]
+    const advertised = schemes.length ? ` Сервер предлагает: ${schemes.join(', ')}.` : ''
+    const selected = credentials.authMethod === 'ntlm' ? 'NTLM' : 'Basic'
+    throw new ExchangeIntegrationError(
+      'exchange_auth_failed',
+      `Exchange отклонил учетные данные для ${selected}.${advertised}`,
+    )
   }
   if (response.status === 404) {
     throw new ExchangeIntegrationError(
@@ -176,7 +226,23 @@ async function requestEws(credentials: ExchangeCredentials, body: string): Promi
       `Exchange вернул HTTP ${response.status}.`,
     )
   }
-  const data = parser.parse(response.data) as Record<string, unknown>
+  const contentType = String(response.headers['content-type'] ?? '')
+  if (contentType.includes('text/html') || /<(?:!doctype\s+html|html)[\s>]/i.test(response.data)) {
+    throw new ExchangeIntegrationError(
+      'exchange_endpoint_not_found',
+      'Вместо EWS сервер вернул HTML-страницу OWA. Укажите конечный адрес /EWS/Exchange.asmx.',
+    )
+  }
+  let data: Record<string, unknown>
+  try {
+    data = parser.parse(response.data) as Record<string, unknown>
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new ExchangeIntegrationError(
+      'exchange_response_error',
+      `Exchange вернул некорректный XML: ${message}`,
+    )
+  }
   const ewsError = responseError(data)
   if (ewsError) throw ewsError
   return data
@@ -185,9 +251,7 @@ async function requestEws(credentials: ExchangeCredentials, body: string): Promi
 export async function testExchangeConnection(credentials: ExchangeCredentials): Promise<void> {
   await requestEws(credentials, `<m:GetFolder>
     <m:FolderShape><t:BaseShape>IdOnly</t:BaseShape></m:FolderShape>
-    <m:FolderIds><t:DistinguishedFolderId Id="calendar">
-      <t:Mailbox><t:EmailAddress>${xml(credentials.email)}</t:EmailAddress></t:Mailbox>
-    </t:DistinguishedFolderId></m:FolderIds>
+    <m:FolderIds><t:DistinguishedFolderId Id="calendar" /></m:FolderIds>
   </m:GetFolder>`)
 }
 
@@ -199,9 +263,7 @@ export async function listExchangeEvents(
   const data = await requestEws(credentials, `<m:FindItem Traversal="Shallow">
     <m:ItemShape><t:BaseShape>AllProperties</t:BaseShape></m:ItemShape>
     <m:CalendarView StartDate="${from.toISOString()}" EndDate="${to.toISOString()}" MaxEntriesReturned="1000" />
-    <m:ParentFolderIds><t:DistinguishedFolderId Id="calendar">
-      <t:Mailbox><t:EmailAddress>${xml(credentials.email)}</t:EmailAddress></t:Mailbox>
-    </t:DistinguishedFolderId></m:ParentFolderIds>
+    <m:ParentFolderIds><t:DistinguishedFolderId Id="calendar" /></m:ParentFolderIds>
   </m:FindItem>`)
   return collectByKey(data, 'CalendarItem').map((item) => {
     const itemId = item.ItemId as Record<string, unknown> | undefined
