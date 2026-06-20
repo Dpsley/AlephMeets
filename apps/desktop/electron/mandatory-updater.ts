@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog } from 'electron'
 import electronUpdater from 'electron-updater'
+import { appIconPath } from './app-icon'
 
 const { autoUpdater } = electronUpdater
 
@@ -24,6 +25,7 @@ class UpdateGate {
       show: false,
       backgroundColor: '#f3f7fb',
       title: 'Обновление AlephMeets',
+      icon: appIconPath(),
       webPreferences: {
         contextIsolation: true,
         nodeIntegration: false,

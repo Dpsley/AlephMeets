@@ -1,6 +1,7 @@
 import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage, session, shell } from 'electron'
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { appIconPath } from './app-icon'
 import { enforceMandatoryUpdate } from './mandatory-updater'
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
@@ -49,7 +50,7 @@ function createWindow(authSlot = 'primary'): BrowserWindow {
     show: false,
     title: 'AlephMeets',
     backgroundColor: '#f7f8fa',
-    icon: app.isPackaged ? undefined : join(__dirname, '../../build/icon.ico'),
+    icon: appIconPath(),
     frame: process.platform !== 'win32',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
     webPreferences: {
