@@ -94,7 +94,9 @@ export function SettingsPage(): React.JSX.Element {
       const result = await api.saveExchangeSettings(form)
       setConfigured(true)
       setExchange(result.settings)
-      setMessage('Подключение к Exchange проверено и сохранено.')
+      setMessage(result.sync
+        ? `Exchange подключён. Импортировано: ${result.sync.imported}, экспортировано: ${result.sync.exported}.`
+        : 'Exchange подключён. Первая синхронизация не выполнена; сервер повторит попытку в течение 5 минут.')
       setExchangeOpen(false)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Не удалось подключиться к Exchange.')

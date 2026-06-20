@@ -157,7 +157,11 @@ export const api = {
       '/api/calendar/exchange/settings',
     ),
   saveExchangeSettings: (settings: ExchangeSettings) =>
-    request<{ configured: boolean; settings: ExchangeSettings }>('/api/calendar/exchange/settings', {
+    request<{
+      configured: boolean
+      settings: ExchangeSettings
+      sync: { imported: number; exported: number; total: number; syncedAt: string } | null
+    }>('/api/calendar/exchange/settings', {
       method: 'POST',
       body: JSON.stringify(settings),
     }),

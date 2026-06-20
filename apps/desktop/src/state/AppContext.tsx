@@ -166,6 +166,7 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
     socket.on('presence:changed', (presence: { userId: string; status: User['status'] }) => {
       setPresenceByUserId((current) => ({ ...current, [presence.userId]: presence.status }))
     })
+    socket.on('calendar:synced', () => void reloadMeetings())
     socket.on('call:incoming', (call: IncomingCall) => setIncomingCall(call))
     socket.on('message:new', (message: Message) => {
       if (message.senderId === user.id) return
@@ -192,7 +193,7 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
       callSocketRef.current = null
       if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current)
     }
-  }, [navigate, user])
+  }, [navigate, reloadMeetings, user])
 
   useEffect(() => {
     if (!incomingCall) return

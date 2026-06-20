@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test, { after } from 'node:test'
-import { createApp } from './app.js'
+import { createApp, EXCHANGE_SYNC_INTERVAL_MS } from './app.js'
 import { pool } from './db.js'
 import type { CurrentUser } from './config.js'
 
@@ -43,6 +43,10 @@ async function createTestApp() {
 
 const dmitryAuth = { authorization: 'Bearer dmitry' }
 const annaAuth = { authorization: 'Bearer anna' }
+
+test('schedules Exchange calendar sync every five minutes', () => {
+  assert.equal(EXCHANGE_SYNC_INTERVAL_MS, 300_000)
+})
 
 after(async () => {
   await pool.end()

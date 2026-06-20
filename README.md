@@ -57,6 +57,11 @@ desktop client. The current adapter targets on-premises Exchange with EWS and
 Basic/NTLM. Exchange Online requires a future Microsoft OAuth/Graph adapter;
 Basic authentication is not supported there.
 
+The first two-way calendar sync starts immediately after the account is saved.
+The API server then syncs every enabled Exchange account every five minutes,
+including while the desktop client is closed. Connected clients receive a
+WebSocket event after a successful sync and refresh their meeting list.
+
 EWS requests originate from the AlephMeets API server, not from the desktop
 client. The EWS host must therefore be reachable from the production VPS. A
 working Outlook installation on a workstation does not prove server-side EWS

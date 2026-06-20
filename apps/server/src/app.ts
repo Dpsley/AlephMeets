@@ -58,6 +58,7 @@ interface AppDependencies {
 
 interface ExchangeAccountRow {
   id: string
+  user_id: string
   server_url: string
   email: string
   username: string
@@ -66,6 +67,19 @@ interface ExchangeAccountRow {
   encrypted_secret: string
   verify_tls: boolean
 }
+
+interface ExchangeSyncResult {
+  imported: number
+  exported: number
+  total: number
+  syncedAt: string
+}
+
+interface ScheduledExchangeAccountRow extends ExchangeAccountRow {
+  timezone: string
+}
+
+export const EXCHANGE_SYNC_INTERVAL_MS = 5 * 60 * 1000
 
 function exchangeCredentials(account: ExchangeAccountRow): ExchangeCredentials {
   return {
@@ -76,6 +90,99 @@ function exchangeCredentials(account: ExchangeAccountRow): ExchangeCredentials {
     domain: account.domain ?? '',
     authMethod: account.auth_method,
     verifyTls: account.verify_tls,
+  }
+}
+
+async function syncExchangeCalendar(
+  account: ExchangeAccountRow,
+  user: Pick<CurrentUser, 'id' | 'timezone'>,
+): Promise<ExchangeSyncResult> {
+  const credentials = exchangeCredentials(account)
+  const from = new Date()
+  from.setMonth(from.getMonth() - 1)
+  const to = new Date()
+  to.setFullYear(to.getFullYear() + 1)
+  let imported = 0
+  let exported = 0
+
+  try {
+    const remoteEvents = await listExchangeEvents(credentials, from, to)
+    for (const event of remoteEvents) {
+      const linked = await pool.query(
+        `SELECT meeting_id FROM calendar_event_links
+         WHERE account_id=$1 AND external_event_id=$2`,
+        [account.id, event.externalEventId],
+      )
+      if (linked.rowCount) {
+        await pool.query(
+          `UPDATE meetings SET title=$1, description=$2, starts_at=$3, ends_at=$4
+           WHERE id=$5 AND host_id=$6`,
+          [event.subject, event.body, event.startsAt, event.endsAt, linked.rows[0].meeting_id, user.id],
+        )
+      } else {
+        const created = await pool.query(
+          `INSERT INTO meetings (
+             host_id, title, description, room_name, starts_at, ends_at, timezone, status
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,'scheduled') RETURNING id`,
+          [
+            user.id,
+            event.subject || 'Exchange meeting',
+            event.body,
+            `exchange-${nanoid(12)}`,
+            event.startsAt,
+            event.endsAt,
+            user.timezone,
+          ],
+        )
+        await pool.query(
+          `INSERT INTO calendar_event_links (
+             account_id, meeting_id, external_event_id, external_change_key
+           ) VALUES ($1,$2,$3,$4)`,
+          [account.id, created.rows[0].id, event.externalEventId, event.changeKey ?? null],
+        )
+        imported += 1
+      }
+    }
+
+    const localMeetings = await pool.query(
+      `SELECT m.*,
+        (SELECT external_event_id FROM calendar_event_links l
+         WHERE l.account_id=$2 AND l.meeting_id=m.id) AS external_event_id,
+        COALESCE((SELECT json_agg(email) FILTER (WHERE email IS NOT NULL)
+                  FROM meeting_attendees a WHERE a.meeting_id=m.id), '[]') AS attendees
+       FROM meetings m
+       WHERE m.host_id=$1 AND m.starts_at >= $3 AND m.starts_at < $4
+         AND m.status='scheduled'`,
+      [user.id, account.id, from, to],
+    )
+    for (const meeting of localMeetings.rows) {
+      if (meeting.external_event_id) continue
+      const event = await createExchangeEvent(credentials, {
+        subject: meeting.title,
+        body: meeting.description ?? '',
+        location: `AlephMeets: ${meeting.room_name}`,
+        startsAt: new Date(meeting.starts_at).toISOString(),
+        endsAt: new Date(meeting.ends_at).toISOString(),
+        attendees: meeting.attendees,
+      })
+      await pool.query(
+        `INSERT INTO calendar_event_links (
+           account_id, meeting_id, external_event_id, external_change_key
+         ) VALUES ($1,$2,$3,$4)`,
+        [account.id, meeting.id, event.externalEventId, event.changeKey ?? null],
+      )
+      exported += 1
+    }
+    const syncedAt = new Date().toISOString()
+    await pool.query(
+      'UPDATE calendar_accounts SET last_synced_at=$1, last_sync_error=NULL WHERE id=$2',
+      [syncedAt, account.id],
+    )
+    return { imported, exported, total: localMeetings.rowCount ?? 0, syncedAt }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    await pool.query('UPDATE calendar_accounts SET last_sync_error=$1 WHERE id=$2', [message, account.id])
+    throw error
   }
 }
 
@@ -105,6 +212,58 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     transports: ['websocket', 'polling'],
   })
   const presenceDisconnectTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  const activeExchangeSyncs = new Map<string, Promise<ExchangeSyncResult>>()
+
+  const syncExchangeAccount = (
+    account: ExchangeAccountRow,
+    user: Pick<CurrentUser, 'id' | 'timezone'>,
+  ): Promise<ExchangeSyncResult> => {
+    const activeSync = activeExchangeSyncs.get(account.id)
+    if (activeSync) return activeSync
+
+    const sync = syncExchangeCalendar(account, user)
+      .then((result) => {
+        io.to(`user:${user.id}`).emit('calendar:synced', result)
+        return result
+      })
+      .finally(() => {
+        activeExchangeSyncs.delete(account.id)
+      })
+    activeExchangeSyncs.set(account.id, sync)
+    return sync
+  }
+
+  const syncConfiguredExchangeAccounts = async (): Promise<void> => {
+    let accounts: ScheduledExchangeAccountRow[]
+    try {
+      const result = await pool.query(
+        `SELECT ca.*, u.timezone
+         FROM calendar_accounts ca
+         JOIN users u ON u.id=ca.user_id
+         WHERE ca.provider='exchange_ews' AND ca.sync_enabled=true`,
+      )
+      accounts = result.rows as ScheduledExchangeAccountRow[]
+    } catch (error) {
+      app.log.error({ err: error }, 'Failed to load Exchange accounts for scheduled sync')
+      return
+    }
+
+    await Promise.all(accounts.map(async (account) => {
+      try {
+        await syncExchangeAccount(account, { id: account.user_id, timezone: account.timezone })
+      } catch (error) {
+        app.log.error(
+          { err: error, accountId: account.id, userId: account.user_id },
+          'Scheduled Exchange calendar sync failed',
+        )
+      }
+    }))
+  }
+
+  const exchangeSyncTimer = setInterval(() => {
+    void syncConfiguredExchangeAccounts()
+  }, EXCHANGE_SYNC_INTERVAL_MS)
+  exchangeSyncTimer.unref()
 
   const setPresence = async (userId: string, status: 'online' | 'offline'): Promise<void> => {
     await pool.query(
@@ -263,6 +422,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
   })
 
   app.addHook('onClose', (_instance, done) => {
+    clearInterval(exchangeSyncTimer)
     for (const timer of presenceDisconnectTimers.values()) clearTimeout(timer)
     presenceDisconnectTimers.clear()
     done()
@@ -977,8 +1137,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
          username=EXCLUDED.username, domain=EXCLUDED.domain,
          auth_method=EXCLUDED.auth_method, encrypted_secret=EXCLUDED.encrypted_secret,
          verify_tls=EXCLUDED.verify_tls, sync_enabled=true, last_sync_error=NULL
-       RETURNING id, server_url, email, username, domain, auth_method, verify_tls,
-                 sync_enabled, last_synced_at, last_sync_error`,
+       RETURNING *`,
       [
         currentUser.id,
         input.email.toLowerCase(),
@@ -991,7 +1150,30 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
         input.verifyTls,
       ],
     )
-    return { configured: true, settings: camelizeRow(result.rows[0] as Record<string, unknown>) }
+    const account = result.rows[0] as ExchangeAccountRow
+    let sync: ExchangeSyncResult | null = null
+    try {
+      sync = await syncExchangeAccount(account, {
+        id: currentUser.id,
+        timezone: currentUser.timezone,
+      })
+    } catch (error) {
+      app.log.warn(
+        { err: error, accountId: account.id, userId: currentUser.id },
+        'Initial Exchange calendar sync failed',
+      )
+    }
+    const settingsResult = await pool.query(
+      `SELECT id, server_url, email, username, domain, auth_method, verify_tls,
+              sync_enabled, last_synced_at, last_sync_error
+       FROM calendar_accounts WHERE id=$1`,
+      [account.id],
+    )
+    return {
+      configured: true,
+      settings: camelizeRow(settingsResult.rows[0] as Record<string, unknown>),
+      sync,
+    }
   })
 
   app.post('/api/calendar/exchange/test', async (request) => {
@@ -1018,90 +1200,10 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
         { statusCode: 409 },
       )
     }
-    const credentials = exchangeCredentials(account)
-    const from = new Date()
-    from.setMonth(from.getMonth() - 1)
-    const to = new Date()
-    to.setFullYear(to.getFullYear() + 1)
-    let imported = 0
-    let exported = 0
-    try {
-      const remoteEvents = await listExchangeEvents(credentials, from, to)
-      for (const event of remoteEvents) {
-        const linked = await pool.query(
-          `SELECT meeting_id FROM calendar_event_links
-           WHERE account_id=$1 AND external_event_id=$2`,
-          [account.id, event.externalEventId],
-        )
-        if (linked.rowCount) {
-          await pool.query(
-            `UPDATE meetings SET title=$1, description=$2, starts_at=$3, ends_at=$4
-             WHERE id=$5 AND host_id=$6`,
-            [event.subject, event.body, event.startsAt, event.endsAt, linked.rows[0].meeting_id, currentUser.id],
-          )
-        } else {
-          const created = await pool.query(
-            `INSERT INTO meetings (
-               host_id, title, description, room_name, starts_at, ends_at, timezone, status
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,'scheduled') RETURNING id`,
-            [
-              currentUser.id,
-              event.subject || 'Встреча Exchange',
-              event.body,
-              `exchange-${nanoid(12)}`,
-              event.startsAt,
-              event.endsAt,
-              currentUser.timezone,
-            ],
-          )
-          await pool.query(
-            `INSERT INTO calendar_event_links (
-               account_id, meeting_id, external_event_id, external_change_key
-             ) VALUES ($1,$2,$3,$4)`,
-            [account.id, created.rows[0].id, event.externalEventId, event.changeKey ?? null],
-          )
-          imported += 1
-        }
-      }
-
-      const localMeetings = await pool.query(
-        `SELECT m.*,
-          (SELECT external_event_id FROM calendar_event_links l
-           WHERE l.account_id=$2 AND l.meeting_id=m.id) AS external_event_id,
-          COALESCE((SELECT json_agg(email) FROM meeting_attendees a WHERE a.meeting_id=m.id), '[]') AS attendees
-         FROM meetings m
-         WHERE m.host_id=$1 AND m.starts_at >= $3 AND m.starts_at < $4
-           AND m.status='scheduled'`,
-        [currentUser.id, account.id, from, to],
-      )
-      for (const meeting of localMeetings.rows) {
-        if (meeting.external_event_id) continue
-        const event = await createExchangeEvent(credentials, {
-          subject: meeting.title,
-          body: meeting.description ?? '',
-          location: `AlephMeets: ${meeting.room_name}`,
-          startsAt: new Date(meeting.starts_at).toISOString(),
-          endsAt: new Date(meeting.ends_at).toISOString(),
-          attendees: meeting.attendees,
-        })
-        await pool.query(
-          `INSERT INTO calendar_event_links (
-             account_id, meeting_id, external_event_id, external_change_key
-           ) VALUES ($1,$2,$3,$4)`,
-          [account.id, meeting.id, event.externalEventId, event.changeKey ?? null],
-        )
-        exported += 1
-      }
-      await pool.query(
-        'UPDATE calendar_accounts SET last_synced_at=now(), last_sync_error=NULL WHERE id=$1',
-        [account.id],
-      )
-      return { imported, exported, total: localMeetings.rowCount, syncedAt: new Date().toISOString() }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      await pool.query('UPDATE calendar_accounts SET last_sync_error=$1 WHERE id=$2', [message, account.id])
-      throw error
-    }
+    return syncExchangeAccount(account, {
+      id: currentUser.id,
+      timezone: currentUser.timezone,
+    })
   })
 
   return app
