@@ -2,7 +2,7 @@ import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage, session, she
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { appIconPath } from './app-icon'
-import { enforceMandatoryUpdate } from './mandatory-updater'
+import { destroyMandatoryUpdateGate, enforceMandatoryUpdate } from './mandatory-updater'
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 app.setName('AlephMeets')
@@ -122,6 +122,7 @@ app.whenReady().then(async () => {
   if (!await enforceMandatoryUpdate()) return
 
   createWindow()
+  destroyMandatoryUpdateGate()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })

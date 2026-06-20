@@ -3,6 +3,7 @@ import electronUpdater from 'electron-updater'
 import { appIconPath } from './app-icon'
 
 const { autoUpdater } = electronUpdater
+let releasedGate: UpdateGate | null = null
 
 type GateStatus = {
   title: string
@@ -94,6 +95,11 @@ class UpdateGate {
 
   release(): void {
     this.released = true
+    if (!this.window.isDestroyed()) this.window.hide()
+  }
+
+  destroy(): void {
+    this.released = true
     if (!this.window.isDestroyed()) this.window.destroy()
   }
 }
@@ -125,6 +131,7 @@ export async function enforceMandatoryUpdate(): Promise<boolean> {
 
       if (!result?.isUpdateAvailable) {
         gate.release()
+        releasedGate = gate
         return true
       }
 
@@ -172,6 +179,11 @@ export async function enforceMandatoryUpdate(): Promise<boolean> {
       }
     }
   }
+}
+
+export function destroyMandatoryUpdateGate(): void {
+  releasedGate?.destroy()
+  releasedGate = null
 }
 
 const updateGateHtml = `<!doctype html>
