@@ -15,6 +15,7 @@ interface AppState {
   user: User | null
   authenticated: boolean
   meetings: Meeting[]
+  lastCalendarSyncedAt: string | null
   loading: boolean
   error: string | null
   presenceByUserId: Record<string, User['status']>
@@ -44,6 +45,7 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
   const navigate = useNavigate()
   const [user, setUser] = useState<User | null>(null)
   const [meetings, setMeetings] = useState<Meeting[]>([])
+  const [lastCalendarSyncedAt, setLastCalendarSyncedAt] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [presenceByUserId, setPresenceByUserId] = useState<Record<string, User['status']>>({})
@@ -58,9 +60,14 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
   }, [])
 
   const loadSession = useCallback(async (): Promise<void> => {
-    const [session, meetingResult] = await Promise.all([api.session(), api.meetings()])
+    const [session, meetingResult, exchange] = await Promise.all([
+      api.session(),
+      api.meetings(),
+      api.exchangeSettings().catch(() => null),
+    ])
     setUser(session.user)
     setMeetings(meetingResult.meetings)
+    setLastCalendarSyncedAt(exchange?.settings?.lastSyncedAt ?? null)
     setError(null)
   }, [])
 
@@ -112,6 +119,7 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
       await clearAuthTokens()
       setUser(null)
       setMeetings([])
+      setLastCalendarSyncedAt(null)
       setIncomingCall(null)
       setMessageNotice(null)
       setPresenceByUserId({})
@@ -166,7 +174,10 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
     socket.on('presence:changed', (presence: { userId: string; status: User['status'] }) => {
       setPresenceByUserId((current) => ({ ...current, [presence.userId]: presence.status }))
     })
-    socket.on('calendar:synced', () => void reloadMeetings())
+    socket.on('calendar:synced', (result: { syncedAt: string }) => {
+      setLastCalendarSyncedAt(result.syncedAt)
+      void reloadMeetings()
+    })
     socket.on('call:incoming', (call: IncomingCall) => setIncomingCall(call))
     socket.on('message:new', (message: Message) => {
       if (message.senderId === user.id) return
@@ -246,6 +257,7 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
     user,
     authenticated: Boolean(user),
     meetings,
+    lastCalendarSyncedAt,
     loading,
     error,
     presenceByUserId,
@@ -258,6 +270,7 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
   }), [
     user,
     meetings,
+    lastCalendarSyncedAt,
     loading,
     error,
     presenceByUserId,

@@ -8,7 +8,7 @@ import { api } from '../lib/api'
 import { useApp } from '../state/AppContext'
 
 export function CalendarPage(): React.JSX.Element {
-  const { meetings, reloadMeetings } = useApp()
+  const { meetings, reloadMeetings, lastCalendarSyncedAt } = useApp()
   const navigate = useNavigate()
   const [month, setMonth] = useState(startOfMonth(new Date()))
   const [scheduleOpen, setScheduleOpen] = useState(false)
@@ -37,7 +37,10 @@ export function CalendarPage(): React.JSX.Element {
     <div className="page calendar-page">
       <header className="page-header">
         <div><p className="eyebrow">Расписание</p><h1>Календарь</h1><span>Встречи AlephMeets и Exchange в одном месте.</span></div>
-        <div className="header-actions"><button className="button secondary" onClick={() => void sync()} disabled={syncing}><RefreshCw size={17} className={syncing ? 'spinning' : ''} />{syncing ? 'Синхронизация...' : 'Exchange / OWA'}</button><button className="button primary" onClick={() => setScheduleOpen(true)}><CalendarPlus size={17} />Создать</button></div>
+        <div className="calendar-header-controls">
+          <div className="header-actions"><button className="button secondary" onClick={() => void sync()} disabled={syncing}><RefreshCw size={17} className={syncing ? 'spinning' : ''} />{syncing ? 'Синхронизация...' : 'Exchange / OWA'}</button><button className="button primary" onClick={() => setScheduleOpen(true)}><CalendarPlus size={17} />Создать</button></div>
+          <small className="calendar-last-sync">Последняя синхронизация: {lastCalendarSyncedAt ? new Date(lastCalendarSyncedAt).toLocaleString('ru-RU') : 'ещё не выполнялась'}</small>
+        </div>
       </header>
       {syncMessage && <div className="notice-bar">{syncMessage}</div>}
       <section className="calendar-panel">
