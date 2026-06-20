@@ -7,7 +7,7 @@
   "type": "module",
   "main": "out/main/main.js",
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "npm run icons && electron-vite dev",
     "icons": "node scripts/generate-icons.mjs",
     "build": "npm run icons && electron-vite build && electron-builder --dir",
     "dist:win": "npm run icons && electron-vite build && electron-builder --win nsis --publish never",

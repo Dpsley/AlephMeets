@@ -6,7 +6,9 @@ import { enforceMandatoryUpdate } from './mandatory-updater'
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 app.setName('AlephMeets')
-if (process.platform === 'win32') app.setAppUserModelId('com.alephmeets.desktop')
+if (process.platform === 'win32') {
+  app.setAppUserModelId(app.isPackaged ? 'com.alephmeets.desktop' : 'com.alephmeets.desktop.dev')
+}
 
 const authSlots = new Map<number, string>()
 const transientAuth = new Map<string, Buffer>()
