@@ -7,7 +7,49 @@ on:
     tags: ['v*']
   pull_request:
 
+concurrency:
+  group: desktop-release-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main' || github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Determine release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          publish=false
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="$GITHUB_REF_NAME"
+            publish=true
+          elif [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == "refs/heads/main" ]]; then
+            git fetch --force --tags origin
+            tag="$(git tag --points-at "$GITHUB_SHA" --list 'v[0-9]*' --sort=-v:refname | head -n 1)"
+            if [[ -z "$tag" ]]; then
+              latest="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)"
+              latest="${latest:-v0.0.0}"
+              IFS='.' read -r major minor patch <<< "${latest#v}"
+              tag="v${major}.${minor}.$((10#$patch + 1))"
+            fi
+            publish=true
+          else
+            tag="v$(node -p "require('./apps/desktop/package.json').version")"
+          fi
+
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
   verify:
     runs-on: ubuntu-latest
     env:
@@ -44,6 +86,7 @@ jobs:
       - run: npm test
 
   package-windows:
+    needs: [version, verify]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,8 +96,7 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Set release version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: npm version "${{ github.ref_name }}" --workspace @aleph/desktop --no-git-tag-version --allow-same-version
+        run: npm version "${{ needs.version.outputs.version }}" --workspace @aleph/desktop --no-git-tag-version --allow-same-version
       - run: npm run dist:win -w @aleph/desktop
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
@@ -68,6 +110,7 @@ jobs:
             apps/desktop/release/latest.yml
 
   package-macos:
+    needs: [version, verify]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,8 +120,7 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Set release version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: npm version "${{ github.ref_name }}" --workspace @aleph/desktop --no-git-tag-version --allow-same-version
+        run: npm version "${{ needs.version.outputs.version }}" --workspace @aleph/desktop --no-git-tag-version --allow-same-version
       - run: npm run dist:mac -w @aleph/desktop
         env:
           CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
@@ -106,8 +148,8 @@ jobs:
             apps/desktop/release/latest-mac.yml
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [verify, package-windows, package-macos]
+    if: needs.version.outputs.publish == 'true'
+    needs: [version, verify, package-windows, package-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -119,10 +161,17 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "${{ github.ref_name }}"
-          release-assets/*
-          --verify-tag
-          --generate-notes
-          --repo "${{ github.repository }}"
-          --title "AlephMeets ${{ github.ref_name }}"
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          RELEASE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "${{ github.repository }}"
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --target "$RELEASE_SHA" \
+              --generate-notes \
+              --repo "${{ github.repository }}" \
+              --title "AlephMeets $RELEASE_TAG"
+          fi
