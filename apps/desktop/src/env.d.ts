@@ -13,6 +13,11 @@ interface Window {
     getMeetingContext: () => Promise<Record<string, unknown> | null>
     forceCloseMeeting: () => void
     onMeetingCloseRequested: (listener: () => void) => () => void
+    onScreenShareSources: (listener: (request: {
+      requestId: number
+      sources: Array<{ id: string; name: string; thumbnail: string }>
+    }) => void) => () => void
+    selectScreenShareSource: (requestId: number, sourceId?: string) => void
     getAuthTokens: () => Promise<string | null>
     setAuthTokens: (value: string) => Promise<void>
     clearAuthTokens: () => Promise<void>

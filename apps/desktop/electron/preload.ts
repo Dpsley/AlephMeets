@@ -22,6 +22,19 @@ contextBridge.exposeInMainWorld('alephDesktop', {
     ipcRenderer.on('meeting:close-requested', handler)
     return () => ipcRenderer.removeListener('meeting:close-requested', handler)
   },
+  onScreenShareSources: (listener: (request: {
+    requestId: number
+    sources: Array<{ id: string; name: string; thumbnail: string }>
+  }) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, request: {
+      requestId: number
+      sources: Array<{ id: string; name: string; thumbnail: string }>
+    }): void => listener(request)
+    ipcRenderer.on('screen-share:sources', handler)
+    return () => ipcRenderer.removeListener('screen-share:sources', handler)
+  },
+  selectScreenShareSource: (requestId: number, sourceId?: string) =>
+    ipcRenderer.send('screen-share:select', requestId, sourceId),
   getAuthTokens: () => ipcRenderer.invoke('auth:get') as Promise<string | null>,
   setAuthTokens: (value: string) => ipcRenderer.invoke('auth:set', value) as Promise<void>,
   clearAuthTokens: () => ipcRenderer.invoke('auth:clear') as Promise<void>,

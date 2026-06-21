@@ -144,6 +144,15 @@ function MeetingConference({
     { source: Track.Source.Camera, withPlaceholder: true },
     { source: Track.Source.ScreenShare, withPlaceholder: false },
   ], { onlySubscribed: false })
+  const displayTracks = participants.map((participant) => (
+    tracks.find((track) => (
+      track.participant.identity === participant.identity
+      && track.source === Track.Source.ScreenShare
+    )) ?? tracks.find((track) => (
+      track.participant.identity === participant.identity
+      && track.source === Track.Source.Camera
+    ))
+  )).filter((track): track is NonNullable<typeof track> => Boolean(track))
   const candidates = participants.filter(
     (participant) => participant.identity !== room.localParticipant.identity,
   )
@@ -160,6 +169,10 @@ function MeetingConference({
   const [loadingContacts, setLoadingContacts] = useState(false)
   const [newHostId, setNewHostId] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [screenShareRequest, setScreenShareRequest] = useState<{
+    requestId: number
+    sources: Array<{ id: string; name: string; thumbnail: string }>
+  } | null>(null)
 
   useEffect(() => {
     if (!candidates.some((participant) => participant.identity === newHostId)) {
@@ -172,6 +185,16 @@ function MeetingConference({
     if (isOrganizer) setExitOpen(true)
     else void room.disconnect()
   }, [closeRequest, isOrganizer, room])
+
+  useEffect(() => {
+    return window.alephDesktop?.onScreenShareSources(setScreenShareRequest)
+  }, [])
+
+  const chooseScreenShareSource = (sourceId?: string): void => {
+    if (!screenShareRequest) return
+    window.alephDesktop?.selectScreenShareSource(screenShareRequest.requestId, sourceId)
+    setScreenShareRequest(null)
+  }
 
   const openInvite = async (): Promise<void> => {
     setInviteOpen(true)
@@ -237,7 +260,7 @@ function MeetingConference({
       <div className={`aleph-conference ${chatOpen ? 'with-chat' : ''}`}>
         <div className="meeting-stage">
           <div className="meeting-participant-grid">
-            {tracks.map((track) => {
+            {displayTracks.map((track) => {
               const attendee = meeting.attendees.find((item) => item.userId === track.participant.identity)
               const displayName = track.participant.name || attendee?.displayName || meeting.hostDisplayName || track.participant.identity
               const avatarUrl = track.participant.identity === meeting.hostId
@@ -293,12 +316,29 @@ function MeetingConference({
         {chatOpen && <MeetingChat onClose={() => setChatOpen(false)} />}
       </div>
 
-      <Modal open={infoOpen} onClose={() => setInfoOpen(false)} title="Информация о встрече" width={430}>
+      <Modal open={infoOpen} onClose={() => setInfoOpen(false)} title="Информация о встрече" width={460}>
         <dl className="meeting-info-list">
           <div><dt>Название</dt><dd>{meeting.title}</dd></div>
           <div><dt>Идентификатор</dt><dd>{meeting.roomName}</dd></div>
           <div><dt>Организатор</dt><dd>{meeting.hostDisplayName || meeting.hostId}</dd></div>
         </dl>
+      </Modal>
+
+      <Modal
+        open={Boolean(screenShareRequest)}
+        onClose={() => chooseScreenShareSource()}
+        title="Выберите экран или окно"
+        width={760}
+      >
+        <div className="screen-share-picker">
+          {screenShareRequest?.sources.map((source) => (
+            <button key={source.id} onClick={() => chooseScreenShareSource(source.id)}>
+              <img src={source.thumbnail} alt="" />
+              <span>{source.name}</span>
+            </button>
+          ))}
+          {!screenShareRequest?.sources.length && <p>Нет доступных экранов или окон.</p>}
+        </div>
       </Modal>
 
       <Modal open={inviteOpen} onClose={() => { if (!submitting) setInviteOpen(false) }} title="Пригласить во встречу" width={480}>

@@ -15,6 +15,29 @@ const transientAuth = new Map<string, Buffer>()
 const meetingWindows = new Map<string, BrowserWindow>()
 const meetingContexts = new Map<number, Record<string, unknown> | null>()
 const forceClosingMeetingWindows = new Set<number>()
+const pendingDisplayRequests = new Map<number, {
+  frame: Electron.WebFrameMain
+  sources: Electron.DesktopCapturerSource[]
+  callback: (streams: Electron.Streams) => void
+  timer: ReturnType<typeof setTimeout>
+}>()
+let nextDisplayRequestId = 1
+
+function isSameFrame(
+  left: Electron.WebFrameMain | null,
+  right: Electron.WebFrameMain | null,
+): boolean {
+  return Boolean(left && right && left.processId === right.processId && left.routingId === right.routingId)
+}
+
+function finishDisplayRequest(requestId: number, sourceId?: string): void {
+  const request = pendingDisplayRequests.get(requestId)
+  if (!request) return
+  pendingDisplayRequests.delete(requestId)
+  clearTimeout(request.timer)
+  const source = sourceId ? request.sources.find((item) => item.id === sourceId) : undefined
+  request.callback(source ? { video: source } : {})
+}
 
 function authFilePath(): string {
   return join(app.getPath('userData'), 'auth-tokens.bin')
@@ -154,12 +177,39 @@ app.whenReady().then(async () => {
     callback(['media', 'display-capture', 'notifications'].includes(permission))
   })
   session.defaultSession.setDisplayMediaRequestHandler(
-    async (_request, callback) => {
-      const sources = await desktopCapturer.getSources({ types: ['screen', 'window'] })
-      callback({ video: sources[0] })
+    async (request, callback) => {
+      if (!request.frame) {
+        callback({})
+        return
+      }
+      const sources = await desktopCapturer.getSources({
+        types: ['screen', 'window'],
+        thumbnailSize: { width: 320, height: 180 },
+        fetchWindowIcons: true,
+      })
+      const requestId = nextDisplayRequestId++
+      for (const [pendingId, pending] of pendingDisplayRequests) {
+        if (isSameFrame(pending.frame.top, request.frame.top)) finishDisplayRequest(pendingId)
+      }
+      const timer = setTimeout(() => finishDisplayRequest(requestId), 60_000)
+      pendingDisplayRequests.set(requestId, { frame: request.frame, sources, callback, timer })
+      request.frame.send('screen-share:sources', {
+        requestId,
+        sources: sources.map((source) => ({
+          id: source.id,
+          name: source.name,
+          thumbnail: source.thumbnail.toDataURL(),
+        })),
+      })
     },
     { useSystemPicker: true },
   )
+
+  ipcMain.on('screen-share:select', (event, requestId: number, sourceId?: string) => {
+    const request = pendingDisplayRequests.get(requestId)
+    if (!request || !isSameFrame(request.frame.top, event.sender.mainFrame)) return
+    finishDisplayRequest(requestId, sourceId)
+  })
 
   ipcMain.on('window:minimize', (event) => BrowserWindow.fromWebContents(event.sender)?.minimize())
   ipcMain.on('window:maximize', (event) => {
@@ -205,5 +255,6 @@ app.whenReady().then(async () => {
 })
 
 app.on('window-all-closed', () => {
+  for (const requestId of pendingDisplayRequests.keys()) finishDisplayRequest(requestId)
   if (process.platform !== 'darwin') app.quit()
 })
