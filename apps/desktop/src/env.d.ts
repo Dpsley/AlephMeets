@@ -9,6 +9,10 @@ interface Window {
     isMaximized: () => Promise<boolean>
     onMaximizedChanged: (listener: (maximized: boolean) => void) => () => void
     getVersion: () => Promise<string>
+    openMeeting: (meetingId: string, context?: Record<string, unknown>) => Promise<void>
+    getMeetingContext: () => Promise<Record<string, unknown> | null>
+    forceCloseMeeting: () => void
+    onMeetingCloseRequested: (listener: () => void) => () => void
     getAuthTokens: () => Promise<string | null>
     setAuthTokens: (value: string) => Promise<void>
     clearAuthTokens: () => Promise<void>

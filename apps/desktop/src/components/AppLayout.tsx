@@ -11,6 +11,7 @@ import {
 import { useState } from 'react'
 import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { api } from '../lib/api'
+import { openMeetingWindow } from '../lib/meeting-window'
 import { useApp } from '../state/AppContext'
 import { Avatar, Modal } from './ui'
 import { BrandMark } from './BrandMark'
@@ -47,7 +48,7 @@ export function AppLayout(): React.JSX.Element {
       })
       await api.updateMeetingStatus(result.meeting.id, 'live')
       await reloadMeetings()
-      navigate(`/meeting/${result.meeting.id}`)
+      if (!await openMeetingWindow(result.meeting.id)) navigate(`/meeting/${result.meeting.id}`)
     } finally {
       setCreating(false)
     }
@@ -58,7 +59,9 @@ export function AppLayout(): React.JSX.Element {
     try {
       const result = await api.meetingByCode(joinValue.trim())
       setJoinOpen(false)
-      navigate(`/meeting/${result.meeting.id}`, { state: { meeting: result.meeting } })
+      if (!await openMeetingWindow(result.meeting.id, { meeting: result.meeting })) {
+        navigate(`/meeting/${result.meeting.id}`, { state: { meeting: result.meeting } })
+      }
     } catch (reason) {
       setJoinError(reason instanceof Error ? reason.message : 'Встреча не найдена.')
     }

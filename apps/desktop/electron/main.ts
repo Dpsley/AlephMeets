@@ -12,6 +12,9 @@ if (process.platform === 'win32') {
 
 const authSlots = new Map<number, string>()
 const transientAuth = new Map<string, Buffer>()
+const meetingWindows = new Map<string, BrowserWindow>()
+const meetingContexts = new Map<number, Record<string, unknown> | null>()
+const forceClosingMeetingWindows = new Set<number>()
 
 function authFilePath(): string {
   return join(app.getPath('userData'), 'auth-tokens.bin')
@@ -85,6 +88,67 @@ function createWindow(authSlot = 'primary'): BrowserWindow {
   return browserWindow
 }
 
+function createMeetingWindow(
+  meetingId: string,
+  authSlot: string,
+  context: Record<string, unknown> | null,
+): BrowserWindow {
+  const existing = meetingWindows.get(meetingId)
+  if (existing && !existing.isDestroyed()) {
+    if (existing.isMinimized()) existing.restore()
+    existing.focus()
+    return existing
+  }
+  const browserWindow = new BrowserWindow({
+    width: 1440,
+    height: 900,
+    minWidth: 960,
+    minHeight: 640,
+    show: false,
+    title: 'AlephMeets',
+    backgroundColor: '#111316',
+    icon: appIconPath(),
+    frame: process.platform !== 'win32',
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
+    webPreferences: {
+      preload: join(__dirname, '../preload/preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  })
+  const webContentsId = browserWindow.webContents.id
+  authSlots.set(webContentsId, authSlot)
+  meetingContexts.set(webContentsId, context)
+  meetingWindows.set(meetingId, browserWindow)
+  browserWindow.on('close', (event) => {
+    if (forceClosingMeetingWindows.has(webContentsId)) return
+    event.preventDefault()
+    browserWindow.webContents.send('meeting:close-requested')
+  })
+  browserWindow.on('closed', () => {
+    forceClosingMeetingWindows.delete(webContentsId)
+    authSlots.delete(webContentsId)
+    meetingContexts.delete(webContentsId)
+    if (meetingWindows.get(meetingId) === browserWindow) meetingWindows.delete(meetingId)
+  })
+  browserWindow.on('maximize', () => browserWindow.webContents.send('window:maximized-changed', true))
+  browserWindow.on('unmaximize', () => browserWindow.webContents.send('window:maximized-changed', false))
+  browserWindow.once('ready-to-show', () => browserWindow.show())
+  browserWindow.webContents.setWindowOpenHandler(({ url }) => {
+    void shell.openExternal(url)
+    return { action: 'deny' }
+  })
+  if (!app.isPackaged && process.env.ELECTRON_RENDERER_URL) {
+    void browserWindow.loadURL(`${process.env.ELECTRON_RENDERER_URL}#/meeting/${encodeURIComponent(meetingId)}`)
+  } else {
+    void browserWindow.loadFile(join(__dirname, '../renderer/index.html'), {
+      hash: `/meeting/${encodeURIComponent(meetingId)}`,
+    })
+  }
+  return browserWindow
+}
+
 app.whenReady().then(async () => {
   session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
     callback(['media', 'display-capture', 'notifications'].includes(permission))
@@ -103,9 +167,21 @@ app.whenReady().then(async () => {
     if (target?.isMaximized()) target.unmaximize()
     else target?.maximize()
   })
-  ipcMain.on('window:close', (event) => BrowserWindow.fromWebContents(event.sender)?.close())
+  ipcMain.on('window:close', (event) => {
+    if (meetingContexts.has(event.sender.id)) event.sender.send('meeting:close-requested')
+    else BrowserWindow.fromWebContents(event.sender)?.close()
+  })
+  ipcMain.on('meeting:force-close', (event) => {
+    forceClosingMeetingWindows.add(event.sender.id)
+    BrowserWindow.fromWebContents(event.sender)?.close()
+  })
   ipcMain.handle('window:is-maximized', (event) => BrowserWindow.fromWebContents(event.sender)?.isMaximized() ?? false)
   ipcMain.handle('app:version', () => app.getVersion())
+  ipcMain.handle('meeting:open', (event, meetingId: string, context?: Record<string, unknown>) => {
+    const slot = authSlots.get(event.sender.id) ?? 'primary'
+    createMeetingWindow(meetingId, slot, context ?? null)
+  })
+  ipcMain.handle('meeting:context', (event) => meetingContexts.get(event.sender.id) ?? null)
   ipcMain.handle('auth:get', (event) => {
     const slot = authSlots.get(event.sender.id) ?? 'primary'
     return readAuth(slot)

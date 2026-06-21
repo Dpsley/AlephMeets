@@ -14,12 +14,16 @@ export interface User {
 export interface Attendee {
   email: string | null
   userId?: string
+  displayName?: string | null
+  avatarUrl?: string | null
   response: 'invited' | 'accepted' | 'declined' | 'tentative'
 }
 
 export interface Meeting {
   id: string
   hostId: string
+  hostDisplayName?: string
+  hostAvatarUrl?: string | null
   title: string
   description: string
   roomName: string

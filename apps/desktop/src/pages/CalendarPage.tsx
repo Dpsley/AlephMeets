@@ -5,6 +5,7 @@ import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ScheduleModal } from '../components/ScheduleModal'
 import { api } from '../lib/api'
+import { openMeetingWindow } from '../lib/meeting-window'
 import { useApp } from '../state/AppContext'
 
 export function CalendarPage(): React.JSX.Element {
@@ -49,7 +50,7 @@ export function CalendarPage(): React.JSX.Element {
         <div className="calendar-grid">
           {days.map((day) => {
             const dayMeetings = meetings.filter((meeting) => meeting.status === 'scheduled' && isSameDay(new Date(meeting.startsAt), day))
-            return <div className={`calendar-day ${!isSameMonth(day, month) ? 'outside' : ''} ${isSameDay(day, new Date()) ? 'today' : ''}`} key={day.toISOString()}><span className="day-number">{format(day, 'd')}</span><div className="day-events">{dayMeetings.slice(0, 3).map((meeting) => <button key={meeting.id} className={meeting.status === 'live' ? 'live' : ''} onClick={() => navigate(`/meeting/${meeting.id}`)}><i />{format(new Date(meeting.startsAt), 'HH:mm')} {meeting.title}</button>)}{dayMeetings.length > 3 && <small>+ еще {dayMeetings.length - 3}</small>}</div></div>
+            return <div className={`calendar-day ${!isSameMonth(day, month) ? 'outside' : ''} ${isSameDay(day, new Date()) ? 'today' : ''}`} key={day.toISOString()}><span className="day-number">{format(day, 'd')}</span><div className="day-events">{dayMeetings.slice(0, 3).map((meeting) => <button key={meeting.id} className={meeting.status === 'live' ? 'live' : ''} onClick={() => void openMeetingWindow(meeting.id).then((opened) => { if (!opened) navigate(`/meeting/${meeting.id}`) })}><i />{format(new Date(meeting.startsAt), 'HH:mm')} {meeting.title}</button>)}{dayMeetings.length > 3 && <small>+ еще {dayMeetings.length - 3}</small>}</div></div>
           })}
         </div>
       </section>

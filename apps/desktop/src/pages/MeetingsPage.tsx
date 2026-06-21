@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import { ScheduleModal } from '../components/ScheduleModal'
 import { meetingDate } from '../lib/format'
 import { isPastMeeting, isScheduledMeeting } from '../lib/meetings'
+import { openMeetingWindow } from '../lib/meeting-window'
 import { useApp } from '../state/AppContext'
 
 export function MeetingsPage(): React.JSX.Element {
@@ -32,7 +33,7 @@ export function MeetingsPage(): React.JSX.Element {
           <article className="meeting-card" key={meeting.id}>
             <div className="meeting-icon"><Video size={24} /></div>
             <div className="meeting-card-main"><div className="meeting-card-title"><h3>{meeting.title}</h3><span className={`status-pill status-${meeting.status}`}>{meeting.status === 'live' ? 'Идет сейчас' : meeting.status === 'scheduled' ? 'Запланирована' : 'Завершена'}</span></div><p>{meeting.description || 'Без описания'}</p><div className="meeting-meta"><span><Clock3 size={15} />{meetingDate(meeting.startsAt)}</span><span><Users size={15} />{meeting.attendees?.length ?? 0} участников</span></div></div>
-            {tab === 'upcoming' && <button className="button primary small" onClick={() => navigate(`/meeting/${meeting.id}`)}>Войти</button>}
+            {tab === 'upcoming' && <button className="button primary small" onClick={() => void openMeetingWindow(meeting.id).then((opened) => { if (!opened) navigate(`/meeting/${meeting.id}`) })}>Войти</button>}
           </article>
         ))}
         {!filtered.length && <div className="soft-empty large"><Video /><h3>Встреч не найдено</h3><p>Измените поиск или запланируйте новую встречу.</p></div>}

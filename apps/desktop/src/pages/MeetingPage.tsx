@@ -1,31 +1,49 @@
 import {
   LiveKitRoom,
+  ConnectionQualityIndicator,
+  ParticipantTile,
   RoomAudioRenderer,
+  TrackToggle,
+  TrackMutedIndicator,
+  VideoTrack,
+  useChat,
   useParticipants,
   useRoomContext,
-  VideoConference,
+  useTracks,
 } from '@livekit/components-react'
 import { Track } from 'livekit-client'
 import {
   ArrowLeft,
   Camera,
   CameraOff,
+  Info,
+  MessageSquare,
   Mic,
   MicOff,
+  PhoneOff,
+  Send,
   ShieldCheck,
+  UserPlus,
   Video,
+  X,
 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
-import type { DirectCallContext, Meeting } from '../types'
+import type { Contact, DirectCallContext, Meeting } from '../types'
 import { api } from '../lib/api'
+import { getMeetingWindowContext } from '../lib/meeting-window'
 import { isRetryableMediaError, mediaErrorMessage, type MediaKind } from '../lib/media'
 import { useApp } from '../state/AppContext'
 import { BrandMark } from '../components/BrandMark'
-import { Modal } from '../components/ui'
+import { Avatar, Modal } from '../components/ui'
 import { WindowControls } from '../components/WindowControls'
 
 type DeviceState = 'checking' | 'available' | 'unavailable'
+
+function closeMeetingWindow(navigate: ReturnType<typeof useNavigate>): void {
+  if (window.alephDesktop) window.alephDesktop.forceCloseMeeting()
+  else navigate('/chat')
+}
 
 function InitialMediaPublisher({
   audioEnabled,
@@ -75,21 +93,71 @@ function InitialMediaPublisher({
   return null
 }
 
+function MeetingChat({ onClose }: { onClose: () => void }): React.JSX.Element {
+  const { chatMessages, send, isSending } = useChat()
+  const [draft, setDraft] = useState('')
+
+  const submit = async (event: React.FormEvent): Promise<void> => {
+    event.preventDefault()
+    const message = draft.trim()
+    if (!message || isSending) return
+    await send(message)
+    setDraft('')
+  }
+
+  return (
+    <aside className="meeting-chat-panel">
+      <header><strong>Чат встречи</strong><button onClick={onClose} title="Закрыть чат"><X /></button></header>
+      <div className="meeting-chat-messages">
+        {chatMessages.map((message, index) => (
+          <div className="meeting-chat-message" key={message.id ?? index}>
+            <strong>{message.from?.name || 'Участник'}</strong>
+            <span>{message.message}</span>
+          </div>
+        ))}
+        {!chatMessages.length && <p>Сообщений пока нет.</p>}
+      </div>
+      <form onSubmit={(event) => void submit(event)}>
+        <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Сообщение" />
+        <button disabled={!draft.trim() || isSending} title="Отправить"><Send /></button>
+      </form>
+    </aside>
+  )
+}
+
 function MeetingConference({
   meeting,
   isOrganizer,
   onError,
+  onReload,
+  closeRequest,
 }: {
   meeting: Meeting
   isOrganizer: boolean
   onError: (message: string) => void
+  onReload: () => Promise<void>
+  closeRequest: number
 }): React.JSX.Element {
   const room = useRoomContext()
   const participants = useParticipants()
+  const tracks = useTracks([
+    { source: Track.Source.Camera, withPlaceholder: true },
+    { source: Track.Source.ScreenShare, withPlaceholder: false },
+  ], { onlySubscribed: false })
   const candidates = participants.filter(
     (participant) => participant.identity !== room.localParticipant.identity,
   )
+  const connectedIds = new Set(participants.map((participant) => participant.identity))
+  const pendingAttendees = meeting.attendees.filter(
+    (attendee) => attendee.response === 'invited' && attendee.userId && !connectedIds.has(attendee.userId),
+  )
   const [exitOpen, setExitOpen] = useState(false)
+  const [infoOpen, setInfoOpen] = useState(false)
+  const [inviteOpen, setInviteOpen] = useState(false)
+  const [chatOpen, setChatOpen] = useState(false)
+  const [contacts, setContacts] = useState<Contact[]>([])
+  const [selectedContactIds, setSelectedContactIds] = useState<string[]>([])
+  const [loadingContacts, setLoadingContacts] = useState(false)
   const [newHostId, setNewHostId] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
@@ -99,13 +167,46 @@ function MeetingConference({
     }
   }, [candidates, newHostId])
 
-  const handleExitClick = (event: React.MouseEvent<HTMLDivElement>): void => {
-    if (!(event.target instanceof Element) || !event.target.closest('.lk-disconnect-button')) return
-    event.preventDefault()
-    event.stopPropagation()
-    event.nativeEvent.stopImmediatePropagation()
+  useEffect(() => {
+    if (!closeRequest) return
     if (isOrganizer) setExitOpen(true)
     else void room.disconnect()
+  }, [closeRequest, isOrganizer, room])
+
+  const openInvite = async (): Promise<void> => {
+    setInviteOpen(true)
+    setLoadingContacts(true)
+    try {
+      const result = await api.contacts()
+      const unavailable = new Set([
+        meeting.hostId,
+        ...meeting.attendees
+          .filter((attendee) => attendee.response === 'invited' || attendee.response === 'accepted')
+          .map((attendee) => attendee.userId)
+          .filter(Boolean) as string[],
+      ])
+      setContacts(result.contacts.filter((contact) => !unavailable.has(contact.id)))
+    } catch (reason) {
+      onError(reason instanceof Error ? reason.message : 'Не удалось загрузить контакты.')
+      setInviteOpen(false)
+    } finally {
+      setLoadingContacts(false)
+    }
+  }
+
+  const invite = async (): Promise<void> => {
+    if (!selectedContactIds.length || submitting) return
+    setSubmitting(true)
+    try {
+      await api.inviteMeetingContacts(meeting.id, selectedContactIds)
+      await onReload()
+      setSelectedContactIds([])
+      setInviteOpen(false)
+    } catch (reason) {
+      onError(reason instanceof Error ? reason.message : 'Не удалось пригласить участников.')
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   const transferAndLeave = async (): Promise<void> => {
@@ -133,15 +234,100 @@ function MeetingConference({
 
   return (
     <>
-      <VideoConference onClickCapture={handleExitClick} />
-      <Modal
-        open={exitOpen}
-        onClose={() => { if (!submitting) setExitOpen(false) }}
-        title="Выход организатора"
-        width={470}
-      >
+      <div className={`aleph-conference ${chatOpen ? 'with-chat' : ''}`}>
+        <div className="meeting-stage">
+          <div className="meeting-participant-grid">
+            {tracks.map((track) => {
+              const attendee = meeting.attendees.find((item) => item.userId === track.participant.identity)
+              const displayName = track.participant.name || attendee?.displayName || meeting.hostDisplayName || track.participant.identity
+              const avatarUrl = track.participant.identity === meeting.hostId
+                ? meeting.hostAvatarUrl
+                : attendee?.avatarUrl
+              return (
+                <ParticipantTile key={`${track.participant.identity}-${track.source}`} trackRef={track}>
+                  <div className="meeting-participant-avatar"><Avatar name={displayName} src={avatarUrl} size="large" /></div>
+                  {'publication' in track && track.publication && <VideoTrack trackRef={track} />}
+                  <div className="lk-participant-metadata">
+                    <div className="lk-participant-metadata-item">
+                      <TrackMutedIndicator
+                        trackRef={{ participant: track.participant, source: Track.Source.Microphone }}
+                        show="muted"
+                      />
+                      <span>{displayName}</span>
+                    </div>
+                    <ConnectionQualityIndicator />
+                  </div>
+                </ParticipantTile>
+              )
+            })}
+            {pendingAttendees.map((attendee) => (
+              <div className="meeting-pending-participant" key={attendee.userId}>
+                <div className="meeting-pending-pulse">
+                  <Avatar name={attendee.displayName || attendee.email || 'Участник'} src={attendee.avatarUrl} size="large" />
+                </div>
+                <strong>{attendee.displayName || attendee.email || 'Участник'}</strong>
+                <span>Вызов...</span>
+              </div>
+            ))}
+          </div>
+          <div className="meeting-control-bar">
+            <TrackToggle source={Track.Source.Microphone} onDeviceError={(reason) => onError(mediaErrorMessage('audio', reason))}>
+              <span>Микрофон</span>
+            </TrackToggle>
+            <TrackToggle source={Track.Source.Camera} onDeviceError={() => undefined}>
+              <span>Камера</span>
+            </TrackToggle>
+            <TrackToggle source={Track.Source.ScreenShare}>
+              <span>Демонстрация</span>
+            </TrackToggle>
+            <button onClick={() => setChatOpen((value) => !value)} className={chatOpen ? 'active' : ''}>
+              <MessageSquare /><span>Чат</span>
+            </button>
+            <button onClick={() => setInfoOpen(true)}><Info /><span>Информация</span></button>
+            {isOrganizer && <button onClick={() => void openInvite()}><UserPlus /><span>Пригласить</span></button>}
+            <button className="meeting-leave-control" onClick={() => isOrganizer ? setExitOpen(true) : void room.disconnect()}>
+              <PhoneOff /><span>Завершить</span>
+            </button>
+          </div>
+        </div>
+        {chatOpen && <MeetingChat onClose={() => setChatOpen(false)} />}
+      </div>
+
+      <Modal open={infoOpen} onClose={() => setInfoOpen(false)} title="Информация о встрече" width={430}>
+        <dl className="meeting-info-list">
+          <div><dt>Название</dt><dd>{meeting.title}</dd></div>
+          <div><dt>Идентификатор</dt><dd>{meeting.roomName}</dd></div>
+          <div><dt>Организатор</dt><dd>{meeting.hostDisplayName || meeting.hostId}</dd></div>
+        </dl>
+      </Modal>
+
+      <Modal open={inviteOpen} onClose={() => { if (!submitting) setInviteOpen(false) }} title="Пригласить во встречу" width={480}>
+        <div className="meeting-invite-list">
+          {loadingContacts && <div className="center-loader"><span className="spinner" /></div>}
+          {!loadingContacts && contacts.map((contact) => (
+            <label key={contact.id}>
+              <input
+                type="checkbox"
+                checked={selectedContactIds.includes(contact.id)}
+                onChange={(event) => setSelectedContactIds((current) => event.target.checked
+                  ? [...current, contact.id]
+                  : current.filter((id) => id !== contact.id))}
+              />
+              <Avatar name={contact.displayName} src={contact.avatarUrl} />
+              <span><strong>{contact.displayName}</strong>{(contact.email || contact.phone) && <small>{contact.email || contact.phone}</small>}</span>
+            </label>
+          ))}
+          {!loadingContacts && !contacts.length && <p className="soft-empty">Нет доступных контактов для приглашения.</p>}
+          <footer className="modal-actions">
+            <button className="button secondary" onClick={() => setInviteOpen(false)} disabled={submitting}>Отмена</button>
+            <button className="button primary" onClick={() => void invite()} disabled={!selectedContactIds.length || submitting}>Пригласить</button>
+          </footer>
+        </div>
+      </Modal>
+
+      <Modal open={exitOpen} onClose={() => { if (!submitting) setExitOpen(false) }} title="Завершение встречи" width={480}>
         <div className="form-stack meeting-exit-form">
-          <p>Перед выходом назначьте нового организатора или завершите встречу для всех.</p>
+          <p>Перед выходом передайте роль организатора другому участнику или завершите встречу для всех.</p>
           <label>
             <span>Новый организатор</span>
             <select value={newHostId} onChange={(event) => setNewHostId(event.target.value)}>
@@ -152,29 +338,11 @@ function MeetingConference({
               ))}
             </select>
           </label>
-          {!candidates.length && <p className="form-error">В конференции пока нет другого участника.</p>}
+          {!candidates.length && <p className="form-error">В конференции пока нет другого подключённого участника.</p>}
           <footer className="meeting-exit-actions">
-            <button
-              className="button secondary"
-              onClick={() => setExitOpen(false)}
-              disabled={submitting}
-            >
-              Остаться
-            </button>
-            <button
-              className="button secondary"
-              onClick={() => void transferAndLeave()}
-              disabled={!newHostId || submitting}
-            >
-              Передать и выйти
-            </button>
-            <button
-              className="button meeting-end-button"
-              onClick={() => void endForEveryone()}
-              disabled={submitting}
-            >
-              Завершить для всех
-            </button>
+            <button className="button secondary" onClick={() => setExitOpen(false)} disabled={submitting}>Остаться</button>
+            <button className="button secondary" onClick={() => void transferAndLeave()} disabled={!newHostId || submitting}>Передать и выйти</button>
+            <button className="button meeting-end-button" onClick={() => void endForEveryone()} disabled={submitting}>Завершить для всех</button>
           </footer>
         </div>
       </Modal>
@@ -186,16 +354,16 @@ export function MeetingPage(): React.JSX.Element {
   const { meetingId } = useParams()
   const navigate = useNavigate()
   const location = useLocation()
-  const { meetings, user, loading } = useApp()
-  const navigationState = location.state as {
-    meeting?: Meeting
-    callContext?: DirectCallContext
-  } | null
-  const meetingFromNavigation = navigationState?.meeting
-  const callContext = navigationState?.callContext
+  const { meetings, user, loading, reloadMeetings } = useApp()
+  const navigationState = location.state as { meeting?: Meeting; callContext?: DirectCallContext } | null
+  const [windowContext, setWindowContext] = useState<{ meeting?: Meeting; callContext?: DirectCallContext } | null>(null)
+  const meetingFromNavigation = navigationState?.meeting ?? windowContext?.meeting
+  const callContext = navigationState?.callContext ?? windowContext?.callContext
   const meeting = meetings.find((item) => item.id === meetingId) ?? meetingFromNavigation
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
+  const autoJoinStartedRef = useRef(false)
+  const callFinishedRef = useRef(false)
   const [audioEnabled, setAudioEnabled] = useState(true)
   const [videoEnabled, setVideoEnabled] = useState(true)
   const [audioState, setAudioState] = useState<DeviceState>('checking')
@@ -212,15 +380,17 @@ export function MeetingPage(): React.JSX.Element {
   } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [cancelling, setCancelling] = useState(false)
-  const callFinishedRef = useRef(false)
+  const [closeRequest, setCloseRequest] = useState(0)
+
+  useEffect(() => { void getMeetingWindowContext().then(setWindowContext) }, [])
 
   const addDeviceNotice = useCallback((message: string): void => {
     setDeviceNotices((current) => current.includes(message) ? current : [...current, message])
   }, [])
 
   const handleDeviceError = useCallback((kind: MediaKind, reason: unknown): void => {
-    addDeviceNotice(mediaErrorMessage(kind, reason))
     if (kind === 'audio') {
+      addDeviceNotice(mediaErrorMessage(kind, reason))
       setAudioState('unavailable')
       setAudioEnabled(false)
     } else {
@@ -280,27 +450,22 @@ export function MeetingPage(): React.JSX.Element {
       acquiredStreams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()))
       streamRef.current = null
     }
-  }, [joined])
+  }, [handleDeviceError, joined])
 
   useEffect(() => {
     streamRef.current?.getVideoTracks().forEach((track) => { track.enabled = videoEnabled })
   }, [videoEnabled])
-
   useEffect(() => {
     streamRef.current?.getAudioTracks().forEach((track) => { track.enabled = audioEnabled })
   }, [audioEnabled])
 
-  const join = async (): Promise<void> => {
-    if (!meetingId || !mediaReady) return
+  const join = useCallback(async (): Promise<void> => {
+    if (!meetingId || !mediaReady || joined) return
     setError(null)
     try {
       const token = await api.meetingToken(meetingId)
-      const audioTrack = audioEnabled
-        ? streamRef.current?.getAudioTracks()[0]?.clone()
-        : undefined
-      const videoTrack = videoEnabled
-        ? streamRef.current?.getVideoTracks()[0]?.clone()
-        : undefined
+      const audioTrack = audioEnabled ? streamRef.current?.getAudioTracks()[0]?.clone() : undefined
+      const videoTrack = videoEnabled ? streamRef.current?.getVideoTracks()[0]?.clone() : undefined
       streamRef.current?.getTracks().forEach((track) => track.stop())
       streamRef.current = null
       if (token.isHost) await api.updateMeetingStatus(meetingId, 'live')
@@ -308,10 +473,18 @@ export function MeetingPage(): React.JSX.Element {
       setJoined(true)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Не удалось подключиться к встрече.')
+      autoJoinStartedRef.current = false
     }
-  }
+  }, [audioEnabled, joined, mediaReady, meetingId, videoEnabled])
 
-  const finishDirectCall = (): void => {
+  const isOrganizer = Boolean(meeting && user && meeting.hostId === user.id)
+  useEffect(() => {
+    if (!isOrganizer || !mediaReady || joined || autoJoinStartedRef.current) return
+    autoJoinStartedRef.current = true
+    void join()
+  }, [isOrganizer, join, joined, mediaReady])
+
+  const finishDirectCall = useCallback((): void => {
     if (!callContext || callFinishedRef.current) return
     callFinishedRef.current = true
     void api.finishCallLog(
@@ -320,27 +493,30 @@ export function MeetingPage(): React.JSX.Element {
       'ended',
       Date.now() - new Date(callContext.startedAt).getTime(),
     )
-  }
+  }, [callContext])
 
-  const leavePrejoin = async (): Promise<void> => {
+  const leavePrejoin = useCallback(async (): Promise<void> => {
     if (!meeting || cancelling) return
-    if (!callContext || meeting.hostId !== user?.id) {
-      navigate(-1)
-      return
-    }
     setCancelling(true)
-    try {
-      await api.endMeetingForEveryone(meeting.id)
+    if (isOrganizer) {
+      await api.endMeetingForEveryone(meeting.id).catch(() => undefined)
       finishDirectCall()
-      navigate('/chat')
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Не удалось отменить звонок.')
-      setCancelling(false)
+    } else {
+      await api.declineMeetingInvitation(meeting.id).catch(() => undefined)
     }
-  }
+    closeMeetingWindow(navigate)
+  }, [cancelling, finishDirectCall, isOrganizer, meeting, navigate])
 
-  if (loading || !meeting) {
-    return <div className="meeting-loading-screen"><WindowControls /><div className="meeting-loading"><span className="spinner" />Загрузка встречи...</div></div>
+  useEffect(() => {
+    if (!window.alephDesktop) return
+    return window.alephDesktop.onMeetingCloseRequested(() => {
+      if (joined) setCloseRequest((value) => value + 1)
+      else void leavePrejoin()
+    })
+  }, [joined, leavePrejoin])
+
+  if (loading || !meeting || (isOrganizer && !joined)) {
+    return <div className="meeting-loading-screen"><WindowControls /><div className="meeting-loading"><span className="spinner" />{error || 'Подключение к встрече...'}</div></div>
   }
 
   if (joined && connection) {
@@ -348,7 +524,7 @@ export function MeetingPage(): React.JSX.Element {
       <div className="meeting-room" data-lk-theme="default">
         <div className="meeting-topbar">
           <div><BrandMark small /><strong>{meeting.title}</strong></div>
-          <div><ShieldCheck size={15} />Защищенное соединение</div>
+          <div><ShieldCheck size={15} />Защищённое соединение</div>
           <WindowControls theme="dark" />
         </div>
         <LiveKitRoom
@@ -359,13 +535,11 @@ export function MeetingPage(): React.JSX.Element {
           video={false}
           onDisconnected={() => {
             finishDirectCall()
-            navigate('/chat')
+            closeMeetingWindow(navigate)
           }}
-          onError={(reason) => setError(
-            /requested device not found/i.test(reason.message)
-              ? 'Одно из медиаустройств отключено. Встреча продолжена с доступными устройствами.'
-              : reason.message,
-          )}
+          onError={(reason) => {
+            if (!/requested device not found/i.test(reason.message)) setError(reason.message)
+          }}
         >
           <InitialMediaPublisher
             audioEnabled={audioEnabled && audioState === 'available'}
@@ -374,11 +548,7 @@ export function MeetingPage(): React.JSX.Element {
             videoTrack={connection.videoTrack}
             onDeviceError={handleDeviceError}
           />
-          <MeetingConference
-            meeting={meeting}
-            isOrganizer={meeting.hostId === user?.id}
-            onError={setError}
-          />
+          <MeetingConference meeting={meeting} isOrganizer={isOrganizer} onError={setError} onReload={reloadMeetings} closeRequest={closeRequest} />
           <RoomAudioRenderer />
         </LiveKitRoom>
         {deviceNotices.length > 0 && <div className="meeting-notice">{deviceNotices.join(' ')}</div>}
@@ -405,19 +575,11 @@ export function MeetingPage(): React.JSX.Element {
             <span className="preview-name">{user?.displayName} (Вы)</span>
           </div>
           <div className="preview-controls">
-            <button
-              className={!audioEnabled ? 'off' : ''}
-              disabled={audioState !== 'available'}
-              onClick={() => setAudioEnabled((value) => !value)}
-            >
+            <button className={!audioEnabled ? 'off' : ''} disabled={audioState !== 'available'} onClick={() => setAudioEnabled((value) => !value)}>
               {audioEnabled && audioState === 'available' ? <Mic /> : <MicOff />}
               <span>{audioState === 'checking' ? 'Проверка...' : audioEnabled ? 'Микрофон' : 'Без звука'}</span>
             </button>
-            <button
-              className={!videoEnabled ? 'off' : ''}
-              disabled={videoState !== 'available'}
-              onClick={() => setVideoEnabled((value) => !value)}
-            >
+            <button className={!videoEnabled ? 'off' : ''} disabled={videoState !== 'available'} onClick={() => setVideoEnabled((value) => !value)}>
               {videoEnabled && videoState === 'available' ? <Camera /> : <CameraOff />}
               <span>{videoState === 'checking' ? 'Проверка...' : videoEnabled ? 'Камера' : 'Без видео'}</span>
             </button>
@@ -428,7 +590,7 @@ export function MeetingPage(): React.JSX.Element {
           <h1>{meeting.title}</h1>
           <p>{meeting.description || 'Встреча AlephMeets'}</p>
           <div className="join-details">
-            <span>Организатор</span><strong>{user?.displayName}</strong>
+            <span>Организатор</span><strong>{meeting.hostDisplayName || meeting.hostId}</strong>
             <span>Идентификатор</span><strong>{meeting.roomName}</strong>
           </div>
           {deviceNotices.map((notice) => <p className="device-notice" key={notice}>{notice}</p>)}

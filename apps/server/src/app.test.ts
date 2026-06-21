@@ -282,6 +282,58 @@ test('ends a direct call before the LiveKit room exists', async () => {
   }
 })
 
+test('invites a contact into a live meeting and records a decline', async () => {
+  const app = await createTestApp()
+  let meetingId: string | undefined
+  try {
+    await pool.query(
+      `INSERT INTO contacts (owner_id, contact_user_id)
+       VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+      [testUsers.dmitry!.id, testUsers.anna!.id],
+    )
+    const startsAt = new Date()
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/meetings',
+      headers: dmitryAuth,
+      payload: {
+        title: '__live_invitation_test__',
+        startsAt: startsAt.toISOString(),
+        endsAt: new Date(startsAt.getTime() + 60 * 60_000).toISOString(),
+        timezone: 'Europe/Moscow',
+        attendees: [],
+        attendeeUserIds: [],
+      },
+    })
+    meetingId = created.json().meeting.id
+    await pool.query("UPDATE meetings SET status='live' WHERE id=$1", [meetingId])
+
+    const invited = await app.inject({
+      method: 'POST',
+      url: `/api/meetings/${meetingId}/invitations`,
+      headers: dmitryAuth,
+      payload: { userIds: [testUsers.anna!.id] },
+    })
+    assert.equal(invited.statusCode, 200, invited.body)
+    assert.deepEqual(invited.json().invited, [testUsers.anna!.id])
+
+    const declined = await app.inject({
+      method: 'POST',
+      url: `/api/meetings/${meetingId}/invitations/decline`,
+      headers: annaAuth,
+    })
+    assert.equal(declined.statusCode, 200, declined.body)
+    const attendee = await pool.query(
+      'SELECT response FROM meeting_attendees WHERE meeting_id=$1 AND user_id=$2',
+      [meetingId, testUsers.anna!.id],
+    )
+    assert.equal(attendee.rows[0]?.response, 'declined')
+  } finally {
+    if (meetingId) await pool.query('DELETE FROM meetings WHERE id=$1', [meetingId])
+    await app.close()
+  }
+})
+
 test('reports presence as online only while the heartbeat is fresh', async () => {
   const app = await createTestApp()
   const annaId = '10000000-0000-4000-8000-000000000002'

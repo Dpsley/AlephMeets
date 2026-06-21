@@ -35,6 +35,7 @@ import {
   conversationTitleSchema,
   exchangeSettingsSchema,
   meetingHostTransferSchema,
+  meetingInvitationSchema,
   meetingInputSchema,
   messageInputSchema,
 } from './schemas.js'
@@ -219,6 +220,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     transports: ['websocket', 'polling'],
   })
   const presenceDisconnectTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  const meetingInvitationTimers = new Map<string, ReturnType<typeof setTimeout>>()
   const activeExchangeSyncs = new Map<string, Promise<ExchangeSyncResult>>()
 
   const syncExchangeAccount = (
@@ -333,6 +335,30 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     }
   }
 
+  const invitationKey = (meetingId: string, userId: string): string => `${meetingId}:${userId}`
+  const clearMeetingInvitationTimer = (meetingId: string, userId: string): void => {
+    const key = invitationKey(meetingId, userId)
+    const timer = meetingInvitationTimers.get(key)
+    if (timer) clearTimeout(timer)
+    meetingInvitationTimers.delete(key)
+  }
+  const scheduleMeetingInvitationTimeout = (meetingId: string, userId: string): void => {
+    clearMeetingInvitationTimer(meetingId, userId)
+    const key = invitationKey(meetingId, userId)
+    meetingInvitationTimers.set(key, setTimeout(() => {
+      meetingInvitationTimers.delete(key)
+      void pool.query(
+        `UPDATE meeting_attendees SET response='declined'
+         WHERE meeting_id=$1 AND user_id=$2 AND response='invited' RETURNING id`,
+        [meetingId, userId],
+      ).then(async (result) => {
+        if (!result.rowCount) return
+        io.to(`user:${userId}`).emit('call:cancelled', { meetingId })
+        await emitMeetingUpdated(meetingId, { meetingId, invitationUserId: userId })
+      }).catch((error) => app.log.error(error))
+    }, 45_000))
+  }
+
   app.addHook('onRequest', (request, _reply, done) => {
     const path = request.url.split('?')[0] ?? request.url
     const isPublic = request.method === 'OPTIONS'
@@ -432,6 +458,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
         caller: socketUser,
         callContext: payload.callContext,
       })
+      scheduleMeetingInvitationTimeout(meetingId, targetUserId)
     })
     socket.on('disconnect', () => {
       const timer = setTimeout(() => {
@@ -447,6 +474,8 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     clearInterval(exchangeSyncTimer)
     for (const timer of presenceDisconnectTimers.values()) clearTimeout(timer)
     presenceDisconnectTimers.clear()
+    for (const timer of meetingInvitationTimers.values()) clearTimeout(timer)
+    meetingInvitationTimers.clear()
     done()
   })
 
@@ -492,15 +521,19 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
   app.get('/api/meetings', async () => {
     const result = await pool.query(
       `SELECT m.*,
+         host.display_name AS host_display_name, host.avatar_url AS host_avatar_url,
          COALESCE(json_agg(json_build_object(
-           'email', ma.email, 'userId', ma.user_id, 'response', ma.response
+           'email', ma.email, 'userId', ma.user_id, 'response', ma.response,
+           'displayName', attendee.display_name, 'avatarUrl', attendee.avatar_url
          )) FILTER (WHERE ma.email IS NOT NULL OR ma.user_id IS NOT NULL), '[]') AS attendees
        FROM meetings m
+       JOIN users host ON host.id = m.host_id
        LEFT JOIN meeting_attendees ma ON ma.meeting_id = m.id
+       LEFT JOIN users attendee ON attendee.id = ma.user_id
        WHERE m.host_id = $1 OR EXISTS (
          SELECT 1 FROM meeting_attendees x WHERE x.meeting_id = m.id AND x.user_id = $1
        )
-       GROUP BY m.id
+       GROUP BY m.id, host.id
        ORDER BY m.starts_at`,
       [currentUser.id],
     )
@@ -510,13 +543,17 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
   app.get<{ Params: { code: string } }>('/api/meetings/join/:code', async (request, reply) => {
     const result = await pool.query(
       `SELECT m.*,
+         host.display_name AS host_display_name, host.avatar_url AS host_avatar_url,
          COALESCE(json_agg(json_build_object(
-           'email', ma.email, 'userId', ma.user_id, 'response', ma.response
+           'email', ma.email, 'userId', ma.user_id, 'response', ma.response,
+           'displayName', attendee.display_name, 'avatarUrl', attendee.avatar_url
          )) FILTER (WHERE ma.email IS NOT NULL OR ma.user_id IS NOT NULL), '[]') AS attendees
        FROM meetings m
+       JOIN users host ON host.id = m.host_id
        LEFT JOIN meeting_attendees ma ON ma.meeting_id=m.id
+       LEFT JOIN users attendee ON attendee.id = ma.user_id
        WHERE m.id::text=$1 OR lower(m.room_name)=lower($1)
-       GROUP BY m.id LIMIT 1`,
+       GROUP BY m.id, host.id LIMIT 1`,
       [request.params.code.trim()],
     )
     if (!result.rowCount) return reply.code(404).send({ message: 'Встреча с таким кодом не найдена.' })
@@ -682,12 +719,98 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     return { meeting: updated }
   })
 
+  app.post<{ Params: IdParams }>('/api/meetings/:id/invitations', async (request, reply) => {
+    const { userIds } = meetingInvitationSchema.parse(request.body)
+    const meetingResult = await pool.query(
+      `SELECT m.*, host.display_name AS host_display_name, host.avatar_url AS host_avatar_url
+       FROM meetings m JOIN users host ON host.id=m.host_id WHERE m.id=$1`,
+      [request.params.id],
+    )
+    const meeting = meetingResult.rows[0] as Record<string, unknown> | undefined
+    if (!meeting) return reply.code(404).send({ error: 'meeting_not_found', message: 'Встреча не найдена.' })
+    if (meeting.host_id !== currentUser.id) {
+      return reply.code(403).send({ error: 'organizer_required', message: 'Приглашать участников может только организатор.' })
+    }
+    if (meeting.status !== 'live') {
+      return reply.code(409).send({ error: 'meeting_not_live', message: 'Встреча сейчас не активна.' })
+    }
+
+    const contacts = await pool.query(
+      `SELECT u.id, u.email, u.display_name, u.avatar_url
+       FROM contacts c JOIN users u ON u.id=c.contact_user_id
+       WHERE c.owner_id=$1 AND u.id = ANY($2::uuid[])`,
+      [currentUser.id, [...new Set(userIds)]],
+    )
+    if (contacts.rowCount !== new Set(userIds).size) {
+      return reply.code(400).send({ error: 'contact_required', message: 'Пригласить можно только пользователя из контактов.' })
+    }
+
+    for (const contact of contacts.rows) {
+      const linkedByEmail = await pool.query(
+        `UPDATE meeting_attendees
+         SET user_id=$2, response='invited', joined_at=NULL, left_at=NULL
+         WHERE meeting_id=$1 AND user_id IS NULL AND lower(email)=lower($3)
+         RETURNING id`,
+        [meeting.id, contact.id, contact.email],
+      )
+      if (!linkedByEmail.rowCount) {
+        await pool.query(
+          `INSERT INTO meeting_attendees (meeting_id, user_id, email, response)
+           VALUES ($1,$2,$3,'invited')
+           ON CONFLICT (meeting_id, user_id) WHERE user_id IS NOT NULL
+           DO UPDATE SET response='invited', joined_at=NULL, left_at=NULL`,
+          [meeting.id, contact.id, contact.email],
+        )
+      }
+      io.to(`user:${String(contact.id)}`).emit('call:incoming', {
+        meeting: camelizeRow(meeting),
+        caller: currentUser,
+        invitation: true,
+      })
+      scheduleMeetingInvitationTimeout(String(meeting.id), String(contact.id))
+    }
+    await emitMeetingUpdated(String(meeting.id), { meetingId: meeting.id })
+    return { invited: contacts.rows.map((contact) => String(contact.id)) }
+  })
+
+  app.post<{ Params: IdParams }>('/api/meetings/:id/invitations/decline', async (request, reply) => {
+    const result = await pool.query(
+      `UPDATE meeting_attendees SET response='declined'
+       WHERE meeting_id=$1 AND user_id=$2 AND response='invited' RETURNING id`,
+      [request.params.id, currentUser.id],
+    )
+    if (!result.rowCount) {
+      return reply.code(404).send({ error: 'invitation_not_found', message: 'Активное приглашение не найдено.' })
+    }
+    clearMeetingInvitationTimer(request.params.id, currentUser.id)
+    await emitMeetingUpdated(request.params.id, {
+      meetingId: request.params.id,
+      invitationUserId: currentUser.id,
+    })
+    return { success: true }
+  })
+
   app.post<{ Params: IdParams }>('/api/meetings/:id/token', async (request, reply) => {
     const result = await pool.query('SELECT * FROM meetings WHERE id = $1', [request.params.id])
     const meeting = result.rows[0] as Record<string, unknown> | undefined
     if (!meeting) return reply.code(404).send({ error: 'meeting_not_found' })
+    if (meeting.status === 'ended' || meeting.status === 'cancelled') {
+      return reply.code(409).send({ error: 'meeting_ended', message: 'Встреча уже завершена.' })
+    }
 
     const isHost = meeting.host_id === currentUser.id
+    if (!isHost) {
+      await pool.query(
+        `UPDATE meeting_attendees SET response='accepted', joined_at=now(), left_at=NULL
+         WHERE meeting_id=$1 AND user_id=$2`,
+        [request.params.id, currentUser.id],
+      )
+      clearMeetingInvitationTimer(request.params.id, currentUser.id)
+      await emitMeetingUpdated(request.params.id, {
+        meetingId: request.params.id,
+        invitationUserId: currentUser.id,
+      })
+    }
     const token = new AccessToken(config.livekitApiKey, config.livekitApiSecret, {
       identity: currentUser.id,
       name: currentUser.displayName,

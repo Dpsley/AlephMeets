@@ -100,6 +100,13 @@ export const api = {
     }),
   endMeetingForEveryone: (id: string) =>
     request<{ meeting: Meeting }>(`/api/meetings/${id}/end`, { method: 'POST' }),
+  inviteMeetingContacts: (id: string, userIds: string[]) =>
+    request<{ invited: string[] }>(`/api/meetings/${id}/invitations`, {
+      method: 'POST',
+      body: JSON.stringify({ userIds }),
+    }),
+  declineMeetingInvitation: (id: string) =>
+    request<{ success: boolean }>(`/api/meetings/${id}/invitations/decline`, { method: 'POST' }),
   contacts: () => request<{ contacts: Contact[] }>('/api/contacts'),
   addContact: (identifier: string) =>
     request<{ contact: Contact }>('/api/contacts', {

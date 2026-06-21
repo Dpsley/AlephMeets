@@ -1,6 +1,6 @@
 import { io, type Socket } from 'socket.io-client'
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { Avatar, Modal } from '../components/ui'
 import {
   clearAuthTokens,
@@ -9,6 +9,7 @@ import {
   saveAuthTokens,
 } from '../lib/auth'
 import { API_URL, api } from '../lib/api'
+import { openMeetingWindow } from '../lib/meeting-window'
 import type { DirectCallContext, Meeting, Message, User } from '../types'
 
 interface AppState {
@@ -31,6 +32,7 @@ interface IncomingCall {
   meeting: Meeting
   caller: User
   callContext?: DirectCallContext
+  invitation?: boolean
 }
 
 interface MessageNotice {
@@ -43,6 +45,7 @@ const AppContext = createContext<AppState | null>(null)
 
 export function AppProvider({ children }: { children: React.ReactNode }): React.JSX.Element {
   const navigate = useNavigate()
+  const location = useLocation()
   const [user, setUser] = useState<User | null>(null)
   const [meetings, setMeetings] = useState<Meeting[]>([])
   const [lastCalendarSyncedAt, setLastCalendarSyncedAt] = useState<string | null>(null)
@@ -156,7 +159,9 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
     }
     inviteToCall(contact.id, activated.meeting, callContext)
     await reloadMeetings()
-    navigate(`/meeting/${activated.meeting.id}`, { state: { callContext } })
+    if (!await openMeetingWindow(activated.meeting.id, { meeting: activated.meeting, callContext })) {
+      navigate(`/meeting/${activated.meeting.id}`, { state: { callContext } })
+    }
   }, [inviteToCall, navigate, reloadMeetings, user])
 
   useEffect(() => {
@@ -184,7 +189,12 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
         setIncomingCall((current) => current?.meeting.id === update.meetingId ? null : current)
       }
     })
-    socket.on('call:incoming', (call: IncomingCall) => setIncomingCall(call))
+    socket.on('call:incoming', (call: IncomingCall) => {
+      if (!location.pathname.startsWith('/meeting/')) setIncomingCall(call)
+    })
+    socket.on('call:cancelled', ({ meetingId }: { meetingId: string }) => {
+      setIncomingCall((current) => current?.meeting.id === meetingId ? null : current)
+    })
     socket.on('message:new', (message: Message) => {
       if (message.senderId === user.id) return
       const body = message.kind === 'audio'
@@ -210,7 +220,7 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
       callSocketRef.current = null
       if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current)
     }
-  }, [navigate, reloadMeetings, user])
+  }, [location.pathname, navigate, reloadMeetings, user])
 
   useEffect(() => {
     if (!incomingCall) return
@@ -248,6 +258,7 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
 
   const declineIncomingCall = useCallback((): void => {
     if (!incomingCall) return
+    void api.declineMeetingInvitation(incomingCall.meeting.id).catch(() => undefined)
     if (incomingCall.callContext) {
       void api.finishCallLog(
         incomingCall.callContext.conversationId,
@@ -301,8 +312,13 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
             <button className="button primary" onClick={() => {
               const call = incomingCall
               setIncomingCall(null)
-              navigate(`/meeting/${call.meeting.id}`, {
-                state: { meeting: call.meeting, callContext: call.callContext },
+              void openMeetingWindow(call.meeting.id, {
+                meeting: call.meeting,
+                callContext: call.callContext,
+              }).then((opened) => {
+                if (!opened) navigate(`/meeting/${call.meeting.id}`, {
+                  state: { meeting: call.meeting, callContext: call.callContext },
+                })
               })
             }}>Принять</button>
           </div>
