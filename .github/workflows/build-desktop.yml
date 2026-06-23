@@ -136,18 +136,19 @@ jobs:
       - name: Verify macOS architectures
         shell: bash
         run: |
-          found=0
-          for binary in $(find apps/desktop/release -path '*/Contents/MacOS/AlephMeets' -type f); do
-            archs="$(lipo -archs "$binary")"
-            echo "$binary: $archs"
-            if [[ "$archs" != *"x86_64"* || "$archs" != *"arm64"* ]]; then
-              echo "::error ::macOS release must be universal, got: $archs"
-              exit 1
-            fi
-            codesign --verify --deep --strict "$(dirname "$(dirname "$(dirname "$binary")")")"
-            found=$((found + 1))
-          done
-          test "$found" -eq 1
+          binary="apps/desktop/release/mac-universal/AlephMeets.app/Contents/MacOS/AlephMeets"
+          if [[ ! -f "$binary" ]]; then
+            echo "::error ::macOS universal app binary was not produced"
+            find apps/desktop/release -path '*/Contents/MacOS/AlephMeets' -type f -print
+            exit 1
+          fi
+          archs="$(lipo -archs "$binary")"
+          echo "$binary: $archs"
+          if [[ "$archs" != *"x86_64"* || "$archs" != *"arm64"* ]]; then
+            echo "::error ::macOS release must be universal, got: $archs"
+            exit 1
+          fi
+          codesign --verify --deep --strict "apps/desktop/release/mac-universal/AlephMeets.app"
       - uses: actions/upload-artifact@v4
         with:
           name: AlephMeets-macOS
