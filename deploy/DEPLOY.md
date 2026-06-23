@@ -182,6 +182,20 @@ The macOS package must be built on macOS. The repository's GitHub Actions
 workflow already uses separate Windows and macOS runners; set the repository
 Actions variable `VITE_API_URL` before using it for production artifacts.
 
+For a macOS build that opens normally after download, configure Apple Developer
+ID signing and notarization in GitHub repository secrets:
+
+- `MAC_CSC_LINK`: base64-encoded `.p12` Developer ID Application certificate,
+  or another `electron-builder`-supported certificate reference.
+- `MAC_CSC_KEY_PASSWORD`: password for the `.p12` certificate.
+- Notarization credentials, preferably `APPLE_API_KEY`, `APPLE_API_KEY_ID` and
+  `APPLE_API_ISSUER`. The Apple ID fallback is also supported through
+  `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD` and `APPLE_TEAM_ID`.
+
+If no explicit signing identity is configured, CI uses ad-hoc signing only to
+produce a testable universal artifact. That is not a replacement for Developer
+ID signing and notarization for public distribution.
+
 ## Updates and backups
 
 Deploy an update:

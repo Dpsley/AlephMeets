@@ -71,7 +71,6 @@
         "releaseType": "release"
       }
     ],
-    "afterPack": "scripts/adhoc-sign-mac.mjs",
     "mac": {
       "icon": "build/icon.png",
       "category": "public.app-category.productivity",
@@ -83,6 +82,7 @@
       "hardenedRuntime": true,
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": true,
       "extendInfo": {
         "NSCameraUsageDescription": "AlephMeets uses the camera for video meetings.",
         "NSMicrophoneUsageDescription": "AlephMeets uses the microphone for meetings and voice messages.",
