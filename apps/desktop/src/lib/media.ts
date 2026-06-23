@@ -1,4 +1,16 @@
 export type MediaKind = 'audio' | 'video'
+export type DesktopMediaAccessKind = 'camera' | 'microphone'
+
+export async function ensureDesktopMediaAccess(kinds: DesktopMediaAccessKind[]): Promise<void> {
+  const results = await window.alephDesktop?.ensureMediaAccess(kinds)
+  const denied = results?.find((result) => !result.granted)
+  if (!denied) return
+  const label = denied.kind === 'camera' ? 'Камера' : 'Микрофон'
+  throw new DOMException(
+    `${label} заблокирован в настройках конфиденциальности macOS.`,
+    'NotAllowedError',
+  )
+}
 
 export function isMissingDeviceError(error: unknown): boolean {
   const name = error && typeof error === 'object' && 'name' in error ? String(error.name) : ''

@@ -32,7 +32,7 @@ import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import type { Contact, DirectCallContext, Meeting } from '../types'
 import { api } from '../lib/api'
 import { getMeetingWindowContext } from '../lib/meeting-window'
-import { isRetryableMediaError, mediaErrorMessage, type MediaKind } from '../lib/media'
+import { ensureDesktopMediaAccess, isRetryableMediaError, mediaErrorMessage, type MediaKind } from '../lib/media'
 import { useApp } from '../state/AppContext'
 import { BrandMark } from '../components/BrandMark'
 import { Avatar, Modal } from '../components/ui'
@@ -448,6 +448,7 @@ export function MeetingPage(): React.JSX.Element {
       let lastError: unknown
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
+          await ensureDesktopMediaAccess([kind === 'audio' ? 'microphone' : 'camera'])
           const stream = await navigator.mediaDevices.getUserMedia(
             kind === 'audio'
               ? { audio: { echoCancellation: true, noiseSuppression: true }, video: false }

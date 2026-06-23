@@ -6,6 +6,7 @@ import { Avatar, EmptyState, Modal } from '../components/ui'
 import { API_URL, api } from '../lib/api'
 import { getAccessToken } from '../lib/auth'
 import { relativeTime, shortTime } from '../lib/format'
+import { ensureDesktopMediaAccess } from '../lib/media'
 import { useApp } from '../state/AppContext'
 import type { Contact, Conversation, Message } from '../types'
 
@@ -153,7 +154,15 @@ export function ChatPage(): React.JSX.Element {
       return
     }
     if (!selectedId) return
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    setCallError(null)
+    let stream: MediaStream
+    try {
+      await ensureDesktopMediaAccess(['microphone'])
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    } catch (reason) {
+      setCallError(reason instanceof Error ? reason.message : 'Не удалось получить доступ к микрофону.')
+      return
+    }
     const chunks: Blob[] = []
     const recorder = new MediaRecorder(stream, { mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : undefined })
     recorderRef.current = recorder

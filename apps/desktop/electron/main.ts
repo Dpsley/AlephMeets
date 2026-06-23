@@ -1,4 +1,4 @@
-import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage, session, shell } from 'electron'
+import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage, session, shell, systemPreferences } from 'electron'
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { appIconPath } from './app-icon'
@@ -22,6 +22,36 @@ const pendingDisplayRequests = new Map<number, {
   timer: ReturnType<typeof setTimeout>
 }>()
 let nextDisplayRequestId = 1
+
+type MediaAccessKind = 'camera' | 'microphone'
+
+type MediaAccessResult = {
+  kind: MediaAccessKind
+  status: string
+  granted: boolean
+}
+
+const mediaSettingsUrls: Record<MediaAccessKind, string> = {
+  camera: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Camera',
+  microphone: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone',
+}
+
+function isMediaAccessKind(value: unknown): value is MediaAccessKind {
+  return value === 'camera' || value === 'microphone'
+}
+
+async function ensureMediaAccess(kind: MediaAccessKind): Promise<MediaAccessResult> {
+  if (process.platform !== 'darwin') return { kind, status: 'granted', granted: true }
+
+  let status = systemPreferences.getMediaAccessStatus(kind)
+  if (status === 'granted') return { kind, status, granted: true }
+  if (status === 'not-determined') {
+    const granted = await systemPreferences.askForMediaAccess(kind)
+    status = systemPreferences.getMediaAccessStatus(kind)
+    return { kind, status: granted ? 'granted' : status, granted }
+  }
+  return { kind, status, granted: false }
+}
 
 function isSameFrame(
   left: Electron.WebFrameMain | null,
@@ -227,6 +257,16 @@ app.whenReady().then(async () => {
   })
   ipcMain.handle('window:is-maximized', (event) => BrowserWindow.fromWebContents(event.sender)?.isMaximized() ?? false)
   ipcMain.handle('app:version', () => app.getVersion())
+  ipcMain.handle('media:ensure-access', async (_event, kinds?: unknown[]) => {
+    const requested = Array.isArray(kinds) && kinds.length ? kinds : ['microphone', 'camera']
+    const unique = [...new Set(requested.filter(isMediaAccessKind))]
+    return Promise.all(unique.map((kind) => ensureMediaAccess(kind)))
+  })
+  ipcMain.handle('media:open-settings', async (_event, kind: unknown) => {
+    if (process.platform !== 'darwin' || !isMediaAccessKind(kind)) return false
+    await shell.openExternal(mediaSettingsUrls[kind])
+    return true
+  })
   ipcMain.handle('meeting:open', (event, meetingId: string, context?: Record<string, unknown>) => {
     const slot = authSlots.get(event.sender.id) ?? 'primary'
     createMeetingWindow(meetingId, slot, context ?? null)

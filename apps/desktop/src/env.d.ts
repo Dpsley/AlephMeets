@@ -9,6 +9,12 @@ interface Window {
     isMaximized: () => Promise<boolean>
     onMaximizedChanged: (listener: (maximized: boolean) => void) => () => void
     getVersion: () => Promise<string>
+    ensureMediaAccess: (kinds: Array<'camera' | 'microphone'>) => Promise<Array<{
+      kind: 'camera' | 'microphone'
+      status: string
+      granted: boolean
+    }>>
+    openMediaSettings: (kind: 'camera' | 'microphone') => Promise<boolean>
     openMeeting: (meetingId: string, context?: Record<string, unknown>) => Promise<void>
     getMeetingContext: () => Promise<Record<string, unknown> | null>
     forceCloseMeeting: () => void

@@ -12,6 +12,14 @@ contextBridge.exposeInMainWorld('alephDesktop', {
     return () => ipcRenderer.removeListener('window:maximized-changed', handler)
   },
   getVersion: () => ipcRenderer.invoke('app:version') as Promise<string>,
+  ensureMediaAccess: (kinds: Array<'camera' | 'microphone'>) =>
+    ipcRenderer.invoke('media:ensure-access', kinds) as Promise<Array<{
+      kind: 'camera' | 'microphone'
+      status: string
+      granted: boolean
+    }>>,
+  openMediaSettings: (kind: 'camera' | 'microphone') =>
+    ipcRenderer.invoke('media:open-settings', kind) as Promise<boolean>,
   openMeeting: (meetingId: string, context?: Record<string, unknown>) =>
     ipcRenderer.invoke('meeting:open', meetingId, context) as Promise<void>,
   getMeetingContext: () =>
