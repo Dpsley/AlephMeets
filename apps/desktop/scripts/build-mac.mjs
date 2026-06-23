@@ -19,22 +19,11 @@ for (const name of signingVariables) {
   if (!env[name]?.trim()) delete env[name]
 }
 
-const macBuilderVersion = env.MAC_ELECTRON_BUILDER_VERSION?.trim() || '26.0.12'
-delete env.MAC_ELECTRON_BUILDER_VERSION
+const builderPath = process.platform === 'win32'
+  ? 'electron-builder.cmd'
+  : 'electron-builder'
 
-const builderPath = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-const builderArgs = [
-  'exec',
-  '--yes',
-  '--package',
-  `electron-builder@${macBuilderVersion}`,
-  '--',
-  'electron-builder',
-  '--mac',
-  ...process.argv.slice(2),
-  '--publish',
-  'never',
-]
+const builderArgs = ['--mac', ...process.argv.slice(2), '--publish', 'never']
 const hasExplicitSigningIdentity = Boolean(env.CSC_LINK || env.CSC_NAME)
 if (process.platform === 'darwin' && env.CI === 'true' && !hasExplicitSigningIdentity) {
   builderArgs.push('-c.mac.identity=-')
