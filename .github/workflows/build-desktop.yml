@@ -130,14 +130,20 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           VITE_API_URL: https://meets-api.alephtrade.com
       - name: Verify macOS architectures
+        shell: bash
         run: |
-          count=0
+          found=0
           for binary in $(find apps/desktop/release -path '*/Contents/MacOS/AlephMeets' -type f); do
-            echo "$binary: $(lipo -archs "$binary")"
+            archs="$(lipo -archs "$binary")"
+            echo "$binary: $archs"
+            if [[ "$archs" != *"x86_64"* || "$archs" != *"arm64"* ]]; then
+              echo "::error ::macOS release must be universal, got: $archs"
+              exit 1
+            fi
             codesign --verify --deep --strict "$(dirname "$(dirname "$(dirname "$binary")")")"
-            count=$((count + 1))
+            found=$((found + 1))
           done
-          test "$count" -eq 2
+          test "$found" -eq 1
       - uses: actions/upload-artifact@v4
         with:
           name: AlephMeets-macOS
