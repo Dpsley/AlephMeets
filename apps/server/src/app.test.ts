@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import test, { after } from 'node:test'
 import { createApp, EXCHANGE_SYNC_INTERVAL_MS } from './app.js'
 import { pool } from './db.js'
-import type { CurrentUser } from './config.js'
+import { config, type CurrentUser } from './config.js'
+import { decryptIdpPayload } from './idp.js'
 
 const testUsers: Record<string, CurrentUser> = {
   dmitry: {
@@ -12,6 +13,7 @@ const testUsers: Record<string, CurrentUser> = {
     displayName: 'Dmitry Aleph',
     firstName: 'Dmitry',
     lastName: 'Aleph',
+    department: null,
     avatarUrl: null,
     timezone: 'Europe/Moscow',
     locale: 'ru-RU',
@@ -24,6 +26,7 @@ const testUsers: Record<string, CurrentUser> = {
     displayName: 'Анна Волкова',
     firstName: 'Анна',
     lastName: 'Волкова',
+    department: null,
     avatarUrl: null,
     timezone: 'Europe/Moscow',
     locale: 'ru-RU',
@@ -78,6 +81,21 @@ test('CORS preflight allows meeting status PATCH requests', async () => {
     })
     assert.equal(response.statusCode, 204)
     assert.match(response.headers['access-control-allow-methods'] ?? '', /PATCH/)
+  } finally {
+    await app.close()
+  }
+})
+
+test('CORS headers are present on auth failures', async () => {
+  const app = await createTestApp()
+  try {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/session',
+      headers: { origin: 'http://localhost:5173' },
+    })
+    assert.equal(response.statusCode, 401)
+    assert.equal(response.headers['access-control-allow-origin'], 'http://localhost:5173')
   } finally {
     await app.close()
   }
@@ -362,6 +380,96 @@ test('reports presence as online only while the heartbeat is fresh', async () =>
       `UPDATE users SET presence = 'offline', last_seen_at = NULL WHERE id = $1`,
       [annaId],
     )
+    await app.close()
+  }
+})
+
+test('loads AD users into contacts for department users', async () => {
+  const app = await createTestApp()
+  const originalFetch = globalThis.fetch
+  const originalConfig = {
+    idpBaseUrl: config.idpBaseUrl,
+    idpAccessKey: config.idpAccessKey,
+    idpEncodeKey: config.idpEncodeKey,
+    idpDecodeKey: config.idpDecodeKey,
+    adControlSecret: config.adControlSecret,
+  }
+  const originalDepartment = testUsers.dmitry!.department
+  const adUserId = '90000000-0000-4000-8000-000000000010'
+  const newAdUserId = '90000000-0000-4000-8000-000000000011'
+  let fetchCount = 0
+
+  Object.assign(config, {
+    idpBaseUrl: 'https://api.alephtrade.com/id',
+    idpAccessKey: 'idp-test-token',
+    idpEncodeKey: 'idp-test-service-key',
+    idpDecodeKey: 'idp-test-response-key',
+    adControlSecret: 'ad-test-control-secret',
+  })
+  testUsers.dmitry!.department = 'Product'
+  await pool.query(
+    `INSERT INTO users (id, phone, email, display_name, timezone, locale)
+     VALUES ($1,$2,$3,$4,'Europe/Moscow','ru-RU')
+     ON CONFLICT (id) DO UPDATE SET
+       phone = EXCLUDED.phone,
+       email = EXCLUDED.email,
+       display_name = EXCLUDED.display_name`,
+    [adUserId, '79990000010', 'directory-contact@alephtrade.com', 'Old Directory Contact'],
+  )
+  globalThis.fetch = async (input, init) => {
+    fetchCount += 1
+    assert.equal(String(input), 'https://api.alephtrade.com/id/service/ad/users')
+    assert.equal(new Headers(init?.headers).get('Authorization'), 'Bearer idp-test-token')
+    const body = JSON.parse(String(init?.body)) as { string: string }
+    const payload = decryptIdpPayload<{ control_string: string }>(body.string, config.idpEncodeKey)
+    assert.match(payload.control_string, /^[0-9a-f]{128}$/)
+    return new Response(JSON.stringify({
+      status: true,
+      count: 2,
+      users: [
+        {
+          dn: 'CN=Directory Contact,DC=alephtrade,DC=com',
+          properties: {
+            objectguid: [{ encoding: 'base64', value: 'LdaiDTZnSE+KG8/KoskhPg==' }],
+            mail: ['directory-contact@alephtrade.com'],
+            displayname: ['Directory Contact'],
+            givenname: ['Directory'],
+            sn: ['Contact'],
+            department: ['Trading'],
+          },
+        },
+        {
+          id: newAdUserId,
+          email: 'new-contact@alephtrade.com',
+          display_name: 'New Contact',
+          department: 'Sales',
+        },
+      ],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+
+  try {
+    const response = await app.inject({ method: 'GET', url: '/api/contacts', headers: dmitryAuth })
+    assert.equal(response.statusCode, 200, response.body)
+    const contact = response.json().contacts.find((item: { id: string }) => item.id === adUserId)
+    assert.equal(contact?.department, 'Trading')
+    assert.equal(contact?.email, 'directory-contact@alephtrade.com')
+    const newContact = response.json().contacts.find((item: { id: string }) => item.id === newAdUserId)
+    assert.equal(newContact?.department, 'Sales')
+    assert.equal(newContact?.email, 'new-contact@alephtrade.com')
+    const created = await pool.query(
+      'SELECT display_name, department FROM users WHERE id = $1',
+      [newAdUserId],
+    )
+    assert.deepEqual(created.rows[0], { display_name: 'New Contact', department: 'Sales' })
+    const cachedResponse = await app.inject({ method: 'GET', url: '/api/contacts', headers: dmitryAuth })
+    assert.equal(cachedResponse.statusCode, 200, cachedResponse.body)
+    assert.equal(fetchCount, 1)
+  } finally {
+    globalThis.fetch = originalFetch
+    Object.assign(config, originalConfig)
+    testUsers.dmitry!.department = originalDepartment
+    await pool.query('DELETE FROM users WHERE id = ANY($1::uuid[])', [[adUserId, newAdUserId]])
     await app.close()
   }
 })

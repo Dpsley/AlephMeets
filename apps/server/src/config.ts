@@ -14,6 +14,7 @@ export interface CurrentUser {
   displayName: string
   firstName: string
   lastName: string
+  department: string | null
   avatarUrl: string | null
   timezone: string
   locale: string
@@ -47,6 +48,7 @@ export const config = {
   idpEncodeKey: process.env.IDP_ENCODE_KEY ?? '',
   idpDecodeKey: process.env.IDP_DECODE_KEY ?? '',
   idpAccessKey: process.env.IDP_ACCESS_KEY ?? '',
+  adControlSecret: process.env.AD_CONTOL_SECRET ?? process.env.AD_CONTROL_SECRET ?? '',
   livekitUrl: process.env.LIVEKIT_URL ?? 'ws://127.0.0.1:7880',
   livekitApiKey: process.env.LIVEKIT_API_KEY ?? 'devkey',
   livekitApiSecret: process.env.LIVEKIT_API_SECRET ?? 'secret',

@@ -12,6 +12,7 @@ CREATE TABLE users (
   display_name text NOT NULL,
   first_name text,
   last_name text,
+  department text,
   avatar_url text,
   timezone text NOT NULL DEFAULT 'UTC',
   locale text NOT NULL DEFAULT 'en-US',

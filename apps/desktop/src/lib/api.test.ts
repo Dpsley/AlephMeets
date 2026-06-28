@@ -86,4 +86,15 @@ describe('API request headers', () => {
     expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(new Headers(fetchMock.mock.calls[2]?.[1]?.headers).get('Authorization')).toBe('Bearer new-access')
   })
+
+  it('reports API connectivity failures with an application message', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new TypeError('Failed to fetch')
+    }))
+
+    await expect(api.requestSms('+7 999 000-00-01')).rejects.toMatchObject({
+      status: 0,
+      message: 'Не удалось подключиться к API. Проверьте, что сервер запущен.',
+    })
+  })
 })

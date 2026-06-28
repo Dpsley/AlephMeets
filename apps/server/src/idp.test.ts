@@ -5,6 +5,7 @@ import { pool } from './db.js'
 import {
   authenticateAccessToken,
   decryptIdpPayload,
+  encryptAdServicePayload,
   encryptIdpPayload,
   findIdpContact,
   findIdpUserByEmail,
@@ -12,6 +13,7 @@ import {
   logoutSession,
   requestSms,
   refreshSession,
+  userCanLoadAdContacts,
   verifySms,
 } from './idp.js'
 
@@ -29,6 +31,23 @@ test('uses the IDP base64(ciphertext::IV) envelope', () => {
   const delimiter = envelope.indexOf(Buffer.from('::'))
   assert.ok(delimiter > 0)
   assert.equal(envelope.subarray(delimiter + 2).length, 16)
+})
+
+test('uses the AD service envelope from the PHP example', () => {
+  const secret = 'sixteen-byte-key'
+  const encrypted = encryptAdServicePayload({ control_string: 'abc' }, secret)
+  assert.deepEqual(decryptIdpPayload(encrypted, secret), { control_string: 'abc' })
+  const envelope = Buffer.from(encrypted, 'base64')
+  const delimiter = envelope.indexOf(Buffer.from('::'))
+  const iv = envelope.subarray(delimiter + 2).toString('ascii')
+  assert.match(iv, /^[0-9a-f]{16}$/)
+})
+
+test('loads AD contacts only for department users or alephtrade mailboxes', () => {
+  assert.equal(userCanLoadAdContacts({ department: 'Sales', email: null }), true)
+  assert.equal(userCanLoadAdContacts({ department: null, email: 'person@alephtrade.com' }), true)
+  assert.equal(userCanLoadAdContacts({ department: null, email: 'person@corp.alephtrade.com' }), true)
+  assert.equal(userCanLoadAdContacts({ department: null, email: 'person@example.com' }), false)
 })
 
 test('uses phone_probe, sms/send, sms/validate and user_info in order', async () => {
@@ -133,6 +152,69 @@ test('keeps the code-entry flow open during the IDP resend cooldown', async () =
   } finally {
     globalThis.fetch = originalFetch
     await pool.query('DELETE FROM auth_login_challenges WHERE phone = $1', ['79990000008'])
+  }
+})
+
+test('merges first IDP sign-in into an AD-created user by email', async () => {
+  const originalFetch = globalThis.fetch
+  const adUserId = '90000000-0000-4000-8000-000000000020'
+  const idpUserId = '90000000-0000-4000-8000-000000000021'
+  const email = 'ad-merge@alephtrade.com'
+  const phone = '79990000020'
+  await pool.query(
+    `INSERT INTO users (id, phone, email, display_name, department, timezone, locale)
+     VALUES ($1,NULL,$2,$3,$4,'Europe/Moscow','ru-RU')`,
+    [adUserId, email, 'AD Merge User', 'Trading'],
+  )
+
+  globalThis.fetch = async (input) => {
+    const path = new URL(String(input)).pathname
+    let payload: unknown
+    if (path.endsWith('/phone_probe')) {
+      payload = { status: true, message: idpUserId }
+    } else if (path.endsWith('/sms/send')) {
+      payload = { headers: {}, original: { status: true, message: true }, exception: null }
+    } else if (path.endsWith('/sms/validate')) {
+      payload = { status: true, message: 'Move on' }
+    } else if (path.endsWith('/user_info')) {
+      payload = {
+        status: true,
+        message: {
+          id: idpUserId,
+          phone: null,
+          name: 'IDP',
+          second_name: 'Merge',
+          email,
+          department: null,
+          time_zone: 'Europe/Moscow',
+        },
+      }
+    } else {
+      throw new Error(`Unexpected IDP path: ${path}`)
+    }
+    return new Response(JSON.stringify([
+      encryptIdpPayload(payload, config.idpDecodeKey),
+    ]), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+
+  try {
+    await requestSms('+7 999 000-00-20')
+    const result = await verifySms('+7 999 000-00-20', '123456')
+    assert.equal(result.user.id, adUserId)
+    assert.equal(result.user.phone, phone)
+    assert.equal(result.user.department, 'Trading')
+    const users = await pool.query(
+      'SELECT id, phone, department FROM users WHERE lower(email) = $1 ORDER BY id',
+      [email],
+    )
+    assert.equal(users.rowCount, 1)
+    assert.deepEqual(users.rows[0], { id: adUserId, phone, department: 'Trading' })
+    assert.equal((await authenticateAccessToken(result.tokens.accessToken)).id, adUserId)
+  } finally {
+    globalThis.fetch = originalFetch
+    await pool.query('DELETE FROM auth_login_challenges WHERE phone = $1', [phone])
+    await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [adUserId])
+    await pool.query('DELETE FROM users WHERE id = ANY($1::uuid[])', [[adUserId, idpUserId]])
   }
 })
 

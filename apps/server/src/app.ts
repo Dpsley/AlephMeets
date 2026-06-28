@@ -47,6 +47,7 @@ import {
   logoutSession,
   refreshSession,
   requestSms,
+  syncAdContactsForUser,
   verifySms,
 } from './idp.js'
 
@@ -223,6 +224,11 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
   const meetingInvitationTimers = new Map<string, ReturnType<typeof setTimeout>>()
   const activeExchangeSyncs = new Map<string, Promise<ExchangeSyncResult>>()
 
+  await app.register(cors, {
+    origin: true,
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  })
+
   const syncExchangeAccount = (
     account: ExchangeAccountRow,
     user: Pick<CurrentUser, 'id' | 'timezone'>,
@@ -384,10 +390,6 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
 
   if (!existsSync(config.uploadDir)) mkdirSync(config.uploadDir, { recursive: true })
 
-  await app.register(cors, {
-    origin: true,
-    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  })
   await app.register(multipart, { limits: { fileSize: config.maxUploadBytes, files: 1 } })
   await app.register(fastifyStatic, {
     root: config.uploadDir,
@@ -509,7 +511,8 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
 
   app.get('/api/session', async () => {
     const result = await pool.query(
-      `SELECT id, phone, email, display_name, first_name, last_name, avatar_url, timezone, locale,
+      `SELECT id, phone, email, display_name, first_name, last_name, department,
+              avatar_url, timezone, locale,
               CASE WHEN presence = 'online' AND last_seen_at >= now() - interval '90 seconds'
                 THEN 'online'::user_presence ELSE 'offline'::user_presence END AS status
        FROM users WHERE id = $1`,
@@ -834,8 +837,15 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
   })
 
   app.get('/api/contacts', async () => {
+    try {
+      const synced = await syncAdContactsForUser(currentUser)
+      if (synced) app.log.info({ userId: currentUser.id, synced }, 'AD contact sync completed')
+    } catch (error) {
+      app.log.warn({ err: error, userId: currentUser.id }, 'AD contact sync failed')
+    }
     const result = await pool.query(
-      `SELECT u.id, u.phone, u.email, u.display_name, u.first_name, u.last_name, u.avatar_url,
+      `SELECT u.id, u.phone, u.email, u.display_name, u.first_name, u.last_name,
+              u.department, u.avatar_url,
               CASE WHEN u.presence = 'online' AND u.last_seen_at >= now() - interval '90 seconds'
                 THEN 'online'::user_presence ELSE 'offline'::user_presence END AS status,
               c.alias, c.created_at
@@ -870,7 +880,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
           c.avatar_url, c.updated_at, self_member.role AS current_user_role,
           COALESCE(json_agg(json_build_object(
             'id', u.id, 'displayName', u.display_name, 'email', u.email, 'phone', u.phone,
-            'avatarUrl', u.avatar_url,
+            'department', u.department, 'avatarUrl', u.avatar_url,
             'status', CASE WHEN u.presence = 'online' AND u.last_seen_at >= now() - interval '90 seconds'
               THEN 'online' ELSE 'offline' END,
             'role', member.role

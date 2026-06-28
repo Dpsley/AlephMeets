@@ -47,10 +47,15 @@ async function request<T>(path: string, init?: RequestInit, retryAfterRefresh = 
   if (init?.body !== undefined && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
-  const response = await fetch(`${API_URL}${path}`, {
-    ...init,
-    headers,
-  })
+  let response: Response
+  try {
+    response = await fetch(`${API_URL}${path}`, {
+      ...init,
+      headers,
+    })
+  } catch {
+    throw new ApiError('Не удалось подключиться к API. Проверьте, что сервер запущен.', 0)
+  }
   const payload = (await response.json()) as T & { message?: string }
   if (response.status === 401 && retryAfterRefresh && !path.startsWith('/api/auth/')) {
     await renewAccessToken()

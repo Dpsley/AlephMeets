@@ -33,6 +33,11 @@ environment. They must never be exposed through `VITE_*` variables or bundled
 into Electron. SMS verification is performed by Aleph ID; AlephMeets then issues
 opaque access/refresh tokens whose SHA-256 hashes are stored in PostgreSQL.
 
+Users whose Aleph ID profile has `department`, or whose email domain is
+`alephtrade.com`, also receive contacts from the AD service through the same
+Aleph ID service credentials. Configure `AD_CONTOL_SECRET` on the API server for
+the AD control string.
+
 ## Current features
 
 - SMS sign-in through Aleph ID, with encrypted desktop token storage

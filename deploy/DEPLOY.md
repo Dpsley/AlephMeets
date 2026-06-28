@@ -68,7 +68,8 @@ openssl rand -base64 36 | tr -dc 'A-Za-z0-9'  # PostgreSQL password
 
 Keep `LIVEKIT_API_KEY`/`LIVEKIT_API_SECRET` identical for the API and LiveKit.
 Keep `CREDENTIAL_ENCRYPTION_KEY` stable: changing it makes saved Exchange
-passwords unreadable. Put the IDP keys only in `.env.production`, never in Git.
+passwords unreadable. Put the IDP keys and `AD_CONTOL_SECRET` only in
+`.env.production`, never in Git.
 
 ## 3. Start the stack
 

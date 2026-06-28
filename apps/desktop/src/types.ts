@@ -5,6 +5,7 @@ export interface User {
   displayName: string
   firstName?: string
   lastName?: string
+  department?: string | null
   avatarUrl: string | null
   timezone: string
   locale: string
