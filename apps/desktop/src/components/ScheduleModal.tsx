@@ -1,6 +1,12 @@
 import { useMemo, useState } from 'react'
 import { api } from '../lib/api'
 import { useApp } from '../state/AppContext'
+import {
+  ParticipantPicker,
+  participantEmails,
+  participantUserIds,
+  type ParticipantSelection,
+} from './ParticipantPicker'
 import { Modal } from './ui'
 
 function localDateTime(date: Date): string {
@@ -19,7 +25,7 @@ export function ScheduleModal({ open, onClose }: { open: boolean; onClose: () =>
   const [title, setTitle] = useState('Новая встреча')
   const [startsAt, setStartsAt] = useState(initialStart)
   const [duration, setDuration] = useState(60)
-  const [attendees, setAttendees] = useState('')
+  const [participants, setParticipants] = useState<ParticipantSelection[]>([])
   const [waitingRoom, setWaitingRoom] = useState(true)
   const [muteOnEntry, setMuteOnEntry] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -37,7 +43,8 @@ export function ScheduleModal({ open, onClose }: { open: boolean; onClose: () =>
         startsAt: start.toISOString(),
         endsAt: end.toISOString(),
         timezone: user?.timezone ?? 'Europe/Moscow',
-        attendees: attendees.split(/[,;\s]+/).filter(Boolean),
+        attendees: participantEmails(participants),
+        attendeeUserIds: participantUserIds(participants),
         syncCalendar: true,
         waitingRoom,
         muteOnEntry,
@@ -75,14 +82,7 @@ export function ScheduleModal({ open, onClose }: { open: boolean; onClose: () =>
             </select>
           </label>
         </div>
-        <label>
-          <span>Участники</span>
-          <input
-            value={attendees}
-            onChange={(event) => setAttendees(event.target.value)}
-            placeholder="email через запятую"
-          />
-        </label>
+        <ParticipantPicker value={participants} onChange={setParticipants} />
         <div className="settings-box">
           <label className="check-row">
             <input type="checkbox" checked={waitingRoom} onChange={(event) => setWaitingRoom(event.target.checked)} />

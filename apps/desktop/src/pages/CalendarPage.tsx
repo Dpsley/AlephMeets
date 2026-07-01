@@ -3,6 +3,12 @@ import { ru } from 'date-fns/locale'
 import { CalendarClock, CalendarPlus, ChevronLeft, ChevronRight, Play, RefreshCw, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import {
+  ParticipantPicker,
+  participantEmails,
+  participantUserIds,
+  type ParticipantSelection,
+} from '../components/ParticipantPicker'
 import { ScheduleModal } from '../components/ScheduleModal'
 import { Modal } from '../components/ui'
 import { api } from '../lib/api'
@@ -15,11 +21,13 @@ function localDateTime(date: Date): string {
   return new Date(date.getTime() - offset).toISOString().slice(0, 16)
 }
 
-function attendeeEmails(meeting: Meeting): string {
-  return (meeting.attendees ?? [])
-    .map((attendee) => attendee.email)
-    .filter((email): email is string => Boolean(email))
-    .join(', ')
+function meetingParticipants(meeting: Meeting): ParticipantSelection[] {
+  return (meeting.attendees ?? []).map((attendee) => ({
+    userId: attendee.userId,
+    email: attendee.email,
+    displayName: attendee.displayName,
+    avatarUrl: attendee.avatarUrl,
+  }))
 }
 
 function meetingDurationMinutes(meeting: Meeting): number {
@@ -41,7 +49,7 @@ function CalendarMeetingActions({
   const [title, setTitle] = useState(meeting.title)
   const [startsAt, setStartsAt] = useState(localDateTime(new Date(meeting.startsAt)))
   const [duration, setDuration] = useState(meetingDurationMinutes(meeting))
-  const [attendees, setAttendees] = useState(attendeeEmails(meeting))
+  const [participants, setParticipants] = useState<ParticipantSelection[]>(meetingParticipants(meeting))
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const canManage = meeting.status === 'scheduled' && new Date(meeting.endsAt) > new Date()
@@ -51,7 +59,7 @@ function CalendarMeetingActions({
     setTitle(meeting.title)
     setStartsAt(localDateTime(new Date(meeting.startsAt)))
     setDuration(meetingDurationMinutes(meeting))
-    setAttendees(attendeeEmails(meeting))
+    setParticipants(meetingParticipants(meeting))
     setError(null)
   }, [meeting])
 
@@ -89,8 +97,8 @@ function CalendarMeetingActions({
         startsAt: start.toISOString(),
         endsAt: end.toISOString(),
         timezone: meeting.timezone,
-        attendees: attendees.split(/[,;\s]+/).filter(Boolean),
-        attendeeUserIds: [],
+        attendees: participantEmails(participants),
+        attendeeUserIds: participantUserIds(participants),
         waitingRoom: meeting.waitingRoom,
         muteOnEntry: meeting.muteOnEntry,
         allowJoinBeforeHost: meeting.allowJoinBeforeHost,
@@ -143,10 +151,7 @@ function CalendarMeetingActions({
               </select>
             </label>
           </div>
-          <label>
-            <span>Участники</span>
-            <input value={attendees} onChange={(event) => setAttendees(event.target.value)} placeholder="email через запятую" />
-          </label>
+          <ParticipantPicker value={participants} onChange={setParticipants} />
           {error && <p className="form-error">{error}</p>}
           <footer className="modal-actions">
             <button type="button" className="button secondary" onClick={() => setEditing(false)}>Назад</button>
