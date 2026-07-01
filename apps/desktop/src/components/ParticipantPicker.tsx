@@ -91,39 +91,56 @@ export function participantUserIds(participants: readonly ParticipantSelection[]
 
 export function ParticipantPicker({
   label = 'Участники',
+  contacts: providedContacts,
+  contactsLoading: providedContactsLoading,
+  contactOnly = false,
+  excludeUserIds = [],
+  max,
+  placeholder = 'Начните вводить имя, телефон или email',
   value,
   onChange,
 }: {
   label?: string
+  contacts?: Contact[]
+  contactsLoading?: boolean
+  contactOnly?: boolean
+  excludeUserIds?: string[]
+  max?: number
+  placeholder?: string
   value: ParticipantSelection[]
   onChange: (participants: ParticipantSelection[]) => void
 }): React.JSX.Element {
-  const [contacts, setContacts] = useState<Contact[]>([])
-  const [contactsLoading, setContactsLoading] = useState(false)
+  const [loadedContacts, setLoadedContacts] = useState<Contact[]>([])
+  const [loadedContactsLoading, setLoadedContactsLoading] = useState(false)
   const [input, setInput] = useState('')
   const [focused, setFocused] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const contacts = providedContacts ?? loadedContacts
+  const contactsLoading = providedContactsLoading ?? loadedContactsLoading
 
   useEffect(() => {
+    if (providedContacts) return
     let active = true
-    setContactsLoading(true)
+    setLoadedContactsLoading(true)
     void api.contacts()
       .then((result) => {
-        if (active) setContacts(result.contacts)
+        if (active) setLoadedContacts(result.contacts)
       })
       .catch(() => {
-        if (active) setContacts([])
+        if (active) setLoadedContacts([])
       })
       .finally(() => {
-        if (active) setContactsLoading(false)
+        if (active) setLoadedContactsLoading(false)
       })
     return () => { active = false }
-  }, [])
+  }, [providedContacts])
 
   const suggestions = useMemo(() => {
     const query = input.trim().toLowerCase()
     const phoneQuery = normalizedPhone(input)
+    const excluded = new Set(excludeUserIds)
     return contacts
+      .filter((contact) => !excluded.has(contact.id))
       .filter((contact) => !hasParticipant(value, contactToParticipant(contact)))
       .filter((contact) => {
         if (!query) return true
@@ -136,10 +153,11 @@ export function ParticipantPicker({
         return text.includes(query) || Boolean(phoneQuery && normalizedPhone(contact.phone).includes(phoneQuery))
       })
       .slice(0, 8)
-  }, [contacts, input, value])
+  }, [contacts, excludeUserIds, input, value])
 
   const addContact = (contact: Contact): void => {
-    onChange(addParticipant(value, contactToParticipant(contact)))
+    const participant = contactToParticipant(contact)
+    onChange(max === 1 ? [participant] : addParticipant(value, participant))
     setInput('')
     setError(null)
     setFocused(false)
@@ -158,17 +176,19 @@ export function ParticipantPicker({
         || Boolean(phone && normalizedPhone(contact.phone) === phone)
       ))
       if (matchedContact) {
-        next = addParticipant(next, contactToParticipant(matchedContact))
-      } else if (emailPattern.test(email)) {
+        const participant = contactToParticipant(matchedContact)
+        next = max === 1 ? [participant] : addParticipant(next, participant)
+      } else if (!contactOnly && emailPattern.test(email)) {
         next = addParticipant(next, { email, displayName: email, avatarUrl: null })
       } else {
         invalid.push(token)
       }
     }
+    if (max && next.length > max) next = next.slice(0, max)
     onChange(next)
     if (invalid.length) {
       setInput(invalid.join(' '))
-      setError('Выберите контакт из списка или введите email.')
+      setError(contactOnly ? 'Выберите контакт из списка.' : 'Выберите контакт из списка или введите email.')
     } else {
       setInput('')
       setError(null)
@@ -224,7 +244,7 @@ export function ParticipantPicker({
             onFocus={() => setFocused(true)}
             onBlur={() => setFocused(false)}
             onKeyDown={handleKeyDown}
-            placeholder="Начните вводить имя, телефон или email"
+            placeholder={placeholder}
             autoComplete="off"
           />
           <button

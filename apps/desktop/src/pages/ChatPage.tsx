@@ -2,6 +2,11 @@ import { io, type Socket } from 'socket.io-client'
 import { Check, CheckCheck, Download, FileText, Mic, Paperclip, Phone, Search, Send, Settings2, Square, UserMinus, UserPlus, Users, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
+import {
+  ParticipantPicker,
+  participantUserIds,
+  type ParticipantSelection,
+} from '../components/ParticipantPicker'
 import { Avatar, EmptyState, Modal } from '../components/ui'
 import { API_URL, api } from '../lib/api'
 import { getAccessToken } from '../lib/auth'
@@ -29,6 +34,23 @@ function recordingAttachment(message: Message, metadata: CallMessageMetadata): P
     : null
 }
 
+function contactParticipant(contact: Contact): ParticipantSelection {
+  return {
+    userId: contact.id,
+    email: contact.email,
+    displayName: contact.displayName,
+    avatarUrl: contact.avatarUrl,
+  }
+}
+
+function participantsFromIds(contacts: readonly Contact[], ids: readonly string[]): ParticipantSelection[] {
+  const byId = new Map(contacts.map((contact) => [contact.id, contact]))
+  return ids.map((id) => {
+    const contact = byId.get(id)
+    return contact ? contactParticipant(contact) : { userId: id, displayName: 'Участник' }
+  })
+}
+
 export function ChatPage(): React.JSX.Element {
   const location = useLocation()
   const { user, presenceByUserId, startDirectCall } = useApp()
@@ -44,10 +66,16 @@ export function ChatPage(): React.JSX.Element {
   const [calling, setCalling] = useState(false)
   const [callError, setCallError] = useState<string | null>(null)
   const [contacts, setContacts] = useState<Contact[]>([])
+  const [contactsLoading, setContactsLoading] = useState(false)
+  const [createDirectOpen, setCreateDirectOpen] = useState(false)
   const [createGroupOpen, setCreateGroupOpen] = useState(false)
   const [manageGroupOpen, setManageGroupOpen] = useState(false)
+  const [directMembers, setDirectMembers] = useState<ParticipantSelection[]>([])
+  const [directSaving, setDirectSaving] = useState(false)
+  const [directError, setDirectError] = useState<string | null>(null)
   const [groupTitle, setGroupTitle] = useState('')
   const [groupMemberIds, setGroupMemberIds] = useState<string[]>([])
+  const [groupAddMemberIds, setGroupAddMemberIds] = useState<string[]>([])
   const [groupSaving, setGroupSaving] = useState(false)
   const [groupError, setGroupError] = useState<string | null>(null)
   const socketRef = useRef<Socket | null>(null)
@@ -71,7 +99,11 @@ export function ChatPage(): React.JSX.Element {
 
   useEffect(() => {
     void loadConversations()
-    void api.contacts().then((result) => setContacts(result.contacts))
+    setContactsLoading(true)
+    void api.contacts()
+      .then((result) => setContacts(result.contacts))
+      .catch(() => setContacts([]))
+      .finally(() => setContactsLoading(false))
     const socket = io(API_URL, {
       transports: ['websocket'],
       auth: (callback) => callback({ token: getAccessToken() }),
@@ -150,6 +182,19 @@ export function ChatPage(): React.JSX.Element {
       ].some((value) => value?.toLowerCase().includes(query))
     })
     : messages
+  const currentUserIds = user?.id ? [user.id] : []
+  const groupParticipants = useMemo(
+    () => participantsFromIds(contacts, groupMemberIds),
+    [contacts, groupMemberIds],
+  )
+  const groupAddParticipants = useMemo(
+    () => participantsFromIds(contacts, groupAddMemberIds),
+    [contacts, groupAddMemberIds],
+  )
+  const groupMemberExcludeIds = useMemo(
+    () => selected?.kind === 'group' ? selected.members.map((member) => member.id) : [],
+    [selected],
+  )
 
   const send = async (): Promise<void> => {
     if (!selectedId || !draft.trim() || sending) return
@@ -230,6 +275,29 @@ export function ChatPage(): React.JSX.Element {
     }
   }
 
+  const openCreateDirect = (): void => {
+    setDirectMembers([])
+    setDirectError(null)
+    setCreateDirectOpen(true)
+  }
+
+  const createDirectChat = async (): Promise<void> => {
+    const memberId = participantUserIds(directMembers)[0]
+    if (!memberId || directSaving) return
+    setDirectSaving(true)
+    setDirectError(null)
+    try {
+      const result = await api.createConversation([memberId])
+      await loadConversations()
+      setSelectedId(result.conversation.id)
+      setCreateDirectOpen(false)
+    } catch (reason) {
+      setDirectError(reason instanceof Error ? reason.message : 'Не удалось создать чат.')
+    } finally {
+      setDirectSaving(false)
+    }
+  }
+
   const openCreateGroup = (): void => {
     setGroupTitle('')
     setGroupMemberIds([])
@@ -256,6 +324,7 @@ export function ChatPage(): React.JSX.Element {
   const openGroupManagement = (): void => {
     if (!selected || selected.kind !== 'group') return
     setGroupTitle(selected.title)
+    setGroupAddMemberIds([])
     setGroupError(null)
     setManageGroupOpen(true)
   }
@@ -274,11 +343,14 @@ export function ChatPage(): React.JSX.Element {
     }
   }
 
-  const addGroupMember = async (memberId: string): Promise<void> => {
+  const addGroupMembers = async (): Promise<void> => {
     if (!selected) return
+    const memberIds = groupAddMemberIds.filter((id) => !selected.members.some((member) => member.id === id))
+    if (!memberIds.length) return
     setGroupError(null)
     try {
-      await api.addConversationMembers(selected.id, [memberId])
+      await api.addConversationMembers(selected.id, memberIds)
+      setGroupAddMemberIds([])
       await loadConversations()
     } catch (reason) {
       setGroupError(reason instanceof Error ? reason.message : 'Не удалось добавить участника.')
@@ -300,7 +372,7 @@ export function ChatPage(): React.JSX.Element {
     <>
     <div className="chat-layout">
       <aside className="conversation-sidebar">
-        <header><div><p className="eyebrow">Сообщения</p><h1>Чаты</h1></div><button className="icon-button"><Users size={19} /></button></header>
+        <header><div><p className="eyebrow">Сообщения</p><h1>Чаты</h1></div><button className="icon-button" onClick={openCreateDirect} title="Создать чат" aria-label="Создать чат"><Users size={19} /></button></header>
         <div className="search-box chat-search"><button className="search-trigger" onClick={() => conversationSearchRef.current?.focus()} title="Поиск по чатам" aria-label="Поиск по чатам"><Search size={17} /></button><input ref={conversationSearchRef} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Поиск" /></div>
         <button className="group-create-button" onClick={openCreateGroup}><UserPlus size={18} />Создать групповой чат</button>
         <div className="conversation-list">
@@ -347,14 +419,40 @@ export function ChatPage(): React.JSX.Element {
         </> : <EmptyState icon={<Users />} title="Выберите чат" text="Переписки и файлы появятся здесь." />}
       </section>
     </div>
+    <Modal open={createDirectOpen} onClose={() => setCreateDirectOpen(false)} title="Создать чат" width={480}>
+      <div className="form-stack">
+        <ParticipantPicker
+          label="Собеседник"
+          contacts={contacts}
+          contactsLoading={contactsLoading}
+          contactOnly
+          excludeUserIds={currentUserIds}
+          max={1}
+          placeholder="Начните вводить имя, телефон или email"
+          value={directMembers}
+          onChange={setDirectMembers}
+        />
+        {!contactsLoading && !contacts.length && <p className="group-empty">Сначала добавьте пользователей в контакты.</p>}
+        {directError && <p className="form-error">{directError}</p>}
+        <footer className="modal-actions">
+          <button className="button secondary" onClick={() => setCreateDirectOpen(false)}>Отмена</button>
+          <button className="button primary" onClick={() => void createDirectChat()} disabled={!participantUserIds(directMembers).length || directSaving}>{directSaving ? 'Создание...' : 'Создать'}</button>
+        </footer>
+      </div>
+    </Modal>
     <Modal open={createGroupOpen} onClose={() => setCreateGroupOpen(false)} title="Создать групповой чат" width={480}>
       <div className="form-stack">
         <label><span>Название группы</span><input value={groupTitle} onChange={(event) => setGroupTitle(event.target.value)} maxLength={150} autoFocus placeholder="Например, Команда проекта" /></label>
-        <div className="group-member-picker">
-          <strong>Участники</strong>
-          {contacts.map((contact) => <label key={contact.id} className="group-member-option"><input type="checkbox" checked={groupMemberIds.includes(contact.id)} onChange={() => setGroupMemberIds((current) => current.includes(contact.id) ? current.filter((id) => id !== contact.id) : [...current, contact.id])} /><div className="group-member-avatar"><Avatar name={contact.displayName} src={contact.avatarUrl} size="small" /></div><span className="group-member-copy">{contact.displayName}{contact.email && <small>{contact.email}</small>}{!contact.email && contact.phone && <small>{contact.phone}</small>}</span></label>)}
-          {!contacts.length && <p className="group-empty">Сначала добавьте пользователей в контакты.</p>}
-        </div>
+        <ParticipantPicker
+          contacts={contacts}
+          contactsLoading={contactsLoading}
+          contactOnly
+          excludeUserIds={currentUserIds}
+          placeholder="Начните вводить имя, телефон или email"
+          value={groupParticipants}
+          onChange={(participants) => setGroupMemberIds(participantUserIds(participants))}
+        />
+        {!contactsLoading && !contacts.length && <p className="group-empty">Сначала добавьте пользователей в контакты.</p>}
         {groupError && <p className="form-error">{groupError}</p>}
         <footer className="modal-actions"><button className="button secondary" onClick={() => setCreateGroupOpen(false)}>Отмена</button><button className="button primary" onClick={() => void createGroup()} disabled={!groupTitle.trim() || !groupMemberIds.length || groupSaving}>{groupSaving ? 'Создание...' : 'Создать'}</button></footer>
       </div>
@@ -363,7 +461,21 @@ export function ChatPage(): React.JSX.Element {
       {selected?.kind === 'group' && <div className="form-stack">
         <label><span>Название группы</span><div className="group-title-editor"><input value={groupTitle} onChange={(event) => setGroupTitle(event.target.value)} maxLength={150} /><button className="button secondary" onClick={() => void renameGroup()} disabled={!groupTitle.trim() || groupSaving}>Сохранить</button></div></label>
         <div className="group-management-list"><strong>Участники</strong>{selected.members.map((member) => <div className="group-management-row" key={member.id}><div className="group-member-avatar"><Avatar name={member.displayName} src={member.avatarUrl} size="small" /></div><span className="group-member-copy">{member.displayName}<small>{member.role === 'owner' ? 'Владелец' : member.email || member.phone || 'Контакт Aleph ID'}</small></span>{member.role !== 'owner' && <button className="icon-button danger" onClick={() => void removeGroupMember(member.id)} title="Удалить участника"><UserMinus size={17} /></button>}</div>)}</div>
-        <div className="group-management-list"><strong>Добавить участника</strong>{contacts.filter((contact) => !selected.members.some((member) => member.id === contact.id)).map((contact) => <div className="group-management-row" key={contact.id}><div className="group-member-avatar"><Avatar name={contact.displayName} src={contact.avatarUrl} size="small" /></div><span className="group-member-copy">{contact.displayName}<small>{contact.email || contact.phone || 'Контакт Aleph ID'}</small></span><button className="icon-button accent" onClick={() => void addGroupMember(contact.id)} title="Добавить участника"><UserPlus size={17} /></button></div>)}{contacts.every((contact) => selected.members.some((member) => member.id === contact.id)) && <p className="group-empty">Все контакты уже добавлены.</p>}</div>
+        <div className="group-management-list">
+          <ParticipantPicker
+            label="Добавить участника"
+            contacts={contacts}
+            contactsLoading={contactsLoading}
+            contactOnly
+            excludeUserIds={groupMemberExcludeIds}
+            placeholder="Начните вводить имя, телефон или email"
+            value={groupAddParticipants}
+            onChange={(participants) => setGroupAddMemberIds(participantUserIds(participants))}
+          />
+          {!contactsLoading && !contacts.length && <p className="group-empty">Сначала добавьте пользователей в контакты.</p>}
+          {contacts.length > 0 && contacts.every((contact) => selected.members.some((member) => member.id === contact.id)) && <p className="group-empty">Все контакты уже добавлены.</p>}
+          <button className="button secondary" onClick={() => void addGroupMembers()} disabled={!groupAddMemberIds.length}>Добавить выбранных</button>
+        </div>
         {groupError && <p className="form-error">{groupError}</p>}
       </div>}
     </Modal>
