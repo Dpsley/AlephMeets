@@ -38,6 +38,7 @@ export function ScheduleModal({ open, onClose }: { open: boolean; onClose: () =>
         endsAt: end.toISOString(),
         timezone: user?.timezone ?? 'Europe/Moscow',
         attendees: attendees.split(/[,;\s]+/).filter(Boolean),
+        syncCalendar: true,
         waitingRoom,
         muteOnEntry,
         allowJoinBeforeHost: false,

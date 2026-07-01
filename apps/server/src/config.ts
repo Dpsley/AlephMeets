@@ -54,6 +54,11 @@ export const config = {
   livekitApiSecret: process.env.LIVEKIT_API_SECRET ?? 'secret',
   uploadDir: resolve(rootDir, process.env.UPLOAD_DIR ?? 'uploads'),
   maxUploadBytes: Number(process.env.MAX_UPLOAD_MB ?? 100) * 1024 * 1024,
+  s3UploadBaseUrl: (process.env.S3_UPLOAD_BASE_URL ?? 'https://api.alephtrade.com/s3').replace(/\/$/, ''),
+  s3UploadAuth: process.env.S3_UPLOAD_AUTH ?? '',
+  s3Bucket: process.env.S3_BUCKET ?? 'alephtrade-storage',
+  s3PublicBaseUrl: (process.env.S3_PUBLIC_BASE_URL ?? 'https://storage.yandexcloud.net').replace(/\/$/, ''),
+  s3RootPath: (process.env.S3_ROOT_PATH ?? 'alephmeets').replace(/^\/+|\/+$/g, '') || 'alephmeets',
   credentialEncryptionKey:
     process.env.CREDENTIAL_ENCRYPTION_KEY ?? 'aleph-meets-local-development-key-change-me',
 }

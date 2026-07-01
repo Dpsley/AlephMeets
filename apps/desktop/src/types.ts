@@ -49,6 +49,8 @@ export interface CallMessageMetadata {
   startedAt: string
   endedAt?: string
   durationMs?: number
+  recordingUrl?: string
+  recordingName?: string
 }
 
 export interface Attachment {
@@ -58,6 +60,8 @@ export interface Attachment {
   byteSize: number
   durationMs?: number
   url: string
+  storageProvider?: string
+  storageKey?: string
 }
 
 export interface Message {

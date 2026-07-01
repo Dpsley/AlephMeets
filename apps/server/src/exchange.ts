@@ -22,6 +22,7 @@ export interface ExchangeEvent {
   startsAt: string
   endsAt: string
   organizer?: string
+  attendees: string[]
 }
 
 export interface ExchangeEventInput {
@@ -135,6 +136,130 @@ function getText(value: unknown): string {
   if (value === undefined || value === null) return ''
   if (typeof value === 'object' && '#text' in value) return String((value as { '#text': unknown })['#text'])
   return String(value)
+}
+
+function decodeHtmlEntities(value: string): string {
+  return value
+    .replace(/&#x([0-9a-f]+);/gi, (_match, code: string) => String.fromCodePoint(Number.parseInt(code, 16)))
+    .replace(/&#(\d+);/g, (_match, code: string) => String.fromCodePoint(Number.parseInt(code, 10)))
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+}
+
+function normalizePlainText(value: string): string {
+  return value
+    .replace(/\r/g, '\n')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t\f\v]+/g, ' ')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+export function normalizeExchangeBody(value: unknown): string {
+  const raw = getText(value)
+  const decoded = decodeHtmlEntities(decodeHtmlEntities(raw))
+  if (decoded.trim() === '[object Object]') return ''
+  if (!/<\/?[a-z][\s\S]*>/i.test(decoded)) return normalizePlainText(decoded)
+  return normalizePlainText(decodeHtmlEntities(
+    decoded
+      .replace(/<!--[\s\S]*?-->/g, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<(?:br|\/p|\/div|\/li|\/tr|\/h[1-6])\b[^>]*>/gi, '\n')
+      .replace(/<[^>]+>/g, ' '),
+  ))
+}
+
+function asArray<T>(value: T | T[] | null | undefined): T[] {
+  if (value === undefined || value === null) return []
+  return Array.isArray(value) ? value : [value]
+}
+
+function normalizeEmail(value: unknown): string {
+  return getText(value).trim().toLowerCase()
+}
+
+export function normalizeExchangeAttendees(attendees: readonly string[] | undefined = []): string[] {
+  return [...new Set(attendees.map((email) => email.trim().toLowerCase()).filter(Boolean))]
+}
+
+function attendeeEmails(container: unknown): string[] {
+  if (!container || typeof container !== 'object') return []
+  const attendeeContainer = container as Record<string, unknown>
+  return asArray(attendeeContainer.Attendee)
+    .map((attendee) => {
+      if (!attendee || typeof attendee !== 'object') return ''
+      const mailbox = (attendee as Record<string, unknown>).Mailbox as Record<string, unknown> | undefined
+      return normalizeEmail(mailbox?.EmailAddress)
+    })
+    .filter(Boolean)
+}
+
+export function parseExchangeCalendarItem(item: Record<string, unknown>): ExchangeEvent {
+  const itemId = item.ItemId as Record<string, unknown> | undefined
+  const organizer = item.Organizer as Record<string, unknown> | undefined
+  const mailbox = organizer?.Mailbox as Record<string, unknown> | undefined
+  const attendees = normalizeExchangeAttendees([
+    ...attendeeEmails(item.RequiredAttendees),
+    ...attendeeEmails(item.OptionalAttendees),
+    ...attendeeEmails(item.Resources),
+  ])
+  return {
+    externalEventId: String(itemId?.['@_Id'] ?? ''),
+    changeKey: itemId?.['@_ChangeKey'] ? String(itemId['@_ChangeKey']) : undefined,
+    subject: getText(item.Subject) || 'Встреча Exchange',
+    body: normalizeExchangeBody(item.Body),
+    location: getText(item.Location),
+    startsAt: getText(item.Start),
+    endsAt: getText(item.End),
+    organizer: getText(mailbox?.EmailAddress),
+    attendees,
+  }
+}
+
+export function buildRequiredAttendeesXml(attendees: readonly string[] | undefined): string {
+  const emails = normalizeExchangeAttendees(attendees)
+  return emails.length
+    ? `<t:RequiredAttendees>${emails.map((email) => `<t:Attendee><t:Mailbox><t:EmailAddress>${xml(email)}</t:EmailAddress></t:Mailbox></t:Attendee>`).join('')}</t:RequiredAttendees>`
+    : ''
+}
+
+export function buildExchangeUpdateItemXml(
+  externalEventId: string,
+  changeKey: string | undefined,
+  event: ExchangeEventInput,
+): string {
+  const requiredAttendees = buildRequiredAttendeesXml(event.attendees)
+  const attendeesUpdate = requiredAttendees
+    ? `<t:SetItemField><t:FieldURI FieldURI="calendar:RequiredAttendees" /><t:CalendarItem>${requiredAttendees}</t:CalendarItem></t:SetItemField>`
+    : ''
+  const sendMode = requiredAttendees ? 'SendOnlyToChanged' : 'SendToNone'
+  const itemId = `<t:ItemId Id="${xml(externalEventId)}"${changeKey ? ` ChangeKey="${xml(changeKey)}"` : ''} />`
+  return `<m:UpdateItem MessageDisposition="SaveOnly" ConflictResolution="AutoResolve" SendMeetingInvitationsOrCancellations="${sendMode}">
+    <m:ItemChanges><t:ItemChange>${itemId}<t:Updates>
+      <t:SetItemField><t:FieldURI FieldURI="item:Subject" /><t:CalendarItem><t:Subject>${xml(event.subject)}</t:Subject></t:CalendarItem></t:SetItemField>
+      <t:SetItemField><t:FieldURI FieldURI="item:Body" /><t:CalendarItem><t:Body BodyType="Text">${xml(event.body)}</t:Body></t:CalendarItem></t:SetItemField>
+      <t:SetItemField><t:FieldURI FieldURI="calendar:Start" /><t:CalendarItem><t:Start>${xml(event.startsAt)}</t:Start></t:CalendarItem></t:SetItemField>
+      <t:SetItemField><t:FieldURI FieldURI="calendar:End" /><t:CalendarItem><t:End>${xml(event.endsAt)}</t:End></t:CalendarItem></t:SetItemField>
+      <t:SetItemField><t:FieldURI FieldURI="calendar:Location" /><t:CalendarItem><t:Location>${xml(event.location)}</t:Location></t:CalendarItem></t:SetItemField>
+      ${attendeesUpdate}
+    </t:Updates></t:ItemChange></m:ItemChanges>
+  </m:UpdateItem>`
+}
+
+export function buildExchangeDeleteItemXml(
+  externalEventId: string,
+  changeKey: string | undefined,
+): string {
+  const itemId = `<t:ItemId Id="${xml(externalEventId)}"${changeKey ? ` ChangeKey="${xml(changeKey)}"` : ''} />`
+  return `<m:DeleteItem DeleteType="MoveToDeletedItems" SendMeetingCancellations="SendToAllAndSaveCopy" AffectedTaskOccurrences="AllOccurrences">
+    <m:ItemIds>${itemId}</m:ItemIds>
+  </m:DeleteItem>`
 }
 
 function collectByKey(value: unknown, key: string, result: Record<string, unknown>[] = []): Record<string, unknown>[] {
@@ -255,6 +380,23 @@ export async function testExchangeConnection(credentials: ExchangeCredentials): 
   </m:GetFolder>`)
 }
 
+async function loadExchangeEventDetails(
+  credentials: ExchangeCredentials,
+  events: ExchangeEvent[],
+): Promise<ExchangeEvent[]> {
+  if (!events.length) return events
+  const ids = events.map((event) => `<t:ItemId Id="${xml(event.externalEventId)}"${event.changeKey ? ` ChangeKey="${xml(event.changeKey)}"` : ''} />`).join('')
+  const data = await requestEws(credentials, `<m:GetItem>
+    <m:ItemShape><t:BaseShape>AllProperties</t:BaseShape></m:ItemShape>
+    <m:ItemIds>${ids}</m:ItemIds>
+  </m:GetItem>`)
+  const detailed = collectByKey(data, 'CalendarItem')
+    .map(parseExchangeCalendarItem)
+    .filter((event) => event.externalEventId && event.startsAt && event.endsAt)
+  const byId = new Map(detailed.map((event) => [event.externalEventId, event]))
+  return events.map((event) => byId.get(event.externalEventId) ?? event)
+}
+
 export async function listExchangeEvents(
   credentials: ExchangeCredentials,
   from: Date,
@@ -265,30 +407,17 @@ export async function listExchangeEvents(
     <m:CalendarView StartDate="${from.toISOString()}" EndDate="${to.toISOString()}" MaxEntriesReturned="1000" />
     <m:ParentFolderIds><t:DistinguishedFolderId Id="calendar" /></m:ParentFolderIds>
   </m:FindItem>`)
-  return collectByKey(data, 'CalendarItem').map((item) => {
-    const itemId = item.ItemId as Record<string, unknown> | undefined
-    const organizer = item.Organizer as Record<string, unknown> | undefined
-    const mailbox = organizer?.Mailbox as Record<string, unknown> | undefined
-    return {
-      externalEventId: String(itemId?.['@_Id'] ?? ''),
-      changeKey: itemId?.['@_ChangeKey'] ? String(itemId['@_ChangeKey']) : undefined,
-      subject: getText(item.Subject) || 'Встреча Exchange',
-      body: getText(item.Body),
-      location: getText(item.Location),
-      startsAt: getText(item.Start),
-      endsAt: getText(item.End),
-      organizer: getText(mailbox?.EmailAddress),
-    }
-  }).filter((event) => event.externalEventId && event.startsAt && event.endsAt)
+  const events = collectByKey(data, 'CalendarItem')
+    .map(parseExchangeCalendarItem)
+    .filter((event) => event.externalEventId && event.startsAt && event.endsAt)
+  return await loadExchangeEventDetails(credentials, events)
 }
 
 export async function createExchangeEvent(
   credentials: ExchangeCredentials,
   event: ExchangeEventInput,
 ): Promise<{ externalEventId: string; changeKey?: string }> {
-  const attendees = event.attendees?.length
-    ? `<t:RequiredAttendees>${event.attendees.map((email) => `<t:Attendee><t:Mailbox><t:EmailAddress>${xml(email)}</t:EmailAddress></t:Mailbox></t:Attendee>`).join('')}</t:RequiredAttendees>`
-    : ''
+  const attendees = buildRequiredAttendeesXml(event.attendees)
   const data = await requestEws(credentials, `<m:CreateItem SendMeetingInvitations="SendToNone">
     <m:SavedItemFolderId><t:DistinguishedFolderId Id="calendar" /></m:SavedItemFolderId>
     <m:Items><t:CalendarItem>
@@ -307,4 +436,27 @@ export async function createExchangeEvent(
     externalEventId,
     changeKey: itemId?.['@_ChangeKey'] ? String(itemId['@_ChangeKey']) : undefined,
   }
+}
+
+export async function updateExchangeEvent(
+  credentials: ExchangeCredentials,
+  externalEventId: string,
+  changeKey: string | undefined,
+  event: ExchangeEventInput,
+): Promise<{ externalEventId: string; changeKey?: string }> {
+  const data = await requestEws(credentials, buildExchangeUpdateItemXml(externalEventId, changeKey, event))
+  const updatedItemId = collectByKey(data, 'ItemId')[0]
+  const updatedExternalEventId = updatedItemId?.['@_Id'] ? String(updatedItemId['@_Id']) : externalEventId
+  return {
+    externalEventId: updatedExternalEventId,
+    changeKey: updatedItemId?.['@_ChangeKey'] ? String(updatedItemId['@_ChangeKey']) : changeKey,
+  }
+}
+
+export async function deleteExchangeEvent(
+  credentials: ExchangeCredentials,
+  externalEventId: string,
+  changeKey: string | undefined,
+): Promise<void> {
+  await requestEws(credentials, buildExchangeDeleteItemXml(externalEventId, changeKey))
 }

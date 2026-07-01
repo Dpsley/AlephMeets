@@ -8,6 +8,7 @@ export const meetingInputSchema = z.object({
   timezone: z.string().min(1).max(100).default('UTC'),
   attendees: z.array(z.email()).max(200).default([]),
   attendeeUserIds: z.array(z.uuid()).max(200).default([]),
+  syncCalendar: z.boolean().default(false),
   waitingRoom: z.boolean().default(true),
   muteOnEntry: z.boolean().default(true),
   allowJoinBeforeHost: z.boolean().default(false),

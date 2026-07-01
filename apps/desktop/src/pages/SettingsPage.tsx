@@ -6,14 +6,18 @@ import {
   ChevronRight,
   HardDrive,
   Headphones,
+  Mic,
+  Moon,
   Monitor,
   RefreshCw,
   Settings2,
   ShieldCheck,
+  Sun,
 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Avatar, Modal } from '../components/ui'
 import { api } from '../lib/api'
+import { ensureDesktopMediaAccess, mediaErrorMessage } from '../lib/media'
 import { useApp } from '../state/AppContext'
 import type { ExchangeSettings } from '../types'
 
@@ -42,7 +46,7 @@ const settingsSections: Array<{
 ]
 
 export function SettingsPage(): React.JSX.Element {
-  const { user, presenceByUserId } = useApp()
+  const { user, presenceByUserId, theme, setTheme } = useApp()
   const [activeSection, setActiveSection] = useState<SettingsSection>('general')
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([])
   const [exchange, setExchange] = useState<ExchangeSettings | null>(null)
@@ -54,12 +58,20 @@ export function SettingsPage(): React.JSX.Element {
   const [syncing, setSyncing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [message, setMessage] = useState<string | null>(null)
+  const [selectedMicrophoneId, setSelectedMicrophoneId] = useState('')
+  const [micTesting, setMicTesting] = useState(false)
+  const [micLevel, setMicLevel] = useState(0)
+  const [micTestError, setMicTestError] = useState<string | null>(null)
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>(
     typeof Notification === 'undefined' ? 'denied' : Notification.permission,
   )
+  const micStreamRef = useRef<MediaStream | null>(null)
+  const micAudioContextRef = useRef<AudioContext | null>(null)
+  const micAnimationRef = useRef<number | null>(null)
 
-  const videoDevices = devices.filter((device) => device.kind === 'videoinput')
-  const audioDevices = devices.filter((device) => device.kind !== 'videoinput')
+  const videoDevices = useMemo(() => devices.filter((device) => device.kind === 'videoinput'), [devices])
+  const audioInputDevices = useMemo(() => devices.filter((device) => device.kind === 'audioinput'), [devices])
+  const audioDevices = useMemo(() => devices.filter((device) => device.kind !== 'videoinput'), [devices])
 
   const loadExchange = async (): Promise<void> => {
     const result = await api.exchangeSettings()
@@ -72,6 +84,82 @@ export function SettingsPage(): React.JSX.Element {
     void loadExchange()
     void window.alephDesktop?.getVersion().then(setVersion)
   }, [])
+
+  const stopMicTest = useCallback((resetState = true): void => {
+    if (micAnimationRef.current !== null) {
+      cancelAnimationFrame(micAnimationRef.current)
+      micAnimationRef.current = null
+    }
+    micStreamRef.current?.getTracks().forEach((track) => track.stop())
+    micStreamRef.current = null
+    const context = micAudioContextRef.current
+    micAudioContextRef.current = null
+    if (context && context.state !== 'closed') void context.close().catch(() => undefined)
+    if (resetState) {
+      setMicTesting(false)
+      setMicLevel(0)
+    }
+  }, [])
+
+  useEffect(() => () => stopMicTest(false), [stopMicTest])
+
+  const changeMicrophone = (deviceId: string): void => {
+    setSelectedMicrophoneId(deviceId)
+    if (micTesting) stopMicTest()
+  }
+
+  const startMicTest = async (): Promise<void> => {
+    if (micTesting) {
+      stopMicTest()
+      return
+    }
+    setMicTestError(null)
+    try {
+      await ensureDesktopMediaAccess(['microphone'])
+      const audio: MediaTrackConstraints = selectedMicrophoneId
+        ? {
+          deviceId: { exact: selectedMicrophoneId },
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        }
+        : {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        }
+      const stream = await navigator.mediaDevices.getUserMedia({ audio, video: false })
+      micStreamRef.current = stream
+      const nextDevices = await navigator.mediaDevices.enumerateDevices()
+      setDevices(nextDevices)
+
+      const audioContext = new AudioContext()
+      const source = audioContext.createMediaStreamSource(stream)
+      const analyser = audioContext.createAnalyser()
+      analyser.fftSize = 2048
+      analyser.smoothingTimeConstant = 0.72
+      source.connect(analyser)
+      micAudioContextRef.current = audioContext
+      await audioContext.resume().catch(() => undefined)
+
+      const data = new Float32Array(analyser.fftSize)
+      const updateLevel = (): void => {
+        analyser.getFloatTimeDomainData(data)
+        let sumSquares = 0
+        for (const sample of data) sumSquares += sample * sample
+        const rms = Math.sqrt(sumSquares / data.length)
+        const decibels = 20 * Math.log10(Math.max(rms, 0.000001))
+        const normalized = Math.round(Math.min(100, Math.max(0, ((decibels + 60) / 60) * 100)))
+        setMicLevel(normalized)
+        micAnimationRef.current = requestAnimationFrame(updateLevel)
+      }
+      setMicTesting(true)
+      updateLevel()
+    } catch (reason) {
+      stopMicTest()
+      setMicTestError(mediaErrorMessage('audio', reason))
+    }
+  }
 
   const openExchange = (): void => {
     setError(null)
@@ -157,6 +245,18 @@ export function SettingsPage(): React.JSX.Element {
           </div>
 
           <div className="settings-section" data-settings-section="general">
+            <h2>Внешний вид</h2>
+            <div className="theme-choice" role="group" aria-label="Тема приложения">
+              <button type="button" className={theme === 'light' ? 'active' : ''} onClick={() => setTheme('light')}>
+                <Sun size={17} />Светлая
+              </button>
+              <button type="button" className={theme === 'dark' ? 'active' : ''} onClick={() => setTheme('dark')}>
+                <Moon size={17} />Темная
+              </button>
+            </div>
+          </div>
+
+          <div className="settings-section" data-settings-section="general">
             <h2>Устройства</h2>
             <div className="setting-row">
               <span className="setting-icon"><Camera /></span>
@@ -226,6 +326,29 @@ export function SettingsPage(): React.JSX.Element {
 
           <div className="settings-section" data-settings-section="audio">
             <h2>Аудио</h2>
+            <div className="microphone-test-card">
+              <label>
+                <span>Тест микрофона</span>
+                <select value={selectedMicrophoneId} onChange={(event) => changeMicrophone(event.target.value)} disabled={micTesting}>
+                  <option value="">Системный микрофон</option>
+                  {audioInputDevices.map((device, index) => (
+                    <option value={device.deviceId} key={device.deviceId || `microphone-${index}`}>
+                      {device.label || `Микрофон ${index + 1}`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="microphone-meter" role="meter" aria-label="Уровень громкости микрофона" aria-valuemin={0} aria-valuemax={100} aria-valuenow={micLevel}>
+                <span style={{ width: `${micLevel}%` }} />
+              </div>
+              <div className="microphone-test-actions">
+                <button className="button secondary small" type="button" onClick={() => void startMicTest()}>
+                  <Mic size={16} />{micTesting ? 'Остановить тест' : 'Начать тест'}
+                </button>
+                <strong>{micTesting ? `${micLevel}%` : 'Тест остановлен'}</strong>
+              </div>
+              {micTestError && <p className="form-error">{micTestError}</p>}
+            </div>
             {audioDevices.length ? audioDevices.map((device, index) => (
               <div className="setting-row" key={device.deviceId || `${device.kind}-${index}`}>
                 <span className="setting-icon"><Headphones /></span>

@@ -20,6 +20,8 @@ contextBridge.exposeInMainWorld('alephDesktop', {
     }>>,
   openMediaSettings: (kind: 'camera' | 'microphone') =>
     ipcRenderer.invoke('media:open-settings', kind) as Promise<boolean>,
+  downloadFile: (url: string, filename?: string) =>
+    ipcRenderer.invoke('file:download', url, filename) as Promise<{ path?: string; cancelled?: boolean }>,
   openMeeting: (meetingId: string, context?: Record<string, unknown>) =>
     ipcRenderer.invoke('meeting:open', meetingId, context) as Promise<void>,
   getMeetingContext: () =>

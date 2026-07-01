@@ -1,5 +1,5 @@
 import { io, type Socket } from 'socket.io-client'
-import { Check, CheckCheck, FileText, Mic, Paperclip, Phone, Search, Send, Settings2, Square, UserMinus, UserPlus, Users, X } from 'lucide-react'
+import { Check, CheckCheck, Download, FileText, Mic, Paperclip, Phone, Search, Send, Settings2, Square, UserMinus, UserPlus, Users, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { Avatar, EmptyState, Modal } from '../components/ui'
@@ -8,7 +8,26 @@ import { getAccessToken } from '../lib/auth'
 import { relativeTime, shortTime } from '../lib/format'
 import { ensureDesktopMediaAccess } from '../lib/media'
 import { useApp } from '../state/AppContext'
-import type { Contact, Conversation, Message } from '../types'
+import type { Attachment, CallMessageMetadata, Contact, Conversation, Message } from '../types'
+
+function isCallMetadata(metadata: Message['metadata']): metadata is CallMessageMetadata {
+  return metadata?.type === 'call'
+}
+
+function recordingAttachment(message: Message, metadata: CallMessageMetadata): Pick<Attachment, 'url' | 'originalName'> | null {
+  const attachedRecording = message.attachments.find((attachment) => (
+    attachment.url
+    && (
+      attachment.originalName === metadata.recordingName
+      || attachment.mimeType.startsWith('audio/')
+      || attachment.mimeType.startsWith('video/')
+    )
+  ))
+  if (attachedRecording) return attachedRecording
+  return metadata.recordingUrl
+    ? { url: metadata.recordingUrl, originalName: metadata.recordingName ?? 'recording.webm' }
+    : null
+}
 
 export function ChatPage(): React.JSX.Element {
   const location = useLocation()
@@ -81,7 +100,12 @@ export function ChatPage(): React.JSX.Element {
         void api.messages(read.conversationId).then((result) => setMessages(result.messages))
       }
     })
-    return () => { socket.disconnect() }
+    const handleConversationsUpdated = (): void => { void loadConversations() }
+    window.addEventListener('aleph:conversations-updated', handleConversationsUpdated)
+    return () => {
+      window.removeEventListener('aleph:conversations-updated', handleConversationsUpdated)
+      socket.disconnect()
+    }
   }, [])
 
   useEffect(() => {
@@ -193,6 +217,19 @@ export function ChatPage(): React.JSX.Element {
     }
   }
 
+  const downloadRecording = async (recording: Pick<Attachment, 'url' | 'originalName'>): Promise<void> => {
+    setCallError(null)
+    try {
+      if (window.alephDesktop?.downloadFile) {
+        await window.alephDesktop.downloadFile(recording.url, recording.originalName)
+      } else {
+        window.open(recording.url, '_blank', 'noopener')
+      }
+    } catch (reason) {
+      setCallError(reason instanceof Error ? reason.message : 'Не удалось скачать запись разговора.')
+    }
+  }
+
   const openCreateGroup = (): void => {
     setGroupTitle('')
     setGroupMemberIds([])
@@ -279,20 +316,27 @@ export function ChatPage(): React.JSX.Element {
             <div className="message-date"><span>Сегодня</span></div>
             {visibleMessages.map((message) => {
               const own = message.senderId === user?.id
-              const callMetadata = message.kind === 'system' && message.metadata?.type === 'call'
+              const callMetadata = message.kind === 'system' && isCallMetadata(message.metadata)
                 ? message.metadata
                 : null
               if (callMetadata) {
-                return <div className="call-history-message" key={message.id}><span><Phone size={18} /></span><div><strong>{own ? 'Исходящий звонок' : 'Входящий звонок'}</strong><small>{message.body || 'Звонок'}</small></div><time>{shortTime(message.createdAt)}</time></div>
+                const recording = recordingAttachment(message, callMetadata)
+                return <div className="call-history-message" key={message.id}><span><Phone size={18} /></span><div><strong>{own ? 'Исходящий звонок' : 'Входящий звонок'}</strong><small>{message.body || 'Звонок'}</small>{recording && <button className="call-recording-download" type="button" onClick={() => void downloadRecording(recording)}><Download size={14} />Скачать запись разговора</button>}</div><time>{shortTime(message.createdAt)}</time></div>
               }
               return <div className={`message ${own ? 'own' : ''}`} key={message.id}>
                 {!own && <Avatar name={message.senderName || 'User'} src={message.senderAvatarUrl} size="small" />}
                 <div className="message-body">
                   {!own && <strong>{message.senderName}</strong>}
                   {message.body && <p>{message.body}</p>}
-                  {message.attachments?.map((attachment) => attachment.mimeType.startsWith('audio/')
-                    ? <audio controls src={attachment.url} key={attachment.id} />
-                    : <a className="file-attachment" href={attachment.url} target="_blank" rel="noreferrer" key={attachment.id}><span><FileText size={20} /></span><div><strong>{attachment.originalName}</strong><small>{Math.max(1, Math.round(attachment.byteSize / 1024))} КБ</small></div></a>)}
+                  {message.attachments?.map((attachment) => {
+                    if (attachment.mimeType.startsWith('audio/')) {
+                      return <audio controls src={attachment.url} key={attachment.id} />
+                    }
+                    if (attachment.mimeType.startsWith('image/')) {
+                      return <a className="image-attachment-link" href={attachment.url} target="_blank" rel="noreferrer" key={attachment.id}><img className="image-attachment" src={attachment.url} alt={attachment.originalName} loading="lazy" /></a>
+                    }
+                    return <a className="file-attachment" href={attachment.url} download={attachment.originalName} target="_blank" rel="noreferrer" key={attachment.id}><span><FileText size={20} /></span><div><strong>{attachment.originalName}</strong><small>{Math.max(1, Math.round(attachment.byteSize / 1024))} КБ</small></div></a>
+                  })}
                   <span className="message-meta"><time>{shortTime(message.createdAt)}</time>{own && (message.deliveryStatus === 'read' ? <CheckCheck aria-label="Прочитано" /> : <Check aria-label="Доставлено" />)}</span>
                 </div>
               </div>

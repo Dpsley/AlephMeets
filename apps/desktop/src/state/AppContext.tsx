@@ -12,6 +12,8 @@ import { API_URL, api } from '../lib/api'
 import { openMeetingWindow } from '../lib/meeting-window'
 import type { DirectCallContext, Meeting, Message, User } from '../types'
 
+export type ThemeMode = 'light' | 'dark'
+
 interface AppState {
   user: User | null
   authenticated: boolean
@@ -19,7 +21,9 @@ interface AppState {
   lastCalendarSyncedAt: string | null
   loading: boolean
   error: string | null
+  theme: ThemeMode
   presenceByUserId: Record<string, User['status']>
+  setTheme: (theme: ThemeMode) => void
   requestLoginCode: (phone: string) => Promise<void>
   verifyLoginCode: (phone: string, code: string) => Promise<void>
   logout: () => Promise<void>
@@ -51,6 +55,7 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
   const [lastCalendarSyncedAt, setLastCalendarSyncedAt] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [theme, setThemeState] = useState<ThemeMode>(() => localStorage.getItem('aleph-theme') === 'dark' ? 'dark' : 'light')
   const [presenceByUserId, setPresenceByUserId] = useState<Record<string, User['status']>>({})
   const [incomingCall, setIncomingCall] = useState<IncomingCall | null>(null)
   const [messageNotice, setMessageNotice] = useState<MessageNotice | null>(null)
@@ -61,6 +66,15 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
     const result = await api.meetings()
     setMeetings(result.meetings)
   }, [])
+
+  const setTheme = useCallback((nextTheme: ThemeMode): void => {
+    setThemeState(nextTheme)
+  }, [])
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme
+    localStorage.setItem('aleph-theme', theme)
+  }, [theme])
 
   const loadSession = useCallback(async (): Promise<void> => {
     const [session, meetingResult, exchange] = await Promise.all([
@@ -189,13 +203,24 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
         setIncomingCall((current) => current?.meeting.id === update.meetingId ? null : current)
       }
     })
+    socket.on('conversation:updated', (update: { conversationId: string }) => {
+      window.dispatchEvent(new CustomEvent('aleph:conversations-updated', { detail: update }))
+    })
     socket.on('call:incoming', (call: IncomingCall) => {
+      if (call.callContext?.conversationId) {
+        window.dispatchEvent(new CustomEvent('aleph:conversations-updated', {
+          detail: { conversationId: call.callContext.conversationId },
+        }))
+      }
       if (!location.pathname.startsWith('/meeting/')) setIncomingCall(call)
     })
     socket.on('call:cancelled', ({ meetingId }: { meetingId: string }) => {
       setIncomingCall((current) => current?.meeting.id === meetingId ? null : current)
     })
     socket.on('message:new', (message: Message) => {
+      window.dispatchEvent(new CustomEvent('aleph:conversations-updated', {
+        detail: { conversationId: message.conversationId },
+      }))
       if (message.senderId === user.id) return
       const body = message.kind === 'audio'
         ? 'Голосовое сообщение'
@@ -277,7 +302,9 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
     lastCalendarSyncedAt,
     loading,
     error,
+    theme,
     presenceByUserId,
+    setTheme,
     requestLoginCode,
     verifyLoginCode,
     logout,
@@ -290,7 +317,9 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
     lastCalendarSyncedAt,
     loading,
     error,
+    theme,
     presenceByUserId,
+    setTheme,
     requestLoginCode,
     verifyLoginCode,
     logout,

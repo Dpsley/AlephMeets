@@ -1,6 +1,6 @@
-import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage, session, shell, systemPreferences } from 'electron'
+import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, safeStorage, session, shell, systemPreferences } from 'electron'
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { extname, join } from 'node:path'
 import { appIconPath } from './app-icon'
 import { destroyMandatoryUpdateGate, enforceMandatoryUpdate } from './mandatory-updater'
 
@@ -97,6 +97,29 @@ function clearAuth(slot: string): void {
   } else {
     transientAuth.delete(slot)
   }
+}
+
+function safeDownloadName(filename: string): string {
+  const trimmed = filename.trim()
+  const sanitized = trimmed
+    .replace(/[\\/:*?"<>|\x00-\x1F]+/g, '-')
+    .replace(/\s+/g, ' ')
+    .slice(0, 180)
+    .trim()
+  return sanitized || `aleph-recording-${Date.now()}.webm`
+}
+
+function uniqueDownloadName(filename: string): string {
+  const safeName = safeDownloadName(filename)
+  const extension = extname(safeName)
+  const base = extension ? safeName.slice(0, -extension.length) : safeName
+  let candidate = safeName
+  let counter = 1
+  while (existsSync(join(app.getPath('downloads'), candidate))) {
+    candidate = `${base} (${counter})${extension}`
+    counter += 1
+  }
+  return candidate
 }
 
 function createWindow(authSlot = 'primary'): BrowserWindow {
@@ -266,6 +289,60 @@ app.whenReady().then(async () => {
     if (process.platform !== 'darwin' || !isMediaAccessKind(kind)) return false
     await shell.openExternal(mediaSettingsUrls[kind])
     return true
+  })
+  ipcMain.handle('file:download', async (event, url: unknown, filename: unknown) => {
+    if (typeof url !== 'string') throw new Error('Download URL is required')
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      throw new Error('Unsupported download URL')
+    }
+    const defaultName = uniqueDownloadName(
+      typeof filename === 'string' && filename.trim()
+        ? filename
+        : decodeURIComponent(parsed.pathname.split('/').pop() || `aleph-recording-${Date.now()}.webm`),
+    )
+    const owner = BrowserWindow.fromWebContents(event.sender)
+    const saveDialogOptions = {
+      title: 'Сохранить запись разговора',
+      defaultPath: join(app.getPath('downloads'), defaultName),
+      buttonLabel: 'Сохранить',
+      filters: [
+        { name: 'Записи WebM', extensions: ['webm'] },
+        { name: 'Все файлы', extensions: ['*'] },
+      ],
+    }
+    const saveDialog = owner
+      ? await dialog.showSaveDialog(owner, saveDialogOptions)
+      : await dialog.showSaveDialog(saveDialogOptions)
+    if (saveDialog.canceled || !saveDialog.filePath) return { cancelled: true }
+    const savePath = saveDialog.filePath
+    const targetSession = event.sender.session
+    const targetWebContents = event.sender
+
+    return await new Promise<{ path: string; cancelled: false }>((resolve, reject) => {
+      const cleanupTimer = setTimeout(() => {
+        targetSession.off('will-download', onWillDownload)
+        reject(new Error('Download did not start'))
+      }, 15_000)
+
+      const onWillDownload = (
+        _downloadEvent: Electron.Event,
+        item: Electron.DownloadItem,
+        webContents: Electron.WebContents,
+      ): void => {
+        if (webContents !== targetWebContents) return
+        clearTimeout(cleanupTimer)
+        targetSession.off('will-download', onWillDownload)
+        item.setSavePath(savePath)
+        item.once('done', (_event, state) => {
+          if (state === 'completed') resolve({ path: savePath, cancelled: false })
+          else reject(new Error(`Download ${state}`))
+        })
+      }
+
+      targetSession.on('will-download', onWillDownload)
+      targetWebContents.downloadURL(parsed.toString())
+    })
   })
   ipcMain.handle('meeting:open', (event, meetingId: string, context?: Record<string, unknown>) => {
     const slot = authSlots.get(event.sender.id) ?? 'primary'

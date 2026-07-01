@@ -69,11 +69,19 @@ CREATE TABLE attachments (
   uploaded_by uuid NOT NULL REFERENCES users(id),
   original_name text NOT NULL,
   storage_name text NOT NULL UNIQUE,
+  storage_provider text NOT NULL DEFAULT 'local',
+  storage_bucket text,
+  storage_key text,
+  storage_url text,
   mime_type text NOT NULL,
   byte_size bigint NOT NULL CHECK (byte_size >= 0),
   duration_ms integer CHECK (duration_ms IS NULL OR duration_ms >= 0),
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE UNIQUE INDEX attachments_storage_bucket_key_idx
+  ON attachments(storage_bucket, storage_key)
+  WHERE storage_bucket IS NOT NULL AND storage_key IS NOT NULL;
 
 CREATE TABLE meetings (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

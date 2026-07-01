@@ -11,11 +11,12 @@ import {
   useRoomContext,
   useTracks,
 } from '@livekit/components-react'
-import { Track } from 'livekit-client'
+import { RoomEvent, Track, type LocalTrackPublication, type RemoteParticipant, type RemoteTrack, type RemoteTrackPublication } from 'livekit-client'
 import {
   ArrowLeft,
   Camera,
   CameraOff,
+  FileText,
   Info,
   MessageSquare,
   Mic,
@@ -31,6 +32,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import type { Contact, DirectCallContext, Meeting } from '../types'
 import { api } from '../lib/api'
+import { plainTextFromRichText } from '../lib/format'
 import { getMeetingWindowContext } from '../lib/meeting-window'
 import { ensureDesktopMediaAccess, isRetryableMediaError, mediaErrorMessage, type MediaKind } from '../lib/media'
 import { useApp } from '../state/AppContext'
@@ -39,6 +41,46 @@ import { Avatar, Modal } from '../components/ui'
 import { WindowControls } from '../components/WindowControls'
 
 type DeviceState = 'checking' | 'available' | 'unavailable'
+type TranscriptionStatus = 'idle' | 'connecting' | 'listening' | 'error'
+
+type TranscriptEntry = {
+  id: string
+  text: string
+  receivedAt: number
+  segmentId?: number
+}
+
+type TranscriptionStats = {
+  audioLevel: number
+  framesSent: number
+  responsesReceived: number
+  tracks: number
+  sampleRate: number
+}
+
+const TRANSCRIBE_WS_URL = import.meta.env.VITE_TRANSCRIBE_WS_URL || 'wss://api.alephtrade.com/agent01/audio_transcribe_ws'
+const TRANSCRIBE_SAMPLE_RATE = 16_000
+const EMPTY_TRANSCRIPTION_STATS: TranscriptionStats = {
+  audioLevel: 0,
+  framesSent: 0,
+  responsesReceived: 0,
+  tracks: 0,
+  sampleRate: TRANSCRIBE_SAMPLE_RATE,
+}
+
+function transcribeWebSocketUrl(sampleRate: number): string {
+  const url = new URL(TRANSCRIBE_WS_URL)
+  url.searchParams.set('sample_rate', String(sampleRate))
+  return url.toString()
+}
+
+function transcriptTime(value: number): string {
+  return new Date(value).toLocaleTimeString('ru-RU', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
 
 function closeMeetingWindow(navigate: ReturnType<typeof useNavigate>): void {
   if (window.alephDesktop) window.alephDesktop.forceCloseMeeting()
@@ -125,15 +167,481 @@ function MeetingChat({ onClose }: { onClose: () => void }): React.JSX.Element {
   )
 }
 
+function readTranscribeMessage(data: string): {
+  type?: string
+  text?: string
+  message?: string
+  error?: string
+  segment_id?: number
+} | null {
+  try {
+    const parsed = JSON.parse(data) as unknown
+    return parsed && typeof parsed === 'object' ? parsed as ReturnType<typeof readTranscribeMessage> : null
+  } catch {
+    return data === 'ready' ? { type: 'ready' } : null
+  }
+}
+
+function MeetingTranscriptPanel({
+  entries,
+  status,
+  error,
+  stats,
+  onClose,
+  onClear,
+  onRetry,
+}: {
+  entries: TranscriptEntry[]
+  status: TranscriptionStatus
+  error: string | null
+  stats: TranscriptionStats
+  onClose: () => void
+  onClear: () => void
+  onRetry: () => void
+}): React.JSX.Element {
+  const bottomRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ block: 'end' })
+  }, [entries])
+
+  const statusText = status === 'connecting'
+    ? 'Подключение к расшифровке...'
+    : status === 'listening'
+      ? 'Идет расшифровка звонка'
+      : status === 'error'
+        ? 'Расшифровка остановлена'
+        : 'Расшифровка выключена'
+
+  return (
+    <aside className="meeting-transcript-panel">
+      <header>
+        <strong>Дешифровка звонка</strong>
+        <button onClick={onClose} title="Закрыть дешифровку"><X /></button>
+      </header>
+      <div className={`meeting-transcript-status ${status}`}>
+        <span />
+        <p>{statusText}</p>
+      </div>
+      <div className="meeting-transcript-debug">
+        <div>
+          <small>Уровень аудио</small>
+          <strong>{Math.round(stats.audioLevel * 100)}%</strong>
+        </div>
+        <div>
+          <small>Треки</small>
+          <strong>{stats.tracks}</strong>
+        </div>
+        <div>
+          <small>Отправлено</small>
+          <strong>{stats.framesSent}</strong>
+        </div>
+        <div>
+          <small>Ответы ASR</small>
+          <strong>{stats.responsesReceived}</strong>
+        </div>
+      </div>
+      {error && (
+        <div className="meeting-transcript-error">
+          <span>{error}</span>
+          <button type="button" onClick={onRetry}>Повторить</button>
+        </div>
+      )}
+      <div className="meeting-transcript-messages">
+        {entries.map((entry) => (
+          <article key={entry.id}>
+            <time>{transcriptTime(entry.receivedAt)}</time>
+            <p>{entry.text}</p>
+          </article>
+        ))}
+        {!entries.length && <p className="meeting-transcript-empty">Текст появится здесь, когда участники начнут говорить.</p>}
+        <div ref={bottomRef} />
+      </div>
+      <footer>
+        <button type="button" onClick={onClear} disabled={!entries.length}>Очистить</button>
+      </footer>
+    </aside>
+  )
+}
+
+function CallTranscriber({
+  active,
+  restartKey,
+  localAudioTrack,
+  onTranscript,
+  onStatusChange,
+  onStatsChange,
+  onError,
+}: {
+  active: boolean
+  restartKey: number
+  localAudioTrack?: MediaStreamTrack
+  onTranscript: (entry: TranscriptEntry) => void
+  onStatusChange: (status: TranscriptionStatus) => void
+  onStatsChange: (stats: TranscriptionStats) => void
+  onError: (message: string) => void
+}): null {
+  const room = useRoomContext()
+
+  useEffect(() => {
+    if (!active) {
+      onStatusChange('idle')
+      onStatsChange(EMPTY_TRANSCRIPTION_STATS)
+      return
+    }
+
+    let alive = true
+    let closedByCleanup = false
+    let failed = false
+    let audioContext: AudioContext
+    try {
+      audioContext = new AudioContext({ sampleRate: TRANSCRIBE_SAMPLE_RATE })
+    } catch {
+      audioContext = new AudioContext()
+    }
+
+    const endpoint = transcribeWebSocketUrl(audioContext.sampleRate)
+    const socket = new WebSocket(endpoint)
+    const mixer = audioContext.createGain()
+    const processor = audioContext.createScriptProcessor(4096, 1, 1)
+    const outputMute = audioContext.createGain()
+    const sources = new Map<MediaStreamTrack, MediaStreamAudioSourceNode>()
+    const trackCleanups: Array<() => void> = []
+    const silence = audioContext.createOscillator()
+    const silenceGain = audioContext.createGain()
+    const stats: TranscriptionStats = {
+      audioLevel: 0,
+      framesSent: 0,
+      responsesReceived: 0,
+      tracks: 0,
+      sampleRate: audioContext.sampleRate,
+    }
+
+    socket.binaryType = 'arraybuffer'
+    outputMute.gain.value = 0
+    silenceGain.gain.value = 0
+    silence.connect(silenceGain).connect(mixer)
+    silence.start()
+    mixer.connect(processor)
+    processor.connect(outputMute).connect(audioContext.destination)
+
+    onStatusChange('connecting')
+    onStatsChange(stats)
+    void audioContext.resume().catch(() => undefined)
+
+    const statsTimer = window.setInterval(() => {
+      if (!alive) return
+      onStatsChange({ ...stats, tracks: sources.size })
+    }, 500)
+
+    const fail = (message: string): void => {
+      if (!alive) return
+      failed = true
+      onStatusChange('error')
+      onError(message)
+    }
+
+    processor.onaudioprocess = (event): void => {
+      if (!alive || socket.readyState !== WebSocket.OPEN) return
+      const input = event.inputBuffer.getChannelData(0)
+      const frame = new Float32Array(input.length)
+      frame.set(input)
+      let sum = 0
+      for (let index = 0; index < input.length; index += 1) {
+        const sample = input[index] ?? 0
+        sum += sample * sample
+      }
+      stats.audioLevel = input.length > 0 ? Math.min(1, Math.sqrt(sum / input.length) * 8) : 0
+      stats.framesSent += 1
+      stats.tracks = sources.size
+      socket.send(frame.buffer)
+    }
+
+    const removeMediaTrack = (track: MediaStreamTrack): void => {
+      const source = sources.get(track)
+      if (!source) return
+      source.disconnect()
+      sources.delete(track)
+      stats.tracks = sources.size
+    }
+
+    const addMediaTrack = (track?: MediaStreamTrack): void => {
+      if (!track || track.kind !== 'audio' || track.readyState !== 'live' || sources.has(track)) return
+      const source = audioContext.createMediaStreamSource(new MediaStream([track]))
+      source.connect(mixer)
+      sources.set(track, source)
+      stats.tracks = sources.size
+      const handleEnded = (): void => removeMediaTrack(track)
+      track.addEventListener('ended', handleEnded, { once: true })
+      trackCleanups.push(() => track.removeEventListener('ended', handleEnded))
+    }
+
+    const addRemoteTrack = (track: RemoteTrack): void => {
+      if (track.kind === Track.Kind.Audio) addMediaTrack(track.mediaStreamTrack)
+    }
+
+    const addRemotePublication = (publication: RemoteTrackPublication): void => {
+      if (publication.isSubscribed && publication.track) addRemoteTrack(publication.track)
+    }
+
+    const addLocalPublication = (publication: LocalTrackPublication): void => {
+      addMediaTrack(publication.track?.mediaStreamTrack)
+    }
+
+    const handleTrackSubscribed = (
+      track: RemoteTrack,
+      _publication: RemoteTrackPublication,
+      _participant: RemoteParticipant,
+    ): void => addRemoteTrack(track)
+
+    const handleTrackUnsubscribed = (
+      track: RemoteTrack,
+      _publication: RemoteTrackPublication,
+      _participant: RemoteParticipant,
+    ): void => {
+      if (track.kind === Track.Kind.Audio) removeMediaTrack(track.mediaStreamTrack)
+    }
+
+    const handleLocalTrackPublished = (publication: LocalTrackPublication): void => {
+      addLocalPublication(publication)
+    }
+
+    const handleLocalTrackUnpublished = (publication: LocalTrackPublication): void => {
+      const track = publication.track?.mediaStreamTrack
+      if (track) removeMediaTrack(track)
+    }
+
+    socket.onopen = (): void => {
+      if (alive) onStatusChange('connecting')
+    }
+    socket.onmessage = (event): void => {
+      if (!alive || typeof event.data !== 'string') return
+      const payload = readTranscribeMessage(event.data)
+      if (!payload) return
+      stats.responsesReceived += 1
+      if (payload.type === 'ready') {
+        onStatusChange('listening')
+        return
+      }
+      if (payload.type === 'error' || payload.error) {
+        fail(payload.message || payload.error || 'Сервис расшифровки вернул ошибку.')
+        return
+      }
+      const text = typeof payload.text === 'string' ? payload.text.trim() : ''
+      if (!text) return
+      onStatusChange('listening')
+      onTranscript({
+        id: `${payload.segment_id ?? Date.now()}-${crypto.randomUUID()}`,
+        text,
+        segmentId: payload.segment_id,
+        receivedAt: Date.now(),
+      })
+    }
+    socket.onerror = (): void => fail(`Не удалось подключиться к сервису расшифровки: ${endpoint}`)
+    socket.onclose = (event): void => {
+      if (alive && !closedByCleanup && !failed) {
+        const details = event.code ? ` Код закрытия: ${event.code}${event.reason ? `, причина: ${event.reason}` : ''}.` : ''
+        fail(`Соединение с сервисом расшифровки закрыто.${details}`)
+      }
+    }
+
+    addMediaTrack(localAudioTrack)
+    room.localParticipant.audioTrackPublications.forEach(addLocalPublication)
+    room.remoteParticipants.forEach((participant) => {
+      participant.audioTrackPublications.forEach(addRemotePublication)
+    })
+    room.on(RoomEvent.TrackSubscribed, handleTrackSubscribed)
+    room.on(RoomEvent.TrackUnsubscribed, handleTrackUnsubscribed)
+    room.on(RoomEvent.LocalTrackPublished, handleLocalTrackPublished)
+    room.on(RoomEvent.LocalTrackUnpublished, handleLocalTrackUnpublished)
+
+    return () => {
+      alive = false
+      closedByCleanup = true
+      window.clearInterval(statsTimer)
+      room.off(RoomEvent.TrackSubscribed, handleTrackSubscribed)
+      room.off(RoomEvent.TrackUnsubscribed, handleTrackUnsubscribed)
+      room.off(RoomEvent.LocalTrackPublished, handleLocalTrackPublished)
+      room.off(RoomEvent.LocalTrackUnpublished, handleLocalTrackUnpublished)
+      trackCleanups.forEach((cleanup) => cleanup())
+      processor.onaudioprocess = null
+      sources.forEach((source) => source.disconnect())
+      sources.clear()
+      try {
+        if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'finalize' }))
+        socket.close()
+      } catch {
+        // WebSocket can already be closing during meeting shutdown.
+      }
+      try {
+        silence.stop()
+      } catch {
+        // Oscillator may already be stopped if the audio graph was torn down by Chromium.
+      }
+      silence.disconnect()
+      silenceGain.disconnect()
+      mixer.disconnect()
+      processor.disconnect()
+      outputMute.disconnect()
+      void audioContext.close().catch(() => undefined)
+    }
+  }, [active, localAudioTrack, onError, onStatsChange, onStatusChange, onTranscript, restartKey, room])
+
+  return null
+}
+
+function CallRecorder({
+  callContext,
+  localAudioTrack,
+  onStopperChange,
+  onError,
+}: {
+  callContext: DirectCallContext
+  localAudioTrack?: MediaStreamTrack
+  onStopperChange: (stopper: (() => Promise<void>) | null) => void
+  onError: (message: string) => void
+}): null {
+  const room = useRoomContext()
+
+  useEffect(() => {
+    if (typeof MediaRecorder === 'undefined') {
+      onError('Запись звонка недоступна в текущей версии Chromium.')
+      return
+    }
+
+    const audioContext = new AudioContext()
+    const destination = audioContext.createMediaStreamDestination()
+    const chunks: Blob[] = []
+    const sources = new Map<MediaStreamTrack, MediaStreamAudioSourceNode>()
+    let stopped = false
+    let stopPromise: Promise<void> | null = null
+
+    const silence = audioContext.createOscillator()
+    const silenceGain = audioContext.createGain()
+    silenceGain.gain.value = 0
+    silence.connect(silenceGain).connect(destination)
+    silence.start()
+
+    const removeMediaTrack = (track: MediaStreamTrack): void => {
+      const source = sources.get(track)
+      if (!source) return
+      source.disconnect()
+      sources.delete(track)
+    }
+
+    const addMediaTrack = (track?: MediaStreamTrack): void => {
+      if (!track || track.kind !== 'audio' || track.readyState !== 'live' || sources.has(track)) return
+      const source = audioContext.createMediaStreamSource(new MediaStream([track]))
+      source.connect(destination)
+      sources.set(track, source)
+      track.addEventListener('ended', () => removeMediaTrack(track), { once: true })
+    }
+
+    const addRemoteTrack = (track: RemoteTrack): void => {
+      if (track.kind === Track.Kind.Audio) addMediaTrack(track.mediaStreamTrack)
+    }
+
+    const addRemotePublication = (publication: RemoteTrackPublication): void => {
+      if (publication.isSubscribed && publication.track) addRemoteTrack(publication.track)
+    }
+
+    const handleTrackSubscribed = (
+      track: RemoteTrack,
+      _publication: RemoteTrackPublication,
+      _participant: RemoteParticipant,
+    ): void => addRemoteTrack(track)
+
+    const handleTrackUnsubscribed = (
+      track: RemoteTrack,
+      _publication: RemoteTrackPublication,
+      _participant: RemoteParticipant,
+    ): void => {
+      if (track.kind === Track.Kind.Audio) removeMediaTrack(track.mediaStreamTrack)
+    }
+
+    addMediaTrack(localAudioTrack)
+    room.remoteParticipants.forEach((participant) => {
+      participant.audioTrackPublications.forEach(addRemotePublication)
+    })
+    room.on(RoomEvent.TrackSubscribed, handleTrackSubscribed)
+    room.on(RoomEvent.TrackUnsubscribed, handleTrackUnsubscribed)
+
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : 'audio/webm'
+    const recorder = new MediaRecorder(destination.stream, { mimeType })
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) chunks.push(event.data)
+    }
+    recorder.start(1000)
+    void audioContext.resume().catch(() => undefined)
+
+    const cleanupAudioGraph = (): void => {
+      room.off(RoomEvent.TrackSubscribed, handleTrackSubscribed)
+      room.off(RoomEvent.TrackUnsubscribed, handleTrackUnsubscribed)
+      sources.forEach((source) => source.disconnect())
+      sources.clear()
+      silence.stop()
+      silence.disconnect()
+      silenceGain.disconnect()
+      void audioContext.close().catch(() => undefined)
+    }
+
+    const stopAndUpload = async (): Promise<void> => {
+      if (stopPromise) return stopPromise
+      stopPromise = new Promise<Blob>((resolve) => {
+        recorder.onstop = () => {
+          cleanupAudioGraph()
+          resolve(new Blob(chunks, { type: recorder.mimeType || 'audio/webm' }))
+        }
+        if (recorder.state === 'inactive') {
+          cleanupAudioGraph()
+          resolve(new Blob(chunks, { type: recorder.mimeType || 'audio/webm' }))
+          return
+        }
+        recorder.stop()
+      }).then(async (blob) => {
+        if (blob.size <= 0) return
+        await api.uploadCallRecording(
+          callContext.conversationId,
+          callContext.messageId,
+          blob,
+          `call-${Date.now()}.webm`,
+        )
+      })
+      return stopPromise
+    }
+
+    onStopperChange(async () => {
+      if (stopped) return
+      stopped = true
+      await stopAndUpload()
+    })
+
+    return () => {
+      onStopperChange(null)
+      if (!stopped) {
+        stopped = true
+        void stopAndUpload().catch((reason) => {
+          onError(reason instanceof Error ? reason.message : 'Не удалось сохранить запись звонка.')
+        })
+      }
+    }
+  }, [callContext.conversationId, callContext.messageId, localAudioTrack, onError, onStopperChange, room])
+
+  return null
+}
+
 function MeetingConference({
   meeting,
   isOrganizer,
+  localAudioTrack,
   onError,
   onReload,
   closeRequest,
 }: {
   meeting: Meeting
   isOrganizer: boolean
+  localAudioTrack?: MediaStreamTrack
   onError: (message: string) => void
   onReload: () => Promise<void>
   closeRequest: number
@@ -164,6 +672,12 @@ function MeetingConference({
   const [infoOpen, setInfoOpen] = useState(false)
   const [inviteOpen, setInviteOpen] = useState(false)
   const [chatOpen, setChatOpen] = useState(false)
+  const [transcriptOpen, setTranscriptOpen] = useState(false)
+  const [transcriptEntries, setTranscriptEntries] = useState<TranscriptEntry[]>([])
+  const [transcriptionStatus, setTranscriptionStatus] = useState<TranscriptionStatus>('idle')
+  const [transcriptionError, setTranscriptionError] = useState<string | null>(null)
+  const [transcriptionRestart, setTranscriptionRestart] = useState(0)
+  const [transcriptionStats, setTranscriptionStats] = useState<TranscriptionStats>(EMPTY_TRANSCRIPTION_STATS)
   const [contacts, setContacts] = useState<Contact[]>([])
   const [selectedContactIds, setSelectedContactIds] = useState<string[]>([])
   const [loadingContacts, setLoadingContacts] = useState(false)
@@ -195,6 +709,32 @@ function MeetingConference({
     window.alephDesktop?.selectScreenShareSource(screenShareRequest.requestId, sourceId)
     setScreenShareRequest(null)
   }
+
+  const appendTranscript = useCallback((entry: TranscriptEntry): void => {
+    setTranscriptionError(null)
+    setTranscriptEntries((current) => [...current.slice(-199), entry])
+  }, [])
+
+  const toggleTranscript = (): void => {
+    if (transcriptOpen) {
+      setTranscriptOpen(false)
+      return
+    }
+    setTranscriptionError(null)
+    setChatOpen(false)
+    setTranscriptOpen(true)
+  }
+
+  const retryTranscript = (): void => {
+    setTranscriptionError(null)
+    setTranscriptionStatus('connecting')
+    setTranscriptOpen(true)
+    setTranscriptionRestart((value) => value + 1)
+  }
+
+  const handleTranscriptionError = useCallback((message: string): void => {
+    setTranscriptionError(message)
+  }, [])
 
   const openInvite = async (): Promise<void> => {
     setInviteOpen(true)
@@ -257,6 +797,15 @@ function MeetingConference({
 
   return (
     <>
+      <CallTranscriber
+        active={transcriptOpen}
+        restartKey={transcriptionRestart}
+        localAudioTrack={localAudioTrack}
+        onTranscript={appendTranscript}
+        onStatusChange={setTranscriptionStatus}
+        onStatsChange={setTranscriptionStats}
+        onError={handleTranscriptionError}
+      />
       <div className={`aleph-conference ${chatOpen ? 'with-chat' : ''}`}>
         <div className="meeting-stage">
           <div className="meeting-participant-grid">
@@ -303,10 +852,20 @@ function MeetingConference({
             <TrackToggle source={Track.Source.ScreenShare}>
               <span>Демонстрация</span>
             </TrackToggle>
-            <button onClick={() => setChatOpen((value) => !value)} className={chatOpen ? 'active' : ''}>
+            <button
+              onClick={() => {
+                const nextOpen = !chatOpen
+                setChatOpen(nextOpen)
+                if (nextOpen) setTranscriptOpen(false)
+              }}
+              className={chatOpen ? 'active' : ''}
+            >
               <MessageSquare /><span>Чат</span>
             </button>
             <button onClick={() => setInfoOpen(true)}><Info /><span>Информация</span></button>
+            <button onClick={toggleTranscript} className={transcriptOpen ? 'active' : ''}>
+              <FileText /><span>Дешифровка</span>
+            </button>
             {isOrganizer && <button onClick={() => void openInvite()}><UserPlus /><span>Пригласить</span></button>}
             <button className="meeting-leave-control" onClick={() => isOrganizer ? setExitOpen(true) : void room.disconnect()}>
               <PhoneOff /><span>Завершить</span>
@@ -314,6 +873,17 @@ function MeetingConference({
           </div>
         </div>
         {chatOpen && <MeetingChat onClose={() => setChatOpen(false)} />}
+        {transcriptOpen && (
+          <MeetingTranscriptPanel
+            entries={transcriptEntries}
+            status={transcriptionStatus}
+            error={transcriptionError}
+            stats={transcriptionStats}
+            onClose={() => setTranscriptOpen(false)}
+            onClear={() => setTranscriptEntries([])}
+            onRetry={retryTranscript}
+          />
+        )}
       </div>
 
       <Modal open={infoOpen} onClose={() => setInfoOpen(false)} title="Информация о встрече" width={460}>
@@ -404,6 +974,7 @@ export function MeetingPage(): React.JSX.Element {
   const streamRef = useRef<MediaStream | null>(null)
   const autoJoinStartedRef = useRef(false)
   const callFinishedRef = useRef(false)
+  const recordingStopRef = useRef<(() => Promise<void>) | null>(null)
   const [audioEnabled, setAudioEnabled] = useState(true)
   const [videoEnabled, setVideoEnabled] = useState(true)
   const [audioState, setAudioState] = useState<DeviceState>('checking')
@@ -525,10 +1096,14 @@ export function MeetingPage(): React.JSX.Element {
     void join()
   }, [isOrganizer, join, joined, mediaReady])
 
-  const finishDirectCall = useCallback((): void => {
+  const setRecordingStopper = useCallback((stopper: (() => Promise<void>) | null): void => {
+    recordingStopRef.current = stopper
+  }, [])
+
+  const finishDirectCall = useCallback(async (): Promise<void> => {
     if (!callContext || callFinishedRef.current) return
     callFinishedRef.current = true
-    void api.finishCallLog(
+    await api.finishCallLog(
       callContext.conversationId,
       callContext.messageId,
       'ended',
@@ -536,12 +1111,38 @@ export function MeetingPage(): React.JSX.Element {
     )
   }, [callContext])
 
+  const stopCallRecording = useCallback(async (): Promise<void> => {
+    const stop = recordingStopRef.current
+    if (!stop) return
+    recordingStopRef.current = null
+    await stop()
+  }, [])
+
+  const closeAfterDisconnect = useCallback(async (): Promise<void> => {
+    let closeError: unknown
+    try {
+      await finishDirectCall()
+    } catch (reason) {
+      closeError = reason
+    }
+    try {
+      await stopCallRecording()
+    } catch (reason) {
+      closeError ??= reason
+    } finally {
+      if (closeError) {
+        setError(closeError instanceof Error ? closeError.message : 'Не удалось сохранить запись звонка.')
+      }
+      closeMeetingWindow(navigate)
+    }
+  }, [finishDirectCall, navigate, stopCallRecording])
+
   const leavePrejoin = useCallback(async (): Promise<void> => {
     if (!meeting || cancelling) return
     setCancelling(true)
     if (isOrganizer) {
       await api.endMeetingForEveryone(meeting.id).catch(() => undefined)
-      finishDirectCall()
+      await finishDirectCall()
     } else {
       await api.declineMeetingInvitation(meeting.id).catch(() => undefined)
     }
@@ -575,8 +1176,7 @@ export function MeetingPage(): React.JSX.Element {
           audio={false}
           video={false}
           onDisconnected={() => {
-            finishDirectCall()
-            closeMeetingWindow(navigate)
+            void closeAfterDisconnect()
           }}
           onError={(reason) => {
             if (!/requested device not found/i.test(reason.message)) setError(reason.message)
@@ -589,7 +1189,20 @@ export function MeetingPage(): React.JSX.Element {
             videoTrack={connection.videoTrack}
             onDeviceError={handleDeviceError}
           />
-          <MeetingConference meeting={meeting} isOrganizer={isOrganizer} onError={setError} onReload={reloadMeetings} closeRequest={closeRequest} />
+          {callContext && isOrganizer && <CallRecorder
+            callContext={callContext}
+            localAudioTrack={connection.audioTrack}
+            onStopperChange={setRecordingStopper}
+            onError={setError}
+          />}
+          <MeetingConference
+            meeting={meeting}
+            isOrganizer={isOrganizer}
+            localAudioTrack={connection.audioTrack}
+            onError={setError}
+            onReload={reloadMeetings}
+            closeRequest={closeRequest}
+          />
           <RoomAudioRenderer />
         </LiveKitRoom>
         {deviceNotices.length > 0 && <div className="meeting-notice">{deviceNotices.join(' ')}</div>}
@@ -629,7 +1242,7 @@ export function MeetingPage(): React.JSX.Element {
         <aside className="join-card">
           <span className="meeting-badge"><Video size={17} />Видеовстреча</span>
           <h1>{meeting.title}</h1>
-          <p>{meeting.description || 'Встреча AlephMeets'}</p>
+          <p>{plainTextFromRichText(meeting.description) || 'Встреча AlephMeets'}</p>
           <div className="join-details">
             <span>Организатор</span><strong>{meeting.hostDisplayName || meeting.hostId}</strong>
             <span>Идентификатор</span><strong>{meeting.roomName}</strong>
