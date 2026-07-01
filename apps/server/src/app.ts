@@ -19,6 +19,7 @@ import { getOutlookStatus, listOutlookEvents, upsertOutlookEvent } from './outlo
 import {
   createExchangeEvent,
   deleteExchangeEvent,
+  type ExchangeEvent,
   type ExchangeEventInput,
   type ExchangeCredentials,
   listExchangeEvents,
@@ -214,6 +215,26 @@ async function updateExchangeEventWithFallback(
   }
 }
 
+async function applyExchangeEventToMeeting(
+  account: ExchangeAccountRow,
+  user: Pick<CurrentUser, 'id'>,
+  meetingId: string,
+  event: ExchangeEvent,
+): Promise<void> {
+  await pool.query(
+    `UPDATE meetings SET title=$1, description=$2, starts_at=$3, ends_at=$4
+     WHERE id=$5 AND host_id=$6`,
+    [event.subject, event.body, event.startsAt, event.endsAt, meetingId, user.id],
+  )
+  await syncMeetingAttendeesFromEmails(meetingId, event.attendees)
+  await pool.query(
+    `UPDATE calendar_event_links
+     SET external_change_key=$1, last_synced_at=now()
+     WHERE account_id=$2 AND meeting_id=$3`,
+    [event.changeKey ?? null, account.id, meetingId],
+  )
+}
+
 async function syncExchangeCalendar(
   account: ExchangeAccountRow,
   user: Pick<CurrentUser, 'id' | 'timezone'>,
@@ -241,18 +262,7 @@ async function syncExchangeCalendar(
       if (linked.rowCount) {
         const linkedMeeting = linked.rows[0] as { meeting_id: string; last_synced_at: Date | string; updated_at: Date | string }
         if (new Date(linkedMeeting.updated_at) > new Date(linkedMeeting.last_synced_at)) continue
-        await pool.query(
-          `UPDATE meetings SET title=$1, description=$2, starts_at=$3, ends_at=$4
-           WHERE id=$5 AND host_id=$6`,
-          [event.subject, event.body, event.startsAt, event.endsAt, linkedMeeting.meeting_id, user.id],
-        )
-        await syncMeetingAttendeesFromEmails(linkedMeeting.meeting_id, event.attendees)
-        await pool.query(
-          `UPDATE calendar_event_links
-           SET external_change_key=$1, last_synced_at=now()
-           WHERE account_id=$2 AND meeting_id=$3`,
-          [event.changeKey ?? null, account.id, linkedMeeting.meeting_id],
-        )
+        await applyExchangeEventToMeeting(account, user, linkedMeeting.meeting_id, event)
       } else {
         const created = await pool.query(
           `INSERT INTO meetings (
@@ -300,6 +310,10 @@ async function syncExchangeCalendar(
       const linkedRemoteEvent = meeting.external_event_id
         ? remoteEventById.get(meeting.external_event_id)
         : undefined
+      if (meeting.external_event_id && !linkedRemoteEvent) {
+        await pool.query('DELETE FROM meetings WHERE id=$1 AND host_id=$2', [meeting.id, user.id])
+        continue
+      }
       const organizerEmail = linkedRemoteEvent?.organizer?.trim().toLowerCase()
       if (organizerEmail && organizerEmail !== accountEmail) continue
       const exchangeInput = {
@@ -320,12 +334,15 @@ async function syncExchangeCalendar(
             exchangeInput,
           )
         } catch (error) {
+          if (isExchangeError(error, 'ErrorIrresolvableConflict')) {
+            if (!linkedRemoteEvent) throw error
+            await applyExchangeEventToMeeting(account, user, meeting.id, linkedRemoteEvent)
+            imported += 1
+            continue
+          }
           if (!isExchangeError(error, 'ErrorItemNotFound')) throw error
-          await pool.query(
-            'DELETE FROM calendar_event_links WHERE account_id=$1 AND meeting_id=$2',
-            [account.id, meeting.id],
-          )
-          event = await createExchangeEventWithFallback(credentials, exchangeInput)
+          await pool.query('DELETE FROM meetings WHERE id=$1 AND host_id=$2', [meeting.id, user.id])
+          continue
         }
       } else {
         event = await createExchangeEventWithFallback(credentials, exchangeInput)

@@ -96,6 +96,7 @@ test('builds a compatible UpdateItem XML for meeting attendees', () => {
     attendees: ['user@example.com'],
   })
   assert.match(withAttendees, /MessageDisposition="SaveOnly"/)
+  assert.match(withAttendees, /ConflictResolution="AutoResolve"/)
   assert.match(withAttendees, /SendMeetingInvitationsOrCancellations="SendOnlyToChanged"/)
   assert.match(withAttendees, /FieldURI="calendar:RequiredAttendees"/)
 
