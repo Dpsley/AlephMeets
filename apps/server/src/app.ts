@@ -19,6 +19,7 @@ import { getOutlookStatus, listOutlookEvents, upsertOutlookEvent } from './outlo
 import {
   createExchangeEvent,
   deleteExchangeEvent,
+  type ExchangeEventInput,
   type ExchangeCredentials,
   listExchangeEvents,
   normalizeEwsUrl,
@@ -182,6 +183,37 @@ async function syncMeetingAttendeesFromEmails(meetingId: string, attendees: read
   }
 }
 
+function isExchangeError(error: unknown, code: string): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.includes(code)
+}
+
+async function createExchangeEventWithFallback(
+  credentials: ExchangeCredentials,
+  event: ExchangeEventInput,
+): Promise<{ externalEventId: string; changeKey?: string }> {
+  try {
+    return await createExchangeEvent(credentials, event)
+  } catch (error) {
+    if (!isExchangeError(error, 'ErrorInvalidPropertySet')) throw error
+    return createExchangeEvent(credentials, { ...event, attendees: [] })
+  }
+}
+
+async function updateExchangeEventWithFallback(
+  credentials: ExchangeCredentials,
+  externalEventId: string,
+  changeKey: string | undefined,
+  event: ExchangeEventInput,
+): Promise<{ externalEventId: string; changeKey?: string }> {
+  try {
+    return await updateExchangeEvent(credentials, externalEventId, changeKey, event)
+  } catch (error) {
+    if (!isExchangeError(error, 'ErrorInvalidPropertySet')) throw error
+    return updateExchangeEvent(credentials, externalEventId, changeKey, { ...event, attendees: [] })
+  }
+}
+
 async function syncExchangeCalendar(
   account: ExchangeAccountRow,
   user: Pick<CurrentUser, 'id' | 'timezone'>,
@@ -281,24 +313,22 @@ async function syncExchangeCalendar(
       let event: { externalEventId: string; changeKey?: string }
       if (meeting.external_event_id) {
         try {
-          event = await updateExchangeEvent(
+          event = await updateExchangeEventWithFallback(
             credentials,
             meeting.external_event_id,
             meeting.external_change_key ?? undefined,
             exchangeInput,
           )
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          if (!message.includes('ErrorInvalidPropertySet')) throw error
-          event = await updateExchangeEvent(
-            credentials,
-            meeting.external_event_id,
-            meeting.external_change_key ?? undefined,
-            { ...exchangeInput, attendees: [] },
+          if (!isExchangeError(error, 'ErrorItemNotFound')) throw error
+          await pool.query(
+            'DELETE FROM calendar_event_links WHERE account_id=$1 AND meeting_id=$2',
+            [account.id, meeting.id],
           )
+          event = await createExchangeEventWithFallback(credentials, exchangeInput)
         }
       } else {
-        event = await createExchangeEvent(credentials, exchangeInput)
+        event = await createExchangeEventWithFallback(credentials, exchangeInput)
       }
       await pool.query(
         `INSERT INTO calendar_event_links (
