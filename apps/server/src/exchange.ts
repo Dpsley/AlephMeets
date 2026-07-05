@@ -235,12 +235,16 @@ export function buildExchangeUpdateItemXml(
   event: ExchangeEventInput,
 ): string {
   const requiredAttendees = buildRequiredAttendeesXml(event.attendees)
+  const shouldUpdateAttendees = event.attendees !== undefined
   const attendeesUpdate = requiredAttendees
     ? `<t:SetItemField><t:FieldURI FieldURI="calendar:RequiredAttendees" /><t:CalendarItem>${requiredAttendees}</t:CalendarItem></t:SetItemField>`
-    : ''
-  const sendMode = requiredAttendees ? 'SendOnlyToChanged' : 'SendToNone'
+    : shouldUpdateAttendees
+      ? '<t:DeleteItemField><t:FieldURI FieldURI="calendar:RequiredAttendees" /></t:DeleteItemField>'
+      : ''
+  const sendMode = shouldUpdateAttendees ? 'SendOnlyToChanged' : 'SendToNone'
+  const conflictResolution = shouldUpdateAttendees ? 'AlwaysOverwrite' : 'AutoResolve'
   const itemId = `<t:ItemId Id="${xml(externalEventId)}"${changeKey ? ` ChangeKey="${xml(changeKey)}"` : ''} />`
-  return `<m:UpdateItem MessageDisposition="SaveOnly" ConflictResolution="AutoResolve" SendMeetingInvitationsOrCancellations="${sendMode}">
+  return `<m:UpdateItem MessageDisposition="SaveOnly" ConflictResolution="${conflictResolution}" SendMeetingInvitationsOrCancellations="${sendMode}">
     <m:ItemChanges><t:ItemChange>${itemId}<t:Updates>
       <t:SetItemField><t:FieldURI FieldURI="item:Subject" /><t:CalendarItem><t:Subject>${xml(event.subject)}</t:Subject></t:CalendarItem></t:SetItemField>
       <t:SetItemField><t:FieldURI FieldURI="item:Body" /><t:CalendarItem><t:Body BodyType="Text">${xml(event.body)}</t:Body></t:CalendarItem></t:SetItemField>
@@ -418,7 +422,8 @@ export async function createExchangeEvent(
   event: ExchangeEventInput,
 ): Promise<{ externalEventId: string; changeKey?: string }> {
   const attendees = buildRequiredAttendeesXml(event.attendees)
-  const data = await requestEws(credentials, `<m:CreateItem SendMeetingInvitations="SendToNone">
+  const sendMode = attendees ? 'SendToAllAndSaveCopy' : 'SendToNone'
+  const data = await requestEws(credentials, `<m:CreateItem SendMeetingInvitations="${sendMode}">
     <m:SavedItemFolderId><t:DistinguishedFolderId Id="calendar" /></m:SavedItemFolderId>
     <m:Items><t:CalendarItem>
       <t:Subject>${xml(event.subject)}</t:Subject>

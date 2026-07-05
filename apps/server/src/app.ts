@@ -1,10 +1,12 @@
 import { existsSync, mkdirSync } from 'node:fs'
+import { Readable } from 'node:stream'
 import cors from '@fastify/cors'
 import multipart from '@fastify/multipart'
 import fastifyStatic from '@fastify/static'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { AccessToken, RoomServiceClient } from 'livekit-server-sdk'
 import { nanoid } from 'nanoid'
+import type { PoolClient } from 'pg'
 import { Server as SocketServer } from 'socket.io'
 import { ZodError } from 'zod'
 import {
@@ -90,6 +92,8 @@ interface ScheduledExchangeAccountRow extends ExchangeAccountRow {
   timezone: string
 }
 
+type RecurrenceRule = 'none' | 'daily' | 'weekly' | 'monthly'
+
 export const EXCHANGE_SYNC_INTERVAL_MS = 5 * 60 * 1000
 
 function exchangeCredentials(account: ExchangeAccountRow): ExchangeCredentials {
@@ -118,6 +122,66 @@ function normalizeEmailList(value: unknown): string[] {
     }
   }
   return []
+}
+
+function exchangeEventAttendeesForAccount(account: ExchangeAccountRow, event: ExchangeEvent): string[] {
+  const accountEmail = account.email.trim().toLowerCase()
+  const organizerEmail = event.organizer?.trim().toLowerCase()
+  return [...new Set([
+    ...event.attendees.map((email) => email.trim().toLowerCase()).filter(Boolean),
+    ...(organizerEmail && organizerEmail !== accountEmail ? [accountEmail] : []),
+  ])]
+}
+
+function shiftRecurrenceDate(date: Date, rule: Exclude<RecurrenceRule, 'none'>, index: number): Date {
+  const shifted = new Date(date)
+  if (rule === 'daily') shifted.setDate(shifted.getDate() + index)
+  if (rule === 'weekly') shifted.setDate(shifted.getDate() + index * 7)
+  if (rule === 'monthly') shifted.setMonth(shifted.getMonth() + index)
+  return shifted
+}
+
+function buildMeetingOccurrences(
+  startsAt: string,
+  endsAt: string,
+  recurrenceRule: RecurrenceRule,
+  recurrenceCount: number,
+): Array<{ startsAt: string; endsAt: string; recurrenceRule: Exclude<RecurrenceRule, 'none'> | null }> {
+  if (recurrenceRule === 'none') {
+    return [{ startsAt, endsAt, recurrenceRule: null }]
+  }
+  const start = new Date(startsAt)
+  const end = new Date(endsAt)
+  return Array.from({ length: recurrenceCount }, (_unused, index) => ({
+    startsAt: shiftRecurrenceDate(start, recurrenceRule, index).toISOString(),
+    endsAt: shiftRecurrenceDate(end, recurrenceRule, index).toISOString(),
+    recurrenceRule,
+  }))
+}
+
+async function insertMeetingAttendees(
+  client: PoolClient,
+  meetingId: string,
+  attendees: string[],
+  attendeeUserIds: string[],
+): Promise<void> {
+  for (const email of new Set(attendees.map((value) => value.toLowerCase()))) {
+    await client.query(
+      `INSERT INTO meeting_attendees (meeting_id, user_id, email)
+       SELECT $1::uuid, id, $2 FROM users WHERE lower(email) = $2
+       UNION ALL SELECT $1::uuid, NULL, $2 WHERE NOT EXISTS (SELECT 1 FROM users WHERE lower(email) = $2)
+       ON CONFLICT DO NOTHING`,
+      [meetingId, email],
+    )
+  }
+  for (const userId of new Set(attendeeUserIds)) {
+    await client.query(
+      `INSERT INTO meeting_attendees (meeting_id, user_id, email)
+       SELECT $1::uuid, id, email FROM users WHERE id = $2
+       ON CONFLICT DO NOTHING`,
+      [meetingId, userId],
+    )
+  }
 }
 
 async function syncMeetingAttendeesFromEmails(meetingId: string, attendees: readonly string[]): Promise<void> {
@@ -211,7 +275,9 @@ async function updateExchangeEventWithFallback(
     return await updateExchangeEvent(credentials, externalEventId, changeKey, event)
   } catch (error) {
     if (!isExchangeError(error, 'ErrorInvalidPropertySet')) throw error
-    return updateExchangeEvent(credentials, externalEventId, changeKey, { ...event, attendees: [] })
+    const eventWithoutAttendees = { ...event }
+    delete eventWithoutAttendees.attendees
+    return updateExchangeEvent(credentials, externalEventId, changeKey, eventWithoutAttendees)
   }
 }
 
@@ -221,12 +287,15 @@ async function applyExchangeEventToMeeting(
   meetingId: string,
   event: ExchangeEvent,
 ): Promise<void> {
+  const organizerEmail = event.organizer?.trim().toLowerCase() || account.email.trim().toLowerCase()
   await pool.query(
-    `UPDATE meetings SET title=$1, description=$2, starts_at=$3, ends_at=$4
-     WHERE id=$5 AND host_id=$6`,
-    [event.subject, event.body, event.startsAt, event.endsAt, meetingId, user.id],
+    `UPDATE meetings
+     SET title=$1, description=$2, starts_at=$3, ends_at=$4,
+         owner_email=$5, owner_display_name=$6
+     WHERE id=$7 AND host_id=$8`,
+    [event.subject, event.body, event.startsAt, event.endsAt, organizerEmail, organizerEmail, meetingId, user.id],
   )
-  await syncMeetingAttendeesFromEmails(meetingId, event.attendees)
+  await syncMeetingAttendeesFromEmails(meetingId, exchangeEventAttendeesForAccount(account, event))
   await pool.query(
     `UPDATE calendar_event_links
      SET external_change_key=$1, last_synced_at=now()
@@ -261,13 +330,17 @@ async function syncExchangeCalendar(
       )
       if (linked.rowCount) {
         const linkedMeeting = linked.rows[0] as { meeting_id: string; last_synced_at: Date | string; updated_at: Date | string }
-        if (new Date(linkedMeeting.updated_at) > new Date(linkedMeeting.last_synced_at)) continue
+        const organizerEmail = event.organizer?.trim().toLowerCase()
+        const externalOrganizer = Boolean(organizerEmail && organizerEmail !== accountEmail)
+        if (new Date(linkedMeeting.updated_at) > new Date(linkedMeeting.last_synced_at) && !externalOrganizer) continue
         await applyExchangeEventToMeeting(account, user, linkedMeeting.meeting_id, event)
       } else {
+        const organizerEmail = event.organizer?.trim().toLowerCase() || accountEmail
         const created = await pool.query(
           `INSERT INTO meetings (
-             host_id, title, description, room_name, starts_at, ends_at, timezone, status
-           ) VALUES ($1,$2,$3,$4,$5,$6,$7,'scheduled') RETURNING id`,
+             host_id, title, description, room_name, starts_at, ends_at, timezone,
+             status, owner_email, owner_display_name
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,'scheduled',$8,$9) RETURNING id`,
           [
             user.id,
             event.subject || 'Exchange meeting',
@@ -276,6 +349,8 @@ async function syncExchangeCalendar(
             event.startsAt,
             event.endsAt,
             user.timezone,
+            organizerEmail,
+            organizerEmail,
           ],
         )
         await pool.query(
@@ -284,7 +359,7 @@ async function syncExchangeCalendar(
           ) VALUES ($1,$2,$3,$4)`,
           [account.id, created.rows[0].id, event.externalEventId, event.changeKey ?? null],
         )
-        await syncMeetingAttendeesFromEmails(created.rows[0].id, event.attendees)
+        await syncMeetingAttendeesFromEmails(created.rows[0].id, exchangeEventAttendeesForAccount(account, event))
         imported += 1
       }
     }
@@ -729,7 +804,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
 
   app.get('/api/session', async () => {
     const result = await pool.query(
-      `SELECT id, phone, email, display_name, first_name, last_name, department,
+      `SELECT id, phone, email, display_name, first_name, last_name, department, position,
               avatar_url, timezone, locale,
               CASE WHEN presence = 'online' AND last_seen_at >= now() - interval '90 seconds'
                 THEN 'online'::user_presence ELSE 'offline'::user_presence END AS status
@@ -745,7 +820,9 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
          host.display_name AS host_display_name, host.avatar_url AS host_avatar_url,
          COALESCE(json_agg(json_build_object(
            'email', ma.email, 'userId', ma.user_id, 'response', ma.response,
-           'displayName', attendee.display_name, 'avatarUrl', attendee.avatar_url
+           'displayName', attendee.display_name, 'department', attendee.department,
+           'position', attendee.position,
+           'avatarUrl', attendee.avatar_url
          )) FILTER (WHERE ma.email IS NOT NULL OR ma.user_id IS NOT NULL), '[]') AS attendees
        FROM meetings m
        JOIN users host ON host.id = m.host_id
@@ -767,7 +844,9 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
          host.display_name AS host_display_name, host.avatar_url AS host_avatar_url,
          COALESCE(json_agg(json_build_object(
            'email', ma.email, 'userId', ma.user_id, 'response', ma.response,
-           'displayName', attendee.display_name, 'avatarUrl', attendee.avatar_url
+           'displayName', attendee.display_name, 'department', attendee.department,
+           'position', attendee.position,
+           'avatarUrl', attendee.avatar_url
          )) FILTER (WHERE ma.email IS NOT NULL OR ma.user_id IS NOT NULL), '[]') AS attendees
        FROM meetings m
        JOIN users host ON host.id = m.host_id
@@ -787,47 +866,42 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       return reply.code(400).send({ error: 'ends_before_start' })
     }
 
-    const meeting = await inTransaction(async (client) => {
-      const result = await client.query(
-        `INSERT INTO meetings (
-          host_id, title, description, room_name, starts_at, ends_at, timezone,
-          waiting_room, mute_on_entry, allow_join_before_host
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-        [
-          currentUser.id,
-          input.title,
-          input.description,
-          `aleph-${nanoid(12)}`,
-          input.startsAt,
-          input.endsAt,
-          input.timezone,
-          input.waitingRoom,
-          input.muteOnEntry,
-          input.allowJoinBeforeHost,
-        ],
-      )
-      const row = result.rows[0] as Record<string, unknown>
-      for (const email of new Set(input.attendees.map((value) => value.toLowerCase()))) {
-        await client.query(
-          `INSERT INTO meeting_attendees (meeting_id, user_id, email)
-           SELECT $1::uuid, id, $2 FROM users WHERE lower(email) = $2
-           UNION ALL SELECT $1::uuid, NULL, $2 WHERE NOT EXISTS (SELECT 1 FROM users WHERE lower(email) = $2)
-           ON CONFLICT DO NOTHING`,
-          [row.id, email],
+    const recurrenceRule = input.recurrenceRule ?? 'none'
+    const recurrenceCount = recurrenceRule === 'none' ? 1 : input.recurrenceCount
+    const occurrences = buildMeetingOccurrences(input.startsAt, input.endsAt, recurrenceRule, recurrenceCount)
+    const meetings = await inTransaction(async (client) => {
+      const created: Record<string, unknown>[] = []
+      for (const occurrence of occurrences) {
+        const result = await client.query(
+          `INSERT INTO meetings (
+            host_id, title, description, room_name, starts_at, ends_at, timezone,
+            waiting_room, mute_on_entry, allow_join_before_host, recurrence_rule,
+            owner_email, owner_display_name
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+          [
+            currentUser.id,
+            input.title,
+            input.description,
+            `aleph-${nanoid(12)}`,
+            occurrence.startsAt,
+            occurrence.endsAt,
+            input.timezone,
+            input.waitingRoom,
+            input.muteOnEntry,
+            input.allowJoinBeforeHost,
+            occurrence.recurrenceRule,
+            currentUser.email?.trim().toLowerCase() ?? null,
+            currentUser.displayName,
+          ],
         )
+        const row = result.rows[0] as Record<string, unknown>
+        await insertMeetingAttendees(client, String(row.id), input.attendees, input.attendeeUserIds)
+        created.push(camelizeRow(row))
       }
-      for (const userId of new Set(input.attendeeUserIds)) {
-        await client.query(
-          `INSERT INTO meeting_attendees (meeting_id, user_id, email)
-           SELECT $1::uuid, id, email FROM users WHERE id = $2
-           ON CONFLICT DO NOTHING`,
-          [row.id, userId],
-        )
-      }
-      return camelizeRow(row)
+      return created
     })
     if (input.syncCalendar) await syncCurrentExchangeAccount('meeting_created')
-    return reply.code(201).send({ meeting })
+    return reply.code(201).send({ meeting: meetings[0], meetings })
   })
 
   app.delete<{ Params: IdParams }>('/api/meetings/:id', async (request, reply) => {
@@ -915,12 +989,17 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
         throw Object.assign(new Error('Изменять можно только запланированные встречи.'), { statusCode: 409 })
       }
 
+      const shouldUpdateRecurrence = input.recurrenceRule !== undefined
+      const recurrenceRule = input.recurrenceRule && input.recurrenceRule !== 'none'
+        ? input.recurrenceRule
+        : null
       const result = await client.query(
         `UPDATE meetings
          SET title=$1, description=$2, starts_at=$3, ends_at=$4, timezone=$5,
              waiting_room=$6, mute_on_entry=$7, allow_join_before_host=$8,
+             recurrence_rule=CASE WHEN $9::boolean THEN $10::text ELSE recurrence_rule END,
              updated_at=now()
-         WHERE id=$9 AND host_id=$10
+         WHERE id=$11 AND host_id=$12
          RETURNING *`,
         [
           input.title,
@@ -931,28 +1010,14 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
           input.waitingRoom,
           input.muteOnEntry,
           input.allowJoinBeforeHost,
+          shouldUpdateRecurrence,
+          recurrenceRule,
           request.params.id,
           currentUser.id,
         ],
       )
       await client.query('DELETE FROM meeting_attendees WHERE meeting_id=$1', [request.params.id])
-      for (const email of new Set(input.attendees.map((value) => value.toLowerCase()))) {
-        await client.query(
-          `INSERT INTO meeting_attendees (meeting_id, user_id, email)
-           SELECT $1::uuid, id, $2 FROM users WHERE lower(email) = $2
-           UNION ALL SELECT $1::uuid, NULL, $2 WHERE NOT EXISTS (SELECT 1 FROM users WHERE lower(email) = $2)
-           ON CONFLICT DO NOTHING`,
-          [request.params.id, email],
-        )
-      }
-      for (const userId of new Set(input.attendeeUserIds)) {
-        await client.query(
-          `INSERT INTO meeting_attendees (meeting_id, user_id, email)
-           SELECT $1::uuid, id, email FROM users WHERE id = $2
-           ON CONFLICT DO NOTHING`,
-          [request.params.id, userId],
-        )
-      }
+      await insertMeetingAttendees(client, request.params.id, input.attendees, input.attendeeUserIds)
       return camelizeRow(result.rows[0] as Record<string, unknown>)
     })
     if (input.syncCalendar) await syncCurrentExchangeAccount('meeting_updated')
@@ -1194,7 +1259,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     }
     const result = await pool.query(
       `SELECT u.id, u.phone, u.email, u.display_name, u.first_name, u.last_name,
-              u.department, u.avatar_url,
+              u.department, u.position, u.avatar_url,
               CASE WHEN u.presence = 'online' AND u.last_seen_at >= now() - interval '90 seconds'
                 THEN 'online'::user_presence ELSE 'offline'::user_presence END AS status,
               c.alias, c.created_at
@@ -1229,7 +1294,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
           c.avatar_url, c.updated_at, self_member.role AS current_user_role,
           COALESCE(json_agg(json_build_object(
             'id', u.id, 'displayName', u.display_name, 'email', u.email, 'phone', u.phone,
-            'department', u.department, 'avatarUrl', u.avatar_url,
+            'department', u.department, 'position', u.position, 'avatarUrl', u.avatar_url,
             'status', CASE WHEN u.presence = 'online' AND u.last_seen_at >= now() - interval '90 seconds'
               THEN 'online' ELSE 'offline' END,
             'role', member.role
@@ -1559,7 +1624,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       storageName: recordingStorageName(data.filename, callRow.starts_at),
     })
     const message = await inTransaction(async (client) => {
-      const attachment = await client.query(
+      await client.query(
         `INSERT INTO attachments (
           message_id, uploaded_by, original_name, storage_name, mime_type, byte_size, duration_ms,
           storage_provider, storage_bucket, storage_key, storage_url
@@ -1587,11 +1652,93 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
          RETURNING *`,
         [storage.storageUrl, storage.storageName, request.params.messageId, request.params.id],
       )
+      const allAttachments = await client.query(
+        'SELECT * FROM attachments WHERE message_id=$1 ORDER BY created_at',
+        [request.params.messageId],
+      )
       await client.query('UPDATE conversations SET updated_at = now() WHERE id = $1', [request.params.id])
       return {
         ...camelizeRow(updated.rows[0] as Record<string, unknown>),
         deliveryStatus: 'delivered',
-        attachments: [publicAttachment(attachment.rows[0] as Record<string, unknown>)],
+        attachments: allAttachments.rows.map((row) => publicAttachment(row as Record<string, unknown>)),
+      }
+    })
+    await emitToConversationMembers(request.params.id, 'message:updated', message)
+    return reply.code(201).send({ message })
+  })
+
+  app.post<{ Params: { id: string; messageId: string } }>('/api/conversations/:id/calls/:messageId/transcript', async (request, reply) => {
+    const data = await request.file()
+    if (!data) return reply.code(400).send({ error: 'file_required' })
+    const call = await pool.query(
+      `SELECT message.id, meeting.id AS meeting_id, meeting.starts_at
+       FROM messages message
+       JOIN meetings meeting ON meeting.id = (message.metadata->>'meetingId')::uuid
+       WHERE message.id = $2 AND message.conversation_id = $1
+         AND message.kind = 'system' AND message.metadata->>'type' = 'call'
+         AND EXISTS (
+           SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = message.conversation_id AND member.user_id = $3
+         )`,
+      [request.params.id, request.params.messageId, currentUser.id],
+    )
+    if (!call.rowCount) {
+      data.file.resume()
+      return reply.code(404).send({ error: 'call_log_not_found' })
+    }
+    const chunks: Buffer[] = []
+    for await (const chunk of data.file) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    }
+    const body = Buffer.concat(chunks)
+    if (!body.byteLength) return reply.code(400).send({ error: 'file_empty' })
+    const callRow = call.rows[0] as { meeting_id: string; starts_at: Date | string }
+    const originalName = data.filename || 'transcript.txt'
+    const storage = await uploadStreamToS3({
+      stream: Readable.from(body),
+      originalName,
+      mimeType: data.mimetype || 'text/plain; charset=utf-8',
+      scopePath: buildStorageScope('meetings', callRow.meeting_id, 'transcripts'),
+      storageName: recordingStorageName(originalName, callRow.starts_at),
+    })
+    const message = await inTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO attachments (
+          message_id, uploaded_by, original_name, storage_name, mime_type, byte_size, duration_ms,
+          storage_provider, storage_bucket, storage_key, storage_url
+        ) VALUES ($1,$2,$3,$4,$5,$6,NULL,$7,$8,$9,$10) RETURNING *`,
+        [
+          request.params.messageId,
+          currentUser.id,
+          originalName,
+          storage.storageName,
+          data.mimetype || 'text/plain; charset=utf-8',
+          storage.byteSize,
+          storage.storageProvider,
+          storage.storageBucket,
+          storage.storageKey,
+          storage.storageUrl,
+        ],
+      )
+      const updated = await client.query(
+        `UPDATE messages SET
+           metadata = metadata || jsonb_build_object(
+             'transcriptUrl',$1::text,'transcriptName',$2::text
+           ),
+           edited_at = now()
+         WHERE id = $3 AND conversation_id = $4
+         RETURNING *`,
+        [storage.storageUrl, originalName, request.params.messageId, request.params.id],
+      )
+      const attachments = await client.query(
+        'SELECT * FROM attachments WHERE message_id=$1 ORDER BY created_at',
+        [request.params.messageId],
+      )
+      await client.query('UPDATE conversations SET updated_at = now() WHERE id = $1', [request.params.id])
+      return {
+        ...camelizeRow(updated.rows[0] as Record<string, unknown>),
+        deliveryStatus: 'delivered',
+        attachments: attachments.rows.map((row) => publicAttachment(row as Record<string, unknown>)),
       }
     })
     await emitToConversationMembers(request.params.id, 'message:updated', message)

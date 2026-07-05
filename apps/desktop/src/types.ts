@@ -6,6 +6,7 @@ export interface User {
   firstName?: string
   lastName?: string
   department?: string | null
+  position?: string | null
   avatarUrl: string | null
   timezone: string
   locale: string
@@ -16,6 +17,8 @@ export interface Attendee {
   email: string | null
   userId?: string
   displayName?: string | null
+  department?: string | null
+  position?: string | null
   avatarUrl?: string | null
   response: 'invited' | 'accepted' | 'declined' | 'tentative'
 }
@@ -25,6 +28,8 @@ export interface Meeting {
   hostId: string
   hostDisplayName?: string
   hostAvatarUrl?: string | null
+  ownerEmail?: string | null
+  ownerDisplayName?: string | null
   title: string
   description: string
   roomName: string
@@ -35,6 +40,7 @@ export interface Meeting {
   waitingRoom: boolean
   muteOnEntry: boolean
   allowJoinBeforeHost: boolean
+  recurrenceRule?: 'daily' | 'weekly' | 'monthly' | null
   attendees: Attendee[]
 }
 
@@ -51,6 +57,8 @@ export interface CallMessageMetadata {
   durationMs?: number
   recordingUrl?: string
   recordingName?: string
+  transcriptUrl?: string
+  transcriptName?: string
 }
 
 export interface Attachment {

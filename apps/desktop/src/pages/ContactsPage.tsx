@@ -1,4 +1,4 @@
-import { Building2, Mail, MessageSquareText, Phone, Plus, Search, UserPlus } from 'lucide-react'
+import { Briefcase, Building2, Mail, MessageSquareText, Phone, Plus, Search, UserPlus } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Avatar, Modal } from '../components/ui'
@@ -31,7 +31,7 @@ export function ContactsPage(): React.JSX.Element {
   }, [])
   useEffect(() => { void load() }, [load])
   const filtered = useMemo(
-    () => contacts.filter((contact) => `${contact.displayName} ${contact.email ?? ''} ${contact.phone ?? ''} ${contact.department ?? ''}`.toLowerCase().includes(search.toLowerCase())),
+    () => contacts.filter((contact) => `${contact.displayName} ${contact.email ?? ''} ${contact.phone ?? ''} ${contact.position ?? ''} ${contact.department ?? ''}`.toLowerCase().includes(search.toLowerCase())),
     [contacts, search],
   )
 
@@ -102,6 +102,7 @@ export function ContactsPage(): React.JSX.Element {
                 <div className="contact-details">
                   {contact.email && <span className="contact-detail" title={contact.email}><Mail size={14} /><span>{contact.email}</span></span>}
                   {contact.phone && <span className="contact-detail" title={contact.phone}><Phone size={14} /><span>{contact.phone}</span></span>}
+                  {contact.position && <span className="contact-detail" title={contact.position}><Briefcase size={14} /><span>{contact.position}</span></span>}
                   {contact.department && <span className="contact-detail" title={contact.department}><Building2 size={14} /><span>{contact.department}</span></span>}
                 </div>
                 <span className={`presence-label presence-text-${status}`}>{status === 'online' ? 'В сети' : 'Не в сети'}</span>

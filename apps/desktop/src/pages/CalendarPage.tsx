@@ -9,12 +9,29 @@ import {
   participantUserIds,
   type ParticipantSelection,
 } from '../components/ParticipantPicker'
+import { MeetingParticipantsPopover, type MeetingOwnerInfo } from '../components/MeetingParticipantsPopover'
 import { ScheduleModal } from '../components/ScheduleModal'
 import { Modal } from '../components/ui'
 import { api } from '../lib/api'
+import { canManageScheduledMeeting } from '../lib/meetings'
 import { openMeetingWindow } from '../lib/meeting-window'
 import { useApp } from '../state/AppContext'
-import type { Meeting } from '../types'
+import type { Meeting, User } from '../types'
+
+function normalizedEmail(value: string | null | undefined): string {
+  return String(value ?? '').trim().toLowerCase()
+}
+
+function meetingOwner(meeting: Meeting, user: User | null): MeetingOwnerInfo {
+  const ownerEmail = normalizedEmail(meeting.ownerEmail)
+  const isLocalOwner = !ownerEmail || ownerEmail === normalizedEmail(user?.email)
+  return {
+    userId: isLocalOwner ? meeting.hostId : undefined,
+    email: meeting.ownerEmail,
+    displayName: meeting.ownerDisplayName || meeting.hostDisplayName,
+    avatarUrl: isLocalOwner ? meeting.hostAvatarUrl : null,
+  }
+}
 
 function localDateTime(date: Date): string {
   const offset = date.getTimezoneOffset() * 60_000
@@ -30,11 +47,6 @@ function meetingParticipants(meeting: Meeting): ParticipantSelection[] {
   }))
 }
 
-function meetingDurationMinutes(meeting: Meeting): number {
-  const duration = Math.round((new Date(meeting.endsAt).getTime() - new Date(meeting.startsAt).getTime()) / 60_000)
-  return Math.max(15, duration || 60)
-}
-
 function CalendarMeetingActions({
   meeting,
   onClose,
@@ -45,20 +57,19 @@ function CalendarMeetingActions({
   onChanged: () => Promise<void>
 }): React.JSX.Element {
   const navigate = useNavigate()
+  const { user } = useApp()
   const [editing, setEditing] = useState(false)
   const [title, setTitle] = useState(meeting.title)
   const [startsAt, setStartsAt] = useState(localDateTime(new Date(meeting.startsAt)))
-  const [duration, setDuration] = useState(meetingDurationMinutes(meeting))
   const [participants, setParticipants] = useState<ParticipantSelection[]>(meetingParticipants(meeting))
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const canManage = meeting.status === 'scheduled' && new Date(meeting.endsAt) > new Date()
+  const canManage = canManageScheduledMeeting(meeting, user)
 
   useEffect(() => {
     setEditing(false)
     setTitle(meeting.title)
     setStartsAt(localDateTime(new Date(meeting.startsAt)))
-    setDuration(meetingDurationMinutes(meeting))
     setParticipants(meetingParticipants(meeting))
     setError(null)
   }, [meeting])
@@ -87,9 +98,12 @@ function CalendarMeetingActions({
   const save = async (event: React.FormEvent): Promise<void> => {
     event.preventDefault()
     const start = new Date(startsAt)
-    const end = new Date(start.getTime() + duration * 60_000)
-    setSaving(true)
+    const previousStart = new Date(meeting.startsAt)
+    const previousEnd = new Date(meeting.endsAt)
+    const previousDurationMs = Math.max(60 * 60_000, previousEnd.getTime() - previousStart.getTime())
+    const end = new Date(start.getTime() + previousDurationMs)
     setError(null)
+    setSaving(true)
     try {
       await api.updateMeeting(meeting.id, {
         title,
@@ -140,16 +154,6 @@ function CalendarMeetingActions({
               <span>Дата и время</span>
               <input type="datetime-local" value={startsAt} onChange={(event) => setStartsAt(event.target.value)} required />
             </label>
-            <label>
-              <span>Длительность</span>
-              <select value={duration} onChange={(event) => setDuration(Number(event.target.value))}>
-                <option value={30}>30 минут</option>
-                <option value={45}>45 минут</option>
-                <option value={60}>1 час</option>
-                <option value={90}>1,5 часа</option>
-                <option value={120}>2 часа</option>
-              </select>
-            </label>
           </div>
           <ParticipantPicker value={participants} onChange={setParticipants} />
           {error && <p className="form-error">{error}</p>}
@@ -164,7 +168,7 @@ function CalendarMeetingActions({
 }
 
 export function CalendarPage(): React.JSX.Element {
-  const { meetings, reloadMeetings, lastCalendarSyncedAt } = useApp()
+  const { meetings, reloadMeetings, lastCalendarSyncedAt, user } = useApp()
   const [month, setMonth] = useState(startOfMonth(new Date()))
   const [scheduleOpen, setScheduleOpen] = useState(false)
   const [selectedMeeting, setSelectedMeeting] = useState<Meeting | null>(null)
@@ -201,7 +205,22 @@ export function CalendarPage(): React.JSX.Element {
         <div className="calendar-grid">
           {days.map((day) => {
             const dayMeetings = meetings.filter((meeting) => meeting.status === 'scheduled' && isSameDay(new Date(meeting.startsAt), day))
-            return <div className={`calendar-day ${!isSameMonth(day, month) ? 'outside' : ''} ${isSameDay(day, new Date()) ? 'today' : ''}`} key={day.toISOString()}><span className="day-number">{format(day, 'd')}</span><div className="day-events">{dayMeetings.slice(0, 3).map((meeting) => <button key={meeting.id} className={meeting.status === 'live' ? 'live' : ''} onClick={() => setSelectedMeeting(meeting)}><i />{format(new Date(meeting.startsAt), 'HH:mm')} {meeting.title}</button>)}{dayMeetings.length > 3 && <small>+ еще {dayMeetings.length - 3}</small>}</div></div>
+            return (
+              <div className={`calendar-day ${!isSameMonth(day, month) ? 'outside' : ''} ${isSameDay(day, new Date()) ? 'today' : ''}`} key={day.toISOString()}>
+                <span className="day-number">{format(day, 'd')}</span>
+                <div className="day-events">
+                  {dayMeetings.slice(0, 3).map((meeting) => (
+                    <span className="calendar-event" key={meeting.id}>
+                      <button className={meeting.status === 'live' ? 'live' : ''} onClick={() => setSelectedMeeting(meeting)}>
+                        <i />{format(new Date(meeting.startsAt), 'HH:mm')} {meeting.title}
+                      </button>
+                      <MeetingParticipantsPopover attendees={meeting.attendees ?? []} owner={meetingOwner(meeting, user)} />
+                    </span>
+                  ))}
+                  {dayMeetings.length > 3 && <small>+ еще {dayMeetings.length - 3}</small>}
+                </div>
+              </div>
+            )
           })}
         </div>
       </section>

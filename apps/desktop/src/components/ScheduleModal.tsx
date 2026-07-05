@@ -14,6 +14,8 @@ function localDateTime(date: Date): string {
   return new Date(date.getTime() - offset).toISOString().slice(0, 16)
 }
 
+type RecurrenceRule = 'none' | 'daily' | 'weekly' | 'monthly'
+
 export function ScheduleModal({ open, onClose }: { open: boolean; onClose: () => void }): React.JSX.Element {
   const { user, reloadMeetings } = useApp()
   const initialStart = useMemo(() => {
@@ -24,7 +26,8 @@ export function ScheduleModal({ open, onClose }: { open: boolean; onClose: () =>
   }, [open])
   const [title, setTitle] = useState('Новая встреча')
   const [startsAt, setStartsAt] = useState(initialStart)
-  const [duration, setDuration] = useState(60)
+  const [recurrenceRule, setRecurrenceRule] = useState<RecurrenceRule>('none')
+  const [recurrenceCount, setRecurrenceCount] = useState(5)
   const [participants, setParticipants] = useState<ParticipantSelection[]>([])
   const [waitingRoom, setWaitingRoom] = useState(true)
   const [muteOnEntry, setMuteOnEntry] = useState(true)
@@ -33,11 +36,11 @@ export function ScheduleModal({ open, onClose }: { open: boolean; onClose: () =>
 
   const submit = async (event: React.FormEvent): Promise<void> => {
     event.preventDefault()
-    setSaving(true)
     setError(null)
+    const start = new Date(startsAt)
+    const end = new Date(start.getTime() + 60 * 60_000)
+    setSaving(true)
     try {
-      const start = new Date(startsAt)
-      const end = new Date(start.getTime() + duration * 60_000)
       await api.createMeeting({
         title,
         startsAt: start.toISOString(),
@@ -49,6 +52,8 @@ export function ScheduleModal({ open, onClose }: { open: boolean; onClose: () =>
         waitingRoom,
         muteOnEntry,
         allowJoinBeforeHost: false,
+        recurrenceRule,
+        recurrenceCount: recurrenceRule === 'none' ? 1 : recurrenceCount,
       })
       await reloadMeetings()
       onClose()
@@ -71,17 +76,33 @@ export function ScheduleModal({ open, onClose }: { open: boolean; onClose: () =>
             <span>Дата и время</span>
             <input type="datetime-local" value={startsAt} onChange={(event) => setStartsAt(event.target.value)} required />
           </label>
-          <label>
-            <span>Длительность</span>
-            <select value={duration} onChange={(event) => setDuration(Number(event.target.value))}>
-              <option value={30}>30 минут</option>
-              <option value={45}>45 минут</option>
-              <option value={60}>1 час</option>
-              <option value={90}>1,5 часа</option>
-              <option value={120}>2 часа</option>
+        </div>
+        <div className="form-row">
+          <label className="grow">
+            <span>Повторять</span>
+            <select value={recurrenceRule} onChange={(event) => setRecurrenceRule(event.target.value as RecurrenceRule)}>
+              <option value="none">Не повторять</option>
+              <option value="daily">Каждый день</option>
+              <option value="weekly">Каждую неделю</option>
+              <option value="monthly">Каждый месяц</option>
             </select>
           </label>
+          {recurrenceRule !== 'none' && (
+            <label>
+              <span>Количество встреч</span>
+              <input
+                type="number"
+                min={2}
+                max={52}
+                value={recurrenceCount}
+                onChange={(event) => setRecurrenceCount(Math.min(52, Math.max(2, Number(event.target.value) || 2)))}
+              />
+            </label>
+          )}
         </div>
+        {recurrenceRule !== 'none' && (
+          <small className="form-hint">Будет создана серия из {recurrenceCount} встреч.</small>
+        )}
         <ParticipantPicker value={participants} onChange={setParticipants} />
         <div className="settings-box">
           <label className="check-row">

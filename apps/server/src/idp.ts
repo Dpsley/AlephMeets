@@ -19,6 +19,10 @@ interface IdpUser {
   avatar?: string | null
   time_zone?: string | null
   department?: string | null
+  position?: string | null
+  title?: string | null
+  jobtitle?: string | null
+  job_title?: string | null
 }
 
 interface IdpResponse<T> {
@@ -34,6 +38,7 @@ interface LocalUserRow {
   first_name: string | null
   last_name: string | null
   department: string | null
+  position: string | null
   avatar_url: string | null
   timezone: string
   locale: string
@@ -60,6 +65,10 @@ interface DirectoryUser {
   avatar_url?: string | null
   time_zone?: string | null
   department?: string | null
+  position?: string | null
+  title?: string | null
+  jobtitle?: string | null
+  job_title?: string | null
 }
 
 export interface IdpTokens {
@@ -400,6 +409,7 @@ function mapDirectoryUser(user: DirectoryUser): CurrentUser | null {
     firstName: firstName ?? '',
     lastName: lastName ?? '',
     department: stringField(properties, ['department']),
+    position: stringField(properties, ['position', 'title', 'jobtitle', 'job_title']),
     avatarUrl: stringField(properties, ['avatar_url', 'thumbnailphoto', 'avatar']),
     timezone: stringField(properties, ['time_zone']) ?? 'Europe/Moscow',
     locale: 'ru-RU',
@@ -446,9 +456,9 @@ async function upsertUserProfile(
 
   await client.query(
     `INSERT INTO users (
-       id, phone, email, display_name, first_name, last_name, department,
+       id, phone, email, display_name, first_name, last_name, department, position,
        avatar_url, timezone, locale, presence
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
      ON CONFLICT (id) DO UPDATE SET
        phone = COALESCE(EXCLUDED.phone, users.phone),
        email = COALESCE(EXCLUDED.email, users.email),
@@ -456,6 +466,7 @@ async function upsertUserProfile(
        first_name = EXCLUDED.first_name,
        last_name = EXCLUDED.last_name,
        department = COALESCE(EXCLUDED.department, users.department),
+       position = COALESCE(EXCLUDED.position, users.position),
        avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
        timezone = EXCLUDED.timezone,
        locale = EXCLUDED.locale`,
@@ -467,6 +478,7 @@ async function upsertUserProfile(
       user.firstName || null,
       user.lastName || null,
       user.department,
+      user.position,
       user.avatarUrl,
       user.timezone,
       user.locale,
@@ -515,6 +527,7 @@ function mapIdpUser(user: IdpUser, fallbackPhone: string): CurrentUser {
     firstName,
     lastName,
     department: user.department?.trim() || null,
+    position: (user.position ?? user.title ?? user.jobtitle ?? user.job_title)?.trim() || null,
     avatarUrl: user.avatar || null,
     timezone: user.time_zone || 'Europe/Moscow',
     locale: 'ru-RU',
@@ -531,6 +544,7 @@ function mapLocalUser(row: LocalUserRow): CurrentUser {
     firstName: row.first_name ?? '',
     lastName: row.last_name ?? '',
     department: row.department,
+    position: row.position,
     avatarUrl: row.avatar_url,
     timezone: row.timezone,
     locale: row.locale,

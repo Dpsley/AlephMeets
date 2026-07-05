@@ -16,6 +16,7 @@ interface Window {
     }>>
     openMediaSettings: (kind: 'camera' | 'microphone') => Promise<boolean>
     downloadFile: (url: string, filename?: string) => Promise<{ path?: string; cancelled?: boolean }>
+    saveDataUrl: (dataUrl: string, filename?: string) => Promise<{ path?: string; cancelled?: boolean }>
     openMeeting: (meetingId: string, context?: Record<string, unknown>) => Promise<void>
     getMeetingContext: () => Promise<Record<string, unknown> | null>
     forceCloseMeeting: () => void

@@ -15,6 +15,7 @@ export interface CurrentUser {
   firstName: string
   lastName: string
   department: string | null
+  position: string | null
   avatarUrl: string | null
   timezone: string
   locale: string

@@ -1,28 +1,42 @@
-import { CalendarPlus, Clock3, Search, Trash2, Users, Video } from 'lucide-react'
+import { CalendarClock, CalendarPlus, Clock3, Search, Trash2, Users, Video } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { MeetingActionsModal } from '../components/MeetingActionsModal'
+import {
+  MeetingParticipantsPopover,
+  meetingParticipantsCount,
+  type MeetingOwnerInfo,
+} from '../components/MeetingParticipantsPopover'
 import { ScheduleModal } from '../components/ScheduleModal'
 import { api } from '../lib/api'
 import { meetingDate, plainTextFromRichText } from '../lib/format'
-import { isPastMeeting, isScheduledMeeting } from '../lib/meetings'
+import { canManageScheduledMeeting, isPastMeeting, isScheduledMeeting } from '../lib/meetings'
 import { openMeetingWindow } from '../lib/meeting-window'
 import { useApp } from '../state/AppContext'
-import type { Attendee } from '../types'
+import type { Meeting, User } from '../types'
 
-function attendeeLabel(attendee: Attendee): string {
-  return attendee.displayName || attendee.email || 'Участник'
+function normalizedEmail(value: string | null | undefined): string {
+  return String(value ?? '').trim().toLowerCase()
 }
 
-function attendeeMeta(attendee: Attendee): string {
-  return attendee.email && attendee.displayName ? attendee.email : ''
+function meetingOwner(meeting: Meeting, user: User | null): MeetingOwnerInfo {
+  const ownerEmail = normalizedEmail(meeting.ownerEmail)
+  const isLocalOwner = !ownerEmail || ownerEmail === normalizedEmail(user?.email)
+  return {
+    userId: isLocalOwner ? meeting.hostId : undefined,
+    email: meeting.ownerEmail,
+    displayName: meeting.ownerDisplayName || meeting.hostDisplayName,
+    avatarUrl: isLocalOwner ? meeting.hostAvatarUrl : null,
+  }
 }
 
 export function MeetingsPage(): React.JSX.Element {
-  const { meetings, reloadMeetings } = useApp()
+  const { meetings, reloadMeetings, user } = useApp()
   const navigate = useNavigate()
   const [tab, setTab] = useState<'upcoming' | 'past'>('upcoming')
   const [search, setSearch] = useState('')
   const [scheduleOpen, setScheduleOpen] = useState(false)
+  const [selectedMeeting, setSelectedMeeting] = useState<Meeting | null>(null)
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const filtered = useMemo(() => meetings.filter((meeting) => {
     const belongsToTab = tab === 'past' ? isPastMeeting(meeting) : isScheduledMeeting(meeting)
@@ -54,6 +68,8 @@ export function MeetingsPage(): React.JSX.Element {
         {filtered.map((meeting) => {
           const description = plainTextFromRichText(meeting.description) || 'Без описания'
           const attendees = meeting.attendees ?? []
+          const owner = meetingOwner(meeting, user)
+          const canManage = canManageScheduledMeeting(meeting, user)
           return (
             <article className="meeting-card" key={meeting.id}>
               <div className="meeting-icon"><Video size={24} /></div>
@@ -66,22 +82,19 @@ export function MeetingsPage(): React.JSX.Element {
                 <div className="meeting-meta">
                   <span><Clock3 size={15} />{meetingDate(meeting.startsAt)}</span>
                   <span className="meeting-participants" tabIndex={0}>
-                    <Users size={15} />{attendees.length} участников
-                    <span className="meeting-participants-popover" role="tooltip">
-                      <strong>Участники</strong>
-                      {attendees.length ? attendees.map((attendee, index) => (
-                        <span className="meeting-participant-row" key={`${attendee.userId ?? attendee.email ?? index}`}>
-                          <span>{attendeeLabel(attendee)}</span>
-                          {attendeeMeta(attendee) && <small>{attendeeMeta(attendee)}</small>}
-                        </span>
-                      )) : <small>Участники не указаны</small>}
-                    </span>
+                    <Users size={15} />{meetingParticipantsCount(attendees, owner)} участников
+                    <MeetingParticipantsPopover attendees={attendees} owner={owner} />
                   </span>
                 </div>
               </div>
               <div className="meeting-card-actions">
                 {tab === 'upcoming' && <button className="button primary small" onClick={() => void openMeetingWindow(meeting.id).then((opened) => { if (!opened) navigate(`/meeting/${meeting.id}`) })}>Войти</button>}
-                {tab === 'upcoming' && isScheduledMeeting(meeting) && (
+                {tab === 'upcoming' && canManage && (
+                  <button className="button secondary small" onClick={() => setSelectedMeeting(meeting)}>
+                    <CalendarClock size={15} />Изменить
+                  </button>
+                )}
+                {tab === 'upcoming' && canManage && (
                   <button
                     className="button secondary small danger"
                     onClick={() => void deleteMeeting(meeting.id, meeting.title)}
@@ -97,6 +110,16 @@ export function MeetingsPage(): React.JSX.Element {
         {!filtered.length && <div className="soft-empty large"><Video /><h3>Встреч не найдено</h3><p>Измените поиск или запланируйте новую встречу.</p></div>}
       </section>
       <ScheduleModal open={scheduleOpen} onClose={() => setScheduleOpen(false)} />
+      {selectedMeeting && (
+        <MeetingActionsModal
+          meeting={selectedMeeting}
+          onClose={() => setSelectedMeeting(null)}
+          onChanged={async () => {
+            await reloadMeetings()
+            setSelectedMeeting(null)
+          }}
+        />
+      )}
     </div>
   )
 }

@@ -87,7 +87,7 @@ export const api = {
   meetingByCode: (code: string) =>
     request<{ meeting: Meeting }>(`/api/meetings/join/${encodeURIComponent(code)}`),
   createMeeting: (input: Record<string, unknown>) =>
-    request<{ meeting: Meeting }>('/api/meetings', { method: 'POST', body: JSON.stringify(input) }),
+    request<{ meeting: Meeting; meetings?: Meeting[] }>('/api/meetings', { method: 'POST', body: JSON.stringify(input) }),
   updateMeeting: (id: string, input: Record<string, unknown>) =>
     request<{ meeting: Meeting }>(`/api/meetings/${id}`, { method: 'PATCH', body: JSON.stringify(input) }),
   deleteMeeting: (id: string) =>
@@ -170,6 +170,14 @@ export const api = {
     form.append('file', file, name)
     return request<{ message: Message }>(
       `/api/conversations/${conversationId}/calls/${messageId}/recording`,
+      { method: 'POST', body: form },
+    )
+  },
+  uploadCallTranscript: (conversationId: string, messageId: string, file: Blob, name: string) => {
+    const form = new FormData()
+    form.append('file', file, name)
+    return request<{ message: Message }>(
+      `/api/conversations/${conversationId}/calls/${messageId}/transcript`,
       { method: 'POST', body: form },
     )
   },

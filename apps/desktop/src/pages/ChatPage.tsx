@@ -34,6 +34,20 @@ function recordingAttachment(message: Message, metadata: CallMessageMetadata): P
     : null
 }
 
+function transcriptAttachment(message: Message, metadata: CallMessageMetadata): Pick<Attachment, 'url' | 'originalName'> | null {
+  const attachedTranscript = message.attachments.find((attachment) => (
+    attachment.url
+    && (
+      attachment.originalName === metadata.transcriptName
+      || attachment.mimeType.startsWith('text/')
+    )
+  ))
+  if (attachedTranscript) return attachedTranscript
+  return metadata.transcriptUrl
+    ? { url: metadata.transcriptUrl, originalName: metadata.transcriptName ?? 'transcript.txt' }
+    : null
+}
+
 function contactParticipant(contact: Contact): ParticipantSelection {
   return {
     userId: contact.id,
@@ -262,16 +276,16 @@ export function ChatPage(): React.JSX.Element {
     }
   }
 
-  const downloadRecording = async (recording: Pick<Attachment, 'url' | 'originalName'>): Promise<void> => {
+  const downloadCallAttachment = async (attachment: Pick<Attachment, 'url' | 'originalName'>): Promise<void> => {
     setCallError(null)
     try {
       if (window.alephDesktop?.downloadFile) {
-        await window.alephDesktop.downloadFile(recording.url, recording.originalName)
+        await window.alephDesktop.downloadFile(attachment.url, attachment.originalName)
       } else {
-        window.open(recording.url, '_blank', 'noopener')
+        window.open(attachment.url, '_blank', 'noopener')
       }
     } catch (reason) {
-      setCallError(reason instanceof Error ? reason.message : 'Не удалось скачать запись разговора.')
+      setCallError(reason instanceof Error ? reason.message : 'Не удалось скачать файл звонка.')
     }
   }
 
@@ -393,7 +407,8 @@ export function ChatPage(): React.JSX.Element {
                 : null
               if (callMetadata) {
                 const recording = recordingAttachment(message, callMetadata)
-                return <div className="call-history-message" key={message.id}><span><Phone size={18} /></span><div><strong>{own ? 'Исходящий звонок' : 'Входящий звонок'}</strong><small>{message.body || 'Звонок'}</small>{recording && <button className="call-recording-download" type="button" onClick={() => void downloadRecording(recording)}><Download size={14} />Скачать запись разговора</button>}</div><time>{shortTime(message.createdAt)}</time></div>
+                const transcript = transcriptAttachment(message, callMetadata)
+                return <div className="call-history-message" key={message.id}><span><Phone size={18} /></span><div><strong>{own ? 'Исходящий звонок' : 'Входящий звонок'}</strong><small>{message.body || 'Звонок'}</small>{recording && <button className="call-recording-download" type="button" onClick={() => void downloadCallAttachment(recording)}><Download size={14} />Скачать запись разговора</button>}{transcript && <button className="call-recording-download" type="button" onClick={() => void downloadCallAttachment(transcript)}><FileText size={14} />Скачать расшифровку</button>}</div><time>{shortTime(message.createdAt)}</time></div>
               }
               return <div className={`message ${own ? 'own' : ''}`} key={message.id}>
                 {!own && <Avatar name={message.senderName || 'User'} src={message.senderAvatarUrl} size="small" />}
@@ -419,7 +434,7 @@ export function ChatPage(): React.JSX.Element {
         </> : <EmptyState icon={<Users />} title="Выберите чат" text="Переписки и файлы появятся здесь." />}
       </section>
     </div>
-    <Modal open={createDirectOpen} onClose={() => setCreateDirectOpen(false)} title="Создать чат" width={480}>
+    <Modal open={createDirectOpen} onClose={() => setCreateDirectOpen(false)} title="Создать чат" width={560} className="participant-picker-modal">
       <div className="form-stack">
         <ParticipantPicker
           label="Собеседник"
@@ -440,7 +455,7 @@ export function ChatPage(): React.JSX.Element {
         </footer>
       </div>
     </Modal>
-    <Modal open={createGroupOpen} onClose={() => setCreateGroupOpen(false)} title="Создать групповой чат" width={480}>
+    <Modal open={createGroupOpen} onClose={() => setCreateGroupOpen(false)} title="Создать групповой чат" width={560} className="participant-picker-modal">
       <div className="form-stack">
         <label><span>Название группы</span><input value={groupTitle} onChange={(event) => setGroupTitle(event.target.value)} maxLength={150} autoFocus placeholder="Например, Команда проекта" /></label>
         <ParticipantPicker
@@ -457,7 +472,7 @@ export function ChatPage(): React.JSX.Element {
         <footer className="modal-actions"><button className="button secondary" onClick={() => setCreateGroupOpen(false)}>Отмена</button><button className="button primary" onClick={() => void createGroup()} disabled={!groupTitle.trim() || !groupMemberIds.length || groupSaving}>{groupSaving ? 'Создание...' : 'Создать'}</button></footer>
       </div>
     </Modal>
-    <Modal open={manageGroupOpen} onClose={() => setManageGroupOpen(false)} title="Управление группой" width={520}>
+    <Modal open={manageGroupOpen} onClose={() => setManageGroupOpen(false)} title="Управление группой" width={560} className="participant-picker-modal">
       {selected?.kind === 'group' && <div className="form-stack">
         <label><span>Название группы</span><div className="group-title-editor"><input value={groupTitle} onChange={(event) => setGroupTitle(event.target.value)} maxLength={150} /><button className="button secondary" onClick={() => void renameGroup()} disabled={!groupTitle.trim() || groupSaving}>Сохранить</button></div></label>
         <div className="group-management-list"><strong>Участники</strong>{selected.members.map((member) => <div className="group-management-row" key={member.id}><div className="group-member-avatar"><Avatar name={member.displayName} src={member.avatarUrl} size="small" /></div><span className="group-member-copy">{member.displayName}<small>{member.role === 'owner' ? 'Владелец' : member.email || member.phone || 'Контакт Aleph ID'}</small></span>{member.role !== 'owner' && <button className="icon-button danger" onClick={() => void removeGroupMember(member.id)} title="Удалить участника"><UserMinus size={17} /></button>}</div>)}</div>

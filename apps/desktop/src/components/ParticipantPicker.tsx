@@ -39,7 +39,7 @@ function participantMeta(participant: ParticipantSelection): string {
 }
 
 function contactMeta(contact: Contact): string {
-  return [contact.email, contact.phone, contact.department].filter(Boolean).join(' · ') || 'Контакт Aleph ID'
+  return contact.email || contact.phone || 'Контакт Aleph ID'
 }
 
 function hasParticipant(participants: readonly ParticipantSelection[], candidate: ParticipantSelection): boolean {
@@ -148,6 +148,7 @@ export function ParticipantPicker({
           contact.displayName,
           contact.email,
           contact.phone,
+          contact.position,
           contact.department,
         ].filter(Boolean).join(' ').toLowerCase()
         return text.includes(query) || Boolean(phoneQuery && normalizedPhone(contact.phone).includes(phoneQuery))
@@ -269,10 +270,12 @@ export function ParticipantPicker({
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => addContact(contact)}
               >
-                <Avatar name={contact.displayName} src={contact.avatarUrl} size="small" />
-                <span>
+                <Avatar name={contact.displayName} src={contact.avatarUrl} />
+                <span className="participant-suggestion-copy">
                   <strong>{contact.displayName}</strong>
                   <small>{contactMeta(contact)}</small>
+                  {contact.position && <em>{contact.position}</em>}
+                  {contact.department && <em>{contact.department}</em>}
                 </span>
               </button>
             ))}

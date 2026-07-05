@@ -1,5 +1,7 @@
 import { z } from 'zod'
 
+export const recurrenceRuleSchema = z.enum(['none', 'daily', 'weekly', 'monthly'])
+
 export const meetingInputSchema = z.object({
   title: z.string().trim().min(1).max(200),
   description: z.string().trim().max(5000).optional().default(''),
@@ -12,6 +14,8 @@ export const meetingInputSchema = z.object({
   waitingRoom: z.boolean().default(true),
   muteOnEntry: z.boolean().default(true),
   allowJoinBeforeHost: z.boolean().default(false),
+  recurrenceRule: recurrenceRuleSchema.nullable().optional(),
+  recurrenceCount: z.number().int().min(1).max(52).optional().default(1),
 })
 
 export const meetingHostTransferSchema = z.object({

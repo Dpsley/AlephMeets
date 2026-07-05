@@ -14,6 +14,7 @@ const testUsers: Record<string, CurrentUser> = {
     firstName: 'Dmitry',
     lastName: 'Aleph',
     department: null,
+    position: null,
     avatarUrl: null,
     timezone: 'Europe/Moscow',
     locale: 'ru-RU',
@@ -27,6 +28,7 @@ const testUsers: Record<string, CurrentUser> = {
     firstName: 'Анна',
     lastName: 'Волкова',
     department: null,
+    position: null,
     avatarUrl: null,
     timezone: 'Europe/Moscow',
     locale: 'ru-RU',
@@ -152,6 +154,49 @@ test('creates a meeting with a registered attendee', async () => {
     assert.equal(attendee.rows[0]?.user_id, '10000000-0000-4000-8000-000000000002')
   } finally {
     if (meetingId) await pool.query('DELETE FROM meetings WHERE id = $1', [meetingId])
+    await app.close()
+  }
+})
+
+test('creates recurring scheduled meetings', async () => {
+  const app = await createTestApp()
+  const meetingIds: string[] = []
+  try {
+    const startsAt = new Date(Date.now() + 60_000)
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/meetings',
+      headers: dmitryAuth,
+      payload: {
+        title: '__recurring_meeting_test__',
+        startsAt: startsAt.toISOString(),
+        endsAt: new Date(startsAt.getTime() + 60 * 60_000).toISOString(),
+        timezone: 'Europe/Moscow',
+        attendees: ['anna@aleph.local'],
+        recurrenceRule: 'weekly',
+        recurrenceCount: 3,
+      },
+    })
+    assert.equal(response.statusCode, 201, response.body)
+    const body = response.json() as { meetings: Array<{ id: string }> }
+    assert.equal(body.meetings.length, 3)
+    meetingIds.push(...body.meetings.map((meeting) => meeting.id))
+
+    const result = await pool.query(
+      `SELECT starts_at, recurrence_rule
+       FROM meetings
+       WHERE id = ANY($1::uuid[])
+       ORDER BY starts_at`,
+      [meetingIds],
+    )
+    assert.equal(result.rowCount, 3)
+    assert.deepEqual(result.rows.map((row) => row.recurrence_rule), ['weekly', 'weekly', 'weekly'])
+    assert.equal(
+      new Date(result.rows[1].starts_at).getTime() - new Date(result.rows[0].starts_at).getTime(),
+      7 * 24 * 60 * 60 * 1000,
+    )
+  } finally {
+    if (meetingIds.length) await pool.query('DELETE FROM meetings WHERE id = ANY($1::uuid[])', [meetingIds])
     await app.close()
   }
 })
@@ -436,6 +481,7 @@ test('loads AD users into contacts for department users', async () => {
             givenname: ['Directory'],
             sn: ['Contact'],
             department: ['Trading'],
+            title: ['Senior trader'],
           },
         },
         {
@@ -443,6 +489,7 @@ test('loads AD users into contacts for department users', async () => {
           email: 'new-contact@alephtrade.com',
           display_name: 'New Contact',
           department: 'Sales',
+          position: 'Sales manager',
         },
       ],
     }), { status: 200, headers: { 'Content-Type': 'application/json' } })
@@ -453,15 +500,17 @@ test('loads AD users into contacts for department users', async () => {
     assert.equal(response.statusCode, 200, response.body)
     const contact = response.json().contacts.find((item: { id: string }) => item.id === adUserId)
     assert.equal(contact?.department, 'Trading')
+    assert.equal(contact?.position, 'Senior trader')
     assert.equal(contact?.email, 'directory-contact@alephtrade.com')
     const newContact = response.json().contacts.find((item: { id: string }) => item.id === newAdUserId)
     assert.equal(newContact?.department, 'Sales')
+    assert.equal(newContact?.position, 'Sales manager')
     assert.equal(newContact?.email, 'new-contact@alephtrade.com')
     const created = await pool.query(
-      'SELECT display_name, department FROM users WHERE id = $1',
+      'SELECT display_name, department, position FROM users WHERE id = $1',
       [newAdUserId],
     )
-    assert.deepEqual(created.rows[0], { display_name: 'New Contact', department: 'Sales' })
+    assert.deepEqual(created.rows[0], { display_name: 'New Contact', department: 'Sales', position: 'Sales manager' })
     const cachedResponse = await app.inject({ method: 'GET', url: '/api/contacts', headers: dmitryAuth })
     assert.equal(cachedResponse.statusCode, 200, cachedResponse.body)
     assert.equal(fetchCount, 1)

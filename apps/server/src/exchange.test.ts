@@ -96,7 +96,7 @@ test('builds a compatible UpdateItem XML for meeting attendees', () => {
     attendees: ['user@example.com'],
   })
   assert.match(withAttendees, /MessageDisposition="SaveOnly"/)
-  assert.match(withAttendees, /ConflictResolution="AutoResolve"/)
+  assert.match(withAttendees, /ConflictResolution="AlwaysOverwrite"/)
   assert.match(withAttendees, /SendMeetingInvitationsOrCancellations="SendOnlyToChanged"/)
   assert.match(withAttendees, /FieldURI="calendar:RequiredAttendees"/)
 
@@ -106,9 +106,17 @@ test('builds a compatible UpdateItem XML for meeting attendees', () => {
     endsAt: '2026-06-29T09:00:00Z',
     attendees: [],
   })
-  assert.match(withoutAttendees, /SendMeetingInvitationsOrCancellations="SendToNone"/)
-  assert.doesNotMatch(withoutAttendees, /DeleteItemField/)
-  assert.doesNotMatch(withoutAttendees, /FieldURI="calendar:RequiredAttendees"/)
+  assert.match(withoutAttendees, /ConflictResolution="AlwaysOverwrite"/)
+  assert.match(withoutAttendees, /SendMeetingInvitationsOrCancellations="SendOnlyToChanged"/)
+  assert.match(withoutAttendees, /<t:DeleteItemField><t:FieldURI FieldURI="calendar:RequiredAttendees" \/><\/t:DeleteItemField>/)
+
+  const withoutAttendeeUpdate = buildExchangeUpdateItemXml('event-id', undefined, {
+    subject: 'Planning',
+    startsAt: '2026-06-29T08:00:00Z',
+    endsAt: '2026-06-29T09:00:00Z',
+  })
+  assert.match(withoutAttendeeUpdate, /SendMeetingInvitationsOrCancellations="SendToNone"/)
+  assert.doesNotMatch(withoutAttendeeUpdate, /FieldURI="calendar:RequiredAttendees"/)
 })
 
 test('normalizes Outlook HTML bodies to readable plain text', () => {

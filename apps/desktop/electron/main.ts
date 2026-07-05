@@ -66,7 +66,12 @@ function finishDisplayRequest(requestId: number, sourceId?: string): void {
   pendingDisplayRequests.delete(requestId)
   clearTimeout(request.timer)
   const source = sourceId ? request.sources.find((item) => item.id === sourceId) : undefined
-  request.callback(source ? { video: source } : {})
+  try {
+    request.callback(source ? { video: source } : {})
+  } catch (error) {
+    const message = error instanceof Error ? error.message : ''
+    if (source || !/video was requested|no video stream/i.test(message)) throw error
+  }
 }
 
 function authFilePath(): string {
@@ -343,6 +348,34 @@ app.whenReady().then(async () => {
       targetSession.on('will-download', onWillDownload)
       targetWebContents.downloadURL(parsed.toString())
     })
+  })
+  ipcMain.handle('file:save-data-url', async (event, dataUrl: unknown, filename: unknown) => {
+    if (typeof dataUrl !== 'string') throw new Error('File data is required')
+    const match = dataUrl.match(/^data:image\/png;base64,([a-zA-Z0-9+/=]+)$/)
+    if (!match) throw new Error('Only PNG data URLs are supported')
+    const encodedPng = match[1]
+    if (!encodedPng) throw new Error('PNG data is empty')
+    const defaultName = safeDownloadName(
+      typeof filename === 'string' && filename.trim()
+        ? filename
+        : `aleph-whiteboard-${Date.now()}.png`,
+    )
+    const owner = BrowserWindow.fromWebContents(event.sender)
+    const saveDialogOptions = {
+      title: 'Сохранить доску',
+      defaultPath: join(app.getPath('downloads'), defaultName),
+      buttonLabel: 'Сохранить',
+      filters: [
+        { name: 'PNG', extensions: ['png'] },
+        { name: 'Все файлы', extensions: ['*'] },
+      ],
+    }
+    const saveDialog = owner
+      ? await dialog.showSaveDialog(owner, saveDialogOptions)
+      : await dialog.showSaveDialog(saveDialogOptions)
+    if (saveDialog.canceled || !saveDialog.filePath) return { cancelled: true }
+    writeFileSync(saveDialog.filePath, Buffer.from(encodedPng, 'base64'))
+    return { path: saveDialog.filePath, cancelled: false }
   })
   ipcMain.handle('meeting:open', (event, meetingId: string, context?: Record<string, unknown>) => {
     const slot = authSlots.get(event.sender.id) ?? 'primary'

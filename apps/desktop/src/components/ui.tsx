@@ -34,18 +34,20 @@ export function Modal({
   title,
   children,
   width = 520,
+  className,
 }: {
   open: boolean
   onClose: () => void
   title: string
   children: React.ReactNode
   width?: number
+  className?: string
 }): React.JSX.Element | null {
   if (!open) return null
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <section
-        className="modal-card"
+        className={clsx('modal-card', className)}
         style={{ width }}
         onMouseDown={(event) => event.stopPropagation()}
         role="dialog"
