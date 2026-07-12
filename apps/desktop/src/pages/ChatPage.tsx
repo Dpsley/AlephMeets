@@ -13,10 +13,33 @@ import { getAccessToken } from '../lib/auth'
 import { relativeTime, shortTime } from '../lib/format'
 import { ensureDesktopMediaAccess } from '../lib/media'
 import { useApp } from '../state/AppContext'
-import type { Attachment, CallMessageMetadata, Contact, Conversation, Message } from '../types'
+import type { Attachment, CallMessageMetadata, Contact, Conversation, MeetingAnalysisMetadata, Message } from '../types'
 
 function isCallMetadata(metadata: Message['metadata']): metadata is CallMessageMetadata {
   return metadata?.type === 'call'
+}
+
+function isMeetingAnalysisMetadata(metadata: Message['metadata']): metadata is MeetingAnalysisMetadata {
+  return metadata?.type === 'meetingAnalysis'
+}
+
+function attachmentSize(bytes: number | string): string {
+  const normalized = Number(bytes)
+  const size = Number.isFinite(normalized) ? normalized : 0
+  if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(size >= 10 * 1024 * 1024 ? 0 : 1)} МБ`
+  return `${Math.max(1, Math.round(size / 1024))} КБ`
+}
+
+function isInlinePreviewAttachment(attachment: Pick<Attachment, 'mimeType'>): boolean {
+  return attachment.mimeType.startsWith('image/')
+    || attachment.mimeType.startsWith('audio/')
+    || attachment.mimeType.startsWith('video/')
+}
+
+function isAudioChatAttachment(message: Message, attachment: Attachment): boolean {
+  return message.kind === 'audio'
+    || attachment.mimeType.startsWith('audio/')
+    || /^voice-\d+\.webm$/i.test(attachment.originalName)
 }
 
 function recordingAttachment(message: Message, metadata: CallMessageMetadata): Pick<Attachment, 'url' | 'originalName'> | null {
@@ -79,6 +102,8 @@ export function ChatPage(): React.JSX.Element {
   const [recording, setRecording] = useState(false)
   const [calling, setCalling] = useState(false)
   const [callError, setCallError] = useState<string | null>(null)
+  const [attachmentMessage, setAttachmentMessage] = useState<Message | null>(null)
+  const [previewAttachment, setPreviewAttachment] = useState<Attachment | null>(null)
   const [contacts, setContacts] = useState<Contact[]>([])
   const [contactsLoading, setContactsLoading] = useState(false)
   const [createDirectOpen, setCreateDirectOpen] = useState(false)
@@ -139,6 +164,7 @@ export function ChatPage(): React.JSX.Element {
     socket.on('conversation:updated', () => void loadConversations())
     socket.on('message:updated', (message: Message) => {
       setMessages((current) => current.map((item) => item.id === message.id ? { ...item, ...message } : item))
+      setAttachmentMessage((current) => current?.id === message.id ? { ...current, ...message } : current)
       void loadConversations()
     })
     socket.on('conversation:read', (read: { conversationId: string; userId: string }) => {
@@ -289,6 +315,32 @@ export function ChatPage(): React.JSX.Element {
     }
   }
 
+  const openAttachmentExternal = (attachment: Pick<Attachment, 'url'>): void => {
+    if (attachment.url) window.open(attachment.url, '_blank', 'noopener')
+  }
+
+  const renderAttachmentPreview = (attachment: Attachment): React.JSX.Element => {
+    if (attachment.mimeType.startsWith('image/')) {
+      return <img className="attachment-preview-image" src={attachment.url} alt={attachment.originalName} />
+    }
+    if (attachment.mimeType.startsWith('audio/')) {
+      return <audio className="attachment-preview-media" controls src={attachment.url} />
+    }
+    if (attachment.mimeType.startsWith('video/')) {
+      return <video className="attachment-preview-video" controls src={attachment.url} />
+    }
+    if (attachment.mimeType === 'application/pdf' || attachment.mimeType.startsWith('text/')) {
+      return <iframe className="attachment-preview-frame" title={attachment.originalName} src={attachment.url} />
+    }
+    return (
+      <div className="attachment-preview-empty">
+        <FileText size={34} />
+        <strong>{attachment.originalName}</strong>
+        <small>Для этого типа файла доступно только скачивание.</small>
+      </div>
+    )
+  }
+
   const openCreateDirect = (): void => {
     setDirectMembers([])
     setDirectError(null)
@@ -405,24 +457,44 @@ export function ChatPage(): React.JSX.Element {
               const callMetadata = message.kind === 'system' && isCallMetadata(message.metadata)
                 ? message.metadata
                 : null
+              const analysisMetadata = message.kind === 'system' && isMeetingAnalysisMetadata(message.metadata)
+                ? message.metadata
+                : null
               if (callMetadata) {
-                const recording = recordingAttachment(message, callMetadata)
-                const transcript = transcriptAttachment(message, callMetadata)
-                return <div className="call-history-message" key={message.id}><span><Phone size={18} /></span><div><strong>{own ? 'Исходящий звонок' : 'Входящий звонок'}</strong><small>{message.body || 'Звонок'}</small>{recording && <button className="call-recording-download" type="button" onClick={() => void downloadCallAttachment(recording)}><Download size={14} />Скачать запись разговора</button>}{transcript && <button className="call-recording-download" type="button" onClick={() => void downloadCallAttachment(transcript)}><FileText size={14} />Скачать расшифровку</button>}</div><time>{shortTime(message.createdAt)}</time></div>
+                const hasAttachments = message.attachments.length > 0 || callMetadata.analysisPending
+                return <div className="call-history-message" key={message.id}><span><Phone size={18} /></span><div><strong>{own ? 'Исходящий звонок' : 'Входящий звонок'}</strong><small>{message.body || 'Звонок'}</small>{hasAttachments && <button className="call-materials-button" type="button" onClick={() => setAttachmentMessage(message)} title="Материалы встречи" aria-label="Материалы встречи"><Paperclip size={16} />{message.attachments.length > 0 && <span>{message.attachments.length}</span>}</button>}</div><time>{shortTime(message.createdAt)}</time></div>
               }
+              if (analysisMetadata) {
+                return null
+              }
+              const attachments = message.attachments ?? []
+              const hasVisualAttachment = attachments.some((attachment) => (
+                !isAudioChatAttachment(message, attachment)
+                && (attachment.mimeType.startsWith('image/') || attachment.mimeType.startsWith('video/'))
+              ))
+              const hasAudioOnlyAttachment = !message.body && attachments.length > 0
+                && attachments.every((attachment) => isAudioChatAttachment(message, attachment))
+              const messageBodyClass = [
+                'message-body',
+                hasVisualAttachment ? 'message-body-media' : '',
+                hasAudioOnlyAttachment ? 'message-body-audio' : '',
+              ].filter(Boolean).join(' ')
               return <div className={`message ${own ? 'own' : ''}`} key={message.id}>
                 {!own && <Avatar name={message.senderName || 'User'} src={message.senderAvatarUrl} size="small" />}
-                <div className="message-body">
+                <div className={messageBodyClass}>
                   {!own && <strong>{message.senderName}</strong>}
                   {message.body && <p>{message.body}</p>}
-                  {message.attachments?.map((attachment) => {
-                    if (attachment.mimeType.startsWith('audio/')) {
-                      return <audio controls src={attachment.url} key={attachment.id} />
+                  {attachments.map((attachment) => {
+                    if (isAudioChatAttachment(message, attachment)) {
+                      return <audio className="audio-attachment" controls src={attachment.url} key={attachment.id} />
                     }
                     if (attachment.mimeType.startsWith('image/')) {
-                      return <a className="image-attachment-link" href={attachment.url} target="_blank" rel="noreferrer" key={attachment.id}><img className="image-attachment" src={attachment.url} alt={attachment.originalName} loading="lazy" /></a>
+                      return <button className="image-attachment-link" type="button" onClick={() => setPreviewAttachment(attachment)} key={attachment.id}><img className="image-attachment" src={attachment.url} alt={attachment.originalName} loading="lazy" /></button>
                     }
-                    return <a className="file-attachment" href={attachment.url} download={attachment.originalName} target="_blank" rel="noreferrer" key={attachment.id}><span><FileText size={20} /></span><div><strong>{attachment.originalName}</strong><small>{Math.max(1, Math.round(attachment.byteSize / 1024))} КБ</small></div></a>
+                    if (attachment.mimeType.startsWith('video/')) {
+                      return <video className="video-attachment" controls preload="metadata" src={attachment.url} key={attachment.id} />
+                    }
+                    return <button className="file-attachment" type="button" onClick={() => openAttachmentExternal(attachment)} key={attachment.id}><span><FileText size={20} /></span><div><strong>{attachment.originalName}</strong><small>{attachmentSize(attachment.byteSize)}</small></div></button>
                   })}
                   <span className="message-meta"><time>{shortTime(message.createdAt)}</time>{own && (message.deliveryStatus === 'read' ? <CheckCheck aria-label="Прочитано" /> : <Check aria-label="Доставлено" />)}</span>
                 </div>
@@ -434,6 +506,76 @@ export function ChatPage(): React.JSX.Element {
         </> : <EmptyState icon={<Users />} title="Выберите чат" text="Переписки и файлы появятся здесь." />}
       </section>
     </div>
+    <Modal open={Boolean(attachmentMessage)} onClose={() => setAttachmentMessage(null)} title="Вложения встречи" width={440}>
+      <div className="call-attachments-list">
+        {attachmentMessage?.attachments.map((attachment) => (
+          <div
+            role="button"
+            tabIndex={0}
+            className="call-attachment-row"
+            key={attachment.id}
+            onClick={() => {
+              if (isInlinePreviewAttachment(attachment)) setPreviewAttachment(attachment)
+              else openAttachmentExternal(attachment)
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault()
+                if (isInlinePreviewAttachment(attachment)) setPreviewAttachment(attachment)
+                else openAttachmentExternal(attachment)
+              }
+            }}
+          >
+            <span><FileText size={18} /></span>
+            <div>
+              <strong>{attachment.originalName}</strong>
+              <small>{isInlinePreviewAttachment(attachment) ? 'Просмотр и скачивание' : 'Открытие и скачивание'} - {attachmentSize(attachment.byteSize)}</small>
+            </div>
+            <button
+              type="button"
+              className="attachment-row-download"
+              title="Скачать"
+              aria-label="Скачать"
+              onClick={(event) => {
+                event.stopPropagation()
+                void downloadCallAttachment(attachment)
+              }}
+            >
+              <Download size={16} />
+            </button>
+          </div>
+        ))}
+        {attachmentMessage && isCallMetadata(attachmentMessage.metadata) && attachmentMessage.metadata.analysisPending && (
+          <button type="button" className="call-attachment-row pending" disabled>
+            <span><FileText size={18} /></span>
+            <div>
+              <strong>Конспект встречи</strong>
+              <small>Алефа формирует конспект, файл появится здесь автоматически.</small>
+            </div>
+            <Download size={16} />
+          </button>
+        )}
+        {attachmentMessage && isCallMetadata(attachmentMessage.metadata) && attachmentMessage.metadata.analysisError && (
+          <p className="form-error">{attachmentMessage.metadata.analysisError}</p>
+        )}
+        {attachmentMessage && !attachmentMessage.attachments.length && !(isCallMetadata(attachmentMessage.metadata) && attachmentMessage.metadata.analysisPending) && (
+          <p className="soft-empty">Вложений пока нет.</p>
+        )}
+      </div>
+    </Modal>
+    <Modal open={Boolean(previewAttachment)} onClose={() => setPreviewAttachment(null)} title={previewAttachment?.originalName ?? 'Вложение'} width={780}>
+      {previewAttachment && (
+        <div className="attachment-preview">
+          {renderAttachmentPreview(previewAttachment)}
+          <footer>
+            <span>{previewAttachment.mimeType || 'application/octet-stream'} - {attachmentSize(previewAttachment.byteSize)}</span>
+            <button className="button primary" type="button" onClick={() => void downloadCallAttachment(previewAttachment)}>
+              <Download size={16} />Скачать
+            </button>
+          </footer>
+        </div>
+      )}
+    </Modal>
     <Modal open={createDirectOpen} onClose={() => setCreateDirectOpen(false)} title="Создать чат" width={560} className="participant-picker-modal">
       <div className="form-stack">
         <ParticipantPicker

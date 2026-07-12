@@ -60,6 +60,14 @@ export const config = {
   s3Bucket: process.env.S3_BUCKET ?? 'alephtrade-storage',
   s3PublicBaseUrl: (process.env.S3_PUBLIC_BASE_URL ?? 'https://storage.yandexcloud.net').replace(/\/$/, ''),
   s3RootPath: (process.env.S3_ROOT_PATH ?? 'alephmeets').replace(/^\/+|\/+$/g, '') || 'alephmeets',
+  alephaAgentBaseUrl: (process.env.ALEPHA_AGENT_BASE_URL ?? 'http://api.alephtrade.com/agent01').replace(/\/$/, ''),
+  smtpHost: process.env.SMTP_HOST ?? '',
+  smtpPort: Number(process.env.SMTP_PORT ?? 587),
+  smtpSecure: /^true|1|yes$/i.test(process.env.SMTP_SECURE ?? ''),
+  smtpUser: process.env.SMTP_USER ?? '',
+  smtpPassword: process.env.SMTP_PASSWORD ?? '',
+  smtpFrom: process.env.SMTP_FROM ?? process.env.SMTP_USER ?? '',
+  smtpRejectUnauthorized: !/^false|0|no$/i.test(process.env.SMTP_REJECT_UNAUTHORIZED ?? 'true'),
   credentialEncryptionKey:
     process.env.CREDENTIAL_ENCRYPTION_KEY ?? 'aleph-meets-local-development-key-change-me',
 }

@@ -11,6 +11,10 @@ test('attachmentStorageName keeps original name and appends 16-character suffix'
   assert.equal(attachmentStorageName('invoice.final.pdf', '1234567890abcdef'), 'invoice.final-1234567890abcdef.pdf')
 })
 
+test('attachmentStorageName uses URL-safe object names for S3 upload path', () => {
+  assert.equal(attachmentStorageName('2 (1).png', '4657339971b0bfa9'), '2-1-4657339971b0bfa9.png')
+})
+
 test('recordingStorageName uses meeting start date and source extension', () => {
   assert.equal(
     recordingStorageName('call.webm', '2026-06-29T10:15:30.000Z', 'fedcba0987654321'),

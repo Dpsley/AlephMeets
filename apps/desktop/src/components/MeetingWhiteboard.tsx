@@ -65,7 +65,7 @@ type WhiteboardArrow = WhiteboardBase & {
   width: number
 }
 
-type WhiteboardItem = WhiteboardStroke | WhiteboardText | WhiteboardShape | WhiteboardArrow
+export type WhiteboardItem = WhiteboardStroke | WhiteboardText | WhiteboardShape | WhiteboardArrow
 type DraftItem = WhiteboardStroke | WhiteboardText | WhiteboardShape | WhiteboardArrow
 
 type MoveState = {
@@ -328,6 +328,95 @@ function exportFilename(): string {
   return `aleph-whiteboard-${stamp}.png`
 }
 
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+function svgNonTextItem(item: Exclude<WhiteboardItem, WhiteboardText>): string {
+  if (item.kind === 'stroke') {
+    return `<path d="${pointsToPath(item.points)}" stroke="${escapeXml(item.color)}" stroke-width="${item.width}" stroke-linecap="round" stroke-linejoin="round" fill="none" />`
+  }
+  if (item.kind === 'arrow') {
+    return [
+      `<line x1="${item.start.x}" y1="${item.start.y}" x2="${item.end.x}" y2="${item.end.y}" stroke="${escapeXml(item.color)}" stroke-width="${item.width}" stroke-linecap="round" />`,
+      `<polygon points="${arrowHeadPoints(item)}" fill="${escapeXml(item.color)}" />`,
+    ].join('')
+  }
+  if (item.shape === 'decision') {
+    const points = [
+      `${item.x + item.width / 2},${item.y}`,
+      `${item.x + item.width},${item.y + item.height / 2}`,
+      `${item.x + item.width / 2},${item.y + item.height}`,
+      `${item.x},${item.y + item.height / 2}`,
+    ].join(' ')
+    return `<polygon points="${points}" fill="${escapeXml(item.fill)}" stroke="${escapeXml(item.color)}" stroke-width="3" />`
+  }
+  if (item.shape === 'terminator') {
+    return `<rect x="${item.x}" y="${item.y}" width="${item.width}" height="${item.height}" rx="${item.height / 2}" fill="${escapeXml(item.fill)}" stroke="${escapeXml(item.color)}" stroke-width="3" />`
+  }
+  return `<rect x="${item.x}" y="${item.y}" width="${item.width}" height="${item.height}" rx="12" fill="${escapeXml(item.fill)}" stroke="${escapeXml(item.color)}" stroke-width="3" />`
+}
+
+function svgTextItem(item: WhiteboardText): string {
+  const lines = textLines(item)
+  const tspans = (lines.length ? lines : ['Текст']).map((line, index) => (
+    `<tspan x="${item.x + 11}" dy="${index === 0 ? 0 : 27}">${escapeXml(line)}</tspan>`
+  )).join('')
+  return [
+    `<rect x="${item.x}" y="${item.y}" width="${item.width}" height="${item.height}" rx="8" fill="transparent" stroke="${escapeXml(item.color)}" stroke-width="2" stroke-dasharray="7 5" />`,
+    `<text x="${item.x + 11}" y="${item.y + 28}" fill="${escapeXml(item.color)}" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="22" font-weight="700">${tspans}</text>`,
+  ].join('')
+}
+
+export function whiteboardItemsToSvgSource(items: readonly WhiteboardItem[]): string {
+  const nonText = items.filter((item): item is Exclude<WhiteboardItem, WhiteboardText> => item.kind !== 'text')
+  const text = items.filter((item): item is WhiteboardText => item.kind === 'text')
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${BOARD_WIDTH * 2}" height="${BOARD_HEIGHT * 2}" viewBox="0 0 ${BOARD_WIDTH} ${BOARD_HEIGHT}">
+  <defs>
+    <pattern id="whiteboard-grid" width="${GRID_SIZE}" height="${GRID_SIZE}" patternUnits="userSpaceOnUse">
+      <path d="M ${GRID_SIZE} 0 L 0 0 0 ${GRID_SIZE}" fill="none" stroke="#e0e7ef" stroke-width="1" />
+    </pattern>
+    <pattern id="whiteboard-grid-large" width="${GRID_SIZE * 4}" height="${GRID_SIZE * 4}" patternUnits="userSpaceOnUse">
+      <rect width="${GRID_SIZE * 4}" height="${GRID_SIZE * 4}" fill="url(#whiteboard-grid)" />
+      <path d="M ${GRID_SIZE * 4} 0 L 0 0 0 ${GRID_SIZE * 4}" fill="none" stroke="#c9d4e1" stroke-width="1.4" />
+    </pattern>
+  </defs>
+  <rect width="${BOARD_WIDTH}" height="${BOARD_HEIGHT}" rx="18" fill="#f7f8fa" />
+  <rect width="${BOARD_WIDTH}" height="${BOARD_HEIGHT}" rx="18" fill="url(#whiteboard-grid-large)" />
+  <g>${nonText.map(svgNonTextItem).join('')}</g>
+  <g>${text.map(svgTextItem).join('')}</g>
+</svg>`
+}
+
+export async function whiteboardItemsToPngBlob(items: readonly WhiteboardItem[]): Promise<Blob> {
+  const svgSource = whiteboardItemsToSvgSource(items)
+  const url = URL.createObjectURL(new Blob([svgSource], { type: 'image/svg+xml;charset=utf-8' }))
+  try {
+    const image = new Image()
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve()
+      image.onerror = () => reject(new Error('Не удалось отрисовать доску в PNG.'))
+      image.src = url
+    })
+    const canvas = document.createElement('canvas')
+    canvas.width = BOARD_WIDTH * 2
+    canvas.height = BOARD_HEIGHT * 2
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('Canvas недоступен.')
+    context.fillStyle = '#f7f8fa'
+    context.fillRect(0, 0, canvas.width, canvas.height)
+    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+    return canvasToBlob(canvas)
+  } finally {
+    URL.revokeObjectURL(url)
+  }
+}
+
 function renderNonTextItem(item: Exclude<WhiteboardItem, WhiteboardText>): React.JSX.Element {
   if (item.kind === 'stroke') {
     return (
@@ -408,11 +497,15 @@ function renderTextItem(item: WhiteboardText): React.JSX.Element {
 }
 
 export function MeetingWhiteboard({
+  initialItems = [],
   onClose,
   onError,
+  onItemsChange,
 }: {
+  initialItems?: WhiteboardItem[]
   onClose: () => void
   onError: (message: string) => void
+  onItemsChange?: (items: WhiteboardItem[]) => void
 }): React.JSX.Element {
   const room = useRoomContext()
   const svgRef = useRef<SVGSVGElement | null>(null)
@@ -421,12 +514,16 @@ export function MeetingWhiteboard({
   const erasingRef = useRef(false)
   const panningRef = useRef<{ clientX: number; clientY: number; viewBox: ViewBox } | null>(null)
   const movingRef = useRef<MoveState | null>(null)
-  const [items, setItems] = useState<WhiteboardItem[]>([])
+  const [items, setItems] = useState<WhiteboardItem[]>(() => initialItems)
   const [tool, setTool] = useState<WhiteboardTool>('pen')
   const [color, setColor] = useState('#2563eb')
   const [viewBox, setViewBox] = useState<ViewBox>(INITIAL_VIEW_BOX)
   const [exporting, setExporting] = useState(false)
   const [editingText, setEditingText] = useState<TextEditorState | null>(null)
+
+  useEffect(() => {
+    onItemsChange?.(items)
+  }, [items, onItemsChange])
   const zoomPercent = Math.round((BOARD_WIDTH / viewBox.width) * 100)
 
   const applyItem = useCallback((item: WhiteboardItem): void => {

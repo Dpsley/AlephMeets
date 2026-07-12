@@ -43,6 +43,7 @@ import {
   messageInputSchema,
 } from './schemas.js'
 import { camelizeRow, camelizeRows } from './serializers.js'
+import { createAlephaConspect } from './alepha.js'
 import {
   attachmentStorageName,
   buildStorageScope,
@@ -59,6 +60,7 @@ import {
   syncAdContactsForUser,
   verifySms,
 } from './idp.js'
+import { sendMeetingMaterialsEmail, type MeetingMaterialLink } from './mail.js'
 
 interface IdParams {
   id: string
@@ -469,8 +471,14 @@ function publicAttachment(row: Record<string, unknown>): Record<string, unknown>
   const attachment = camelizeRow(row)
   const storageUrl = typeof attachment.storageUrl === 'string' ? attachment.storageUrl : ''
   const storageName = typeof attachment.storageName === 'string' ? attachment.storageName : ''
+  const byteSize = Number(attachment.byteSize)
+  const durationMs = attachment.durationMs === null || attachment.durationMs === undefined
+    ? null
+    : Number(attachment.durationMs)
   return {
     ...attachment,
+    byteSize: Number.isFinite(byteSize) ? byteSize : 0,
+    durationMs: Number.isFinite(durationMs) ? durationMs : null,
     url: storageUrl || `${config.apiUrl}/uploads/${storageName}`,
   }
 }
@@ -616,6 +624,61 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     ])
     for (const userId of userIds) {
       io.to(`user:${userId}`).emit('conversation:updated', { conversationId })
+    }
+  }
+
+  const sendCallMaterialsEmail = async (
+    conversationId: string,
+    messageId: string,
+    meeting: { id: string; title: string; room_name: string },
+  ): Promise<void> => {
+    const recipientsResult = await pool.query<{ email: string }>(
+      `SELECT DISTINCT lower(email) AS email FROM (
+         SELECT u.email
+         FROM conversation_members cm
+         JOIN users u ON u.id = cm.user_id
+         WHERE cm.conversation_id = $1 AND u.email IS NOT NULL
+         UNION
+         SELECT host.email
+         FROM meetings m
+         JOIN users host ON host.id = m.host_id
+         WHERE m.id = $2 AND host.email IS NOT NULL
+         UNION
+         SELECT COALESCE(attendee_user.email, attendee.email) AS email
+         FROM meeting_attendees attendee
+         LEFT JOIN users attendee_user ON attendee_user.id = attendee.user_id
+         WHERE attendee.meeting_id = $2
+       ) recipients
+       WHERE email IS NOT NULL AND email <> ''`,
+      [conversationId, meeting.id],
+    )
+    const attachments = await pool.query(
+      `SELECT original_name, mime_type, storage_url, storage_name
+       FROM attachments
+       WHERE message_id = $1
+       ORDER BY created_at`,
+      [messageId],
+    )
+    const materials: MeetingMaterialLink[] = attachments.rows
+      .map((row) => {
+        const attachment = publicAttachment(row as Record<string, unknown>)
+        return {
+          name: String(attachment.originalName ?? attachment.storageName ?? 'material'),
+          url: String(attachment.url ?? ''),
+          mimeType: typeof attachment.mimeType === 'string' ? attachment.mimeType : null,
+        }
+      })
+      .filter((material) => material.url)
+
+    try {
+      await sendMeetingMaterialsEmail({
+        recipients: recipientsResult.rows.map((row) => row.email),
+        meetingTitle: meeting.title,
+        meetingRoomName: meeting.room_name,
+        materials,
+      })
+    } catch (error) {
+      app.log.error({ err: error, meetingId: meeting.id, messageId }, 'Failed to send meeting materials email')
     }
   }
 
@@ -1535,12 +1598,22 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       `SELECT 1 FROM conversations conversation
        JOIN conversation_members caller
          ON caller.conversation_id = conversation.id AND caller.user_id = $2
-       JOIN conversation_members recipient
-         ON recipient.conversation_id = conversation.id AND recipient.user_id <> $2
        JOIN meetings meeting ON meeting.id = $3 AND meeting.host_id = $2
-       JOIN meeting_attendees attendee
-         ON attendee.meeting_id = meeting.id AND attendee.user_id = recipient.user_id
-       WHERE conversation.id = $1 AND conversation.kind = 'direct'`,
+       WHERE conversation.id = $1
+         AND EXISTS (
+           SELECT 1 FROM conversation_members other
+           WHERE other.conversation_id = conversation.id AND other.user_id <> $2
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM meeting_attendees attendee
+           WHERE attendee.meeting_id = meeting.id
+             AND attendee.user_id IS NOT NULL
+             AND attendee.user_id <> $2
+             AND NOT EXISTS (
+               SELECT 1 FROM conversation_members member
+               WHERE member.conversation_id = conversation.id AND member.user_id = attendee.user_id
+             )
+         )`,
       [request.params.id, currentUser.id, input.meetingId],
     )
     if (!allowed.rowCount) return reply.code(403).send({ error: 'call_log_not_allowed' })
@@ -1729,6 +1802,238 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
          WHERE id = $3 AND conversation_id = $4
          RETURNING *`,
         [storage.storageUrl, originalName, request.params.messageId, request.params.id],
+      )
+      const attachments = await client.query(
+        'SELECT * FROM attachments WHERE message_id=$1 ORDER BY created_at',
+        [request.params.messageId],
+      )
+      await client.query('UPDATE conversations SET updated_at = now() WHERE id = $1', [request.params.id])
+      return {
+        ...camelizeRow(updated.rows[0] as Record<string, unknown>),
+        deliveryStatus: 'delivered',
+        attachments: attachments.rows.map((row) => publicAttachment(row as Record<string, unknown>)),
+      }
+    })
+    await emitToConversationMembers(request.params.id, 'message:updated', message)
+    return reply.code(201).send({ message })
+  })
+
+  app.post<{ Params: { id: string; messageId: string } }>('/api/conversations/:id/calls/:messageId/analysis', async (request, reply) => {
+    const input = request.body as { transcriptText?: unknown; name?: unknown } | null
+    const transcriptText = typeof input?.transcriptText === 'string' ? input.transcriptText.trim() : ''
+    if (!transcriptText) return reply.code(400).send({ error: 'transcript_required', message: 'Transcript is required.' })
+    const call = await pool.query(
+      `SELECT message.id, meeting.id AS meeting_id, meeting.starts_at, meeting.title, meeting.room_name
+       FROM messages message
+       JOIN meetings meeting ON meeting.id = (message.metadata->>'meetingId')::uuid
+       WHERE message.id = $2 AND message.conversation_id = $1
+         AND message.kind = 'system' AND message.metadata->>'type' = 'call'
+         AND EXISTS (
+           SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = message.conversation_id AND member.user_id = $3
+         )`,
+      [request.params.id, request.params.messageId, currentUser.id],
+    )
+    if (!call.rowCount) return reply.code(404).send({ error: 'call_log_not_found' })
+    const callRow = call.rows[0] as {
+      meeting_id: string
+      starts_at: Date | string
+      title: string
+      room_name: string
+    }
+
+    const pendingMessage = await inTransaction(async (client) => {
+      const updated = await client.query(
+        `UPDATE messages SET
+           metadata = (metadata || jsonb_build_object('analysisPending', true)) - 'analysisError',
+           edited_at = now()
+         WHERE id = $1 AND conversation_id = $2
+         RETURNING *`,
+        [request.params.messageId, request.params.id],
+      )
+      const attachments = await client.query(
+        'SELECT * FROM attachments WHERE message_id=$1 ORDER BY created_at',
+        [request.params.messageId],
+      )
+      return {
+        ...camelizeRow(updated.rows[0] as Record<string, unknown>),
+        deliveryStatus: 'delivered',
+        attachments: attachments.rows.map((row) => publicAttachment(row as Record<string, unknown>)),
+      }
+    })
+    await emitToConversationMembers(request.params.id, 'message:updated', pendingMessage)
+
+    const markAnalysisFailed = async (error: unknown): Promise<void> => {
+      const errorMessage = error instanceof Error ? error.message : 'Alepha conspect failed'
+      const failedMessage = await inTransaction(async (client) => {
+        const updated = await client.query(
+          `UPDATE messages SET
+             metadata = metadata || jsonb_build_object(
+               'analysisPending', false,
+               'analysisError', $1::text
+             ),
+             edited_at = now()
+           WHERE id = $2 AND conversation_id = $3
+           RETURNING *`,
+          [errorMessage, request.params.messageId, request.params.id],
+        )
+        const attachments = await client.query(
+          'SELECT * FROM attachments WHERE message_id=$1 ORDER BY created_at',
+          [request.params.messageId],
+        )
+        return {
+          ...camelizeRow(updated.rows[0] as Record<string, unknown>),
+          deliveryStatus: 'delivered',
+          attachments: attachments.rows.map((row) => publicAttachment(row as Record<string, unknown>)),
+        }
+      })
+      await emitToConversationMembers(request.params.id, 'message:updated', failedMessage)
+    }
+
+    const runAnalysis = async (): Promise<void> => {
+      try {
+        const conspect = await createAlephaConspect({
+          chatId: callRow.meeting_id,
+          transcriptText,
+        })
+        const originalName = typeof input?.name === 'string' && input.name.trim()
+      ? input.name.trim()
+      : 'analysis.txt'
+    const body = Buffer.from(`${conspect.text.trim()}\n`, 'utf8')
+    const storage = await uploadStreamToS3({
+      stream: Readable.from(body),
+      originalName,
+      mimeType: 'text/plain; charset=utf-8',
+      scopePath: buildStorageScope('meetings', callRow.meeting_id, 'analysis'),
+      storageName: recordingStorageName(originalName, callRow.starts_at),
+    })
+    const callMessage = await inTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO attachments (
+          message_id, uploaded_by, original_name, storage_name, mime_type, byte_size, duration_ms,
+          storage_provider, storage_bucket, storage_key, storage_url
+        ) VALUES ($1,$2,$3,$4,$5,$6,NULL,$7,$8,$9,$10) RETURNING *`,
+        [
+          request.params.messageId,
+          currentUser.id,
+          originalName,
+          storage.storageName,
+          'text/plain; charset=utf-8',
+          storage.byteSize,
+          storage.storageProvider,
+          storage.storageBucket,
+          storage.storageKey,
+          storage.storageUrl,
+        ],
+      )
+      const updated = await client.query(
+        `UPDATE messages SET
+           metadata = (
+             metadata || jsonb_build_object(
+               'analysisUrl',$1::text,
+               'analysisName',$2::text,
+               'analysisPending', false,
+               'analysisSummary', $5::text,
+               'alephaDialogId', $6::text
+             )
+           ) - 'analysisError',
+           edited_at = now()
+         WHERE id = $3 AND conversation_id = $4
+         RETURNING *`,
+        [
+          storage.storageUrl,
+          originalName,
+          request.params.messageId,
+          request.params.id,
+          conspect.text,
+          conspect.dialogId,
+        ],
+      )
+      const attachments = await client.query(
+        'SELECT * FROM attachments WHERE message_id=$1 ORDER BY created_at',
+        [request.params.messageId],
+      )
+      await client.query('UPDATE conversations SET updated_at = now() WHERE id = $1', [request.params.id])
+      return {
+        ...camelizeRow(updated.rows[0] as Record<string, unknown>),
+        deliveryStatus: 'delivered',
+        attachments: attachments.rows.map((row) => publicAttachment(row as Record<string, unknown>)),
+      }
+    })
+    await emitToConversationMembers(request.params.id, 'message:updated', callMessage)
+    await emitConversationUpdated(request.params.id)
+    await sendCallMaterialsEmail(request.params.id, request.params.messageId, {
+      id: callRow.meeting_id,
+      title: callRow.title,
+      room_name: callRow.room_name,
+    })
+      } catch (error) {
+        app.log.error({ err: error, meetingId: callRow.meeting_id }, 'Failed to create meeting analysis')
+        await markAnalysisFailed(error).catch((failure) => {
+          app.log.error({ err: failure, meetingId: callRow.meeting_id }, 'Failed to mark meeting analysis as failed')
+        })
+      }
+    }
+
+    void runAnalysis()
+    return reply.code(202).send({ message: pendingMessage })
+  })
+
+  app.post<{ Params: { id: string; messageId: string } }>('/api/conversations/:id/calls/:messageId/materials', async (request, reply) => {
+    const data = await request.file()
+    if (!data) return reply.code(400).send({ error: 'file_required' })
+    const query = request.query as { kind?: string }
+    const kind = query.kind === 'whiteboard' ? 'whiteboard' : 'meeting-chat'
+    const call = await pool.query(
+      `SELECT message.id, meeting.id AS meeting_id
+       FROM messages message
+       JOIN meetings meeting ON meeting.id = (message.metadata->>'meetingId')::uuid
+       WHERE message.id = $2 AND message.conversation_id = $1
+         AND message.kind = 'system' AND message.metadata->>'type' = 'call'
+         AND EXISTS (
+           SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = message.conversation_id AND member.user_id = $3
+         )`,
+      [request.params.id, request.params.messageId, currentUser.id],
+    )
+    if (!call.rowCount) {
+      data.file.resume()
+      return reply.code(404).send({ error: 'call_log_not_found' })
+    }
+    const callRow = call.rows[0] as { meeting_id: string }
+    const storage = await uploadStreamToS3({
+      stream: data.file,
+      originalName: data.filename,
+      mimeType: data.mimetype || 'application/octet-stream',
+      scopePath: buildStorageScope('meetings', callRow.meeting_id, kind === 'whiteboard' ? 'whiteboards' : 'materials'),
+      storageName: attachmentStorageName(data.filename),
+    })
+    const message = await inTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO attachments (
+          message_id, uploaded_by, original_name, storage_name, mime_type, byte_size, duration_ms,
+          storage_provider, storage_bucket, storage_key, storage_url
+        ) VALUES ($1,$2,$3,$4,$5,$6,NULL,$7,$8,$9,$10) RETURNING *`,
+        [
+          request.params.messageId,
+          currentUser.id,
+          data.filename,
+          storage.storageName,
+          data.mimetype || 'application/octet-stream',
+          storage.byteSize,
+          storage.storageProvider,
+          storage.storageBucket,
+          storage.storageKey,
+          storage.storageUrl,
+        ],
+      )
+      const updated = await client.query(
+        `UPDATE messages SET
+           metadata = metadata || jsonb_build_object('materialsUpdatedAt', now()),
+           edited_at = now()
+         WHERE id = $1 AND conversation_id = $2
+         RETURNING *`,
+        [request.params.messageId, request.params.id],
       )
       const attachments = await client.query(
         'SELECT * FROM attachments WHERE message_id=$1 ORDER BY created_at',

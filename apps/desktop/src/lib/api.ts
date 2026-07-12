@@ -181,6 +181,20 @@ export const api = {
       { method: 'POST', body: form },
     )
   },
+  createCallAnalysis: (conversationId: string, messageId: string, transcriptText: string, name: string) =>
+    request<{ message: Message }>(
+      `/api/conversations/${conversationId}/calls/${messageId}/analysis`,
+      { method: 'POST', body: JSON.stringify({ transcriptText, name }) },
+    ),
+  uploadCallMaterial: (conversationId: string, messageId: string, file: Blob, name: string, kind: 'meeting-chat' | 'whiteboard' = 'meeting-chat') => {
+    const form = new FormData()
+    form.append('file', file, name)
+    const params = new URLSearchParams({ kind })
+    return request<{ message: Message }>(
+      `/api/conversations/${conversationId}/calls/${messageId}/materials?${params}`,
+      { method: 'POST', body: form },
+    )
+  },
   upload: (conversationId: string, file: Blob, name: string, kind = 'file', durationMs?: number) => {
     const form = new FormData()
     form.append('file', file, name)

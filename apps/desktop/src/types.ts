@@ -59,6 +59,21 @@ export interface CallMessageMetadata {
   recordingName?: string
   transcriptUrl?: string
   transcriptName?: string
+  analysisUrl?: string
+  analysisName?: string
+  analysisPending?: boolean
+  analysisError?: string
+  analysisSummary?: string
+  alephaDialogId?: string
+}
+
+export interface MeetingAnalysisMetadata {
+  type: 'meetingAnalysis'
+  meetingId: string
+  callMessageId: string
+  analysisUrl?: string
+  analysisName?: string
+  alephaDialogId?: string
 }
 
 export interface Attachment {
@@ -75,15 +90,15 @@ export interface Attachment {
 export interface Message {
   id: string
   conversationId: string
-  senderId: string
-  senderName: string
+  senderId: string | null
+  senderName: string | null
   senderAvatarUrl: string | null
   kind: 'text' | 'file' | 'audio' | 'system'
   body?: string
   createdAt: string
   editedAt?: string | null
   deliveryStatus: 'delivered' | 'read'
-  metadata: CallMessageMetadata | Record<string, unknown>
+  metadata: CallMessageMetadata | MeetingAnalysisMetadata | Record<string, unknown>
   attachments: Attachment[]
 }
 

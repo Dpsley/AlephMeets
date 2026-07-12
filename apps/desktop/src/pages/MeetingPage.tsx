@@ -14,13 +14,16 @@ import {
 import { RoomEvent, Track, type LocalTrackPublication, type RemoteParticipant, type RemoteTrack, type RemoteTrackPublication } from 'livekit-client'
 import {
   ArrowLeft,
+  Bot,
   Camera,
   CameraOff,
+  Download,
   FileText,
   Info,
   MessageSquare,
   Mic,
   MicOff,
+  Paperclip,
   PencilRuler,
   PhoneOff,
   Send,
@@ -31,7 +34,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
-import type { Contact, DirectCallContext, Meeting } from '../types'
+import type { Attachment, Contact, DirectCallContext, Meeting } from '../types'
 import { api } from '../lib/api'
 import { plainTextFromRichText } from '../lib/format'
 import { getMeetingWindowContext } from '../lib/meeting-window'
@@ -40,7 +43,7 @@ import { useApp } from '../state/AppContext'
 import { BrandMark } from '../components/BrandMark'
 import { Avatar, Modal } from '../components/ui'
 import { WindowControls } from '../components/WindowControls'
-import { MeetingWhiteboard } from '../components/MeetingWhiteboard'
+import { MeetingWhiteboard, whiteboardItemsToPngBlob, type WhiteboardItem } from '../components/MeetingWhiteboard'
 
 type DeviceState = 'checking' | 'available' | 'unavailable'
 type TranscriptionStatus = 'idle' | 'connecting' | 'listening' | 'error'
@@ -52,6 +55,15 @@ type TranscriptEntry = {
   text: string
   receivedAt: number
   segmentId?: number
+}
+
+type MeetingChatAttachment = Pick<Attachment, 'originalName' | 'mimeType' | 'url'> & {
+  byteSize: number
+}
+
+type MeetingChatAttachmentPayload = {
+  type: 'attachment'
+  attachment: MeetingChatAttachment
 }
 
 type TranscriptionStats = {
@@ -96,6 +108,16 @@ function transcriptFilename(meeting: Meeting): string {
     .trim()
     .slice(0, 80)
   return `transcript-${safeTitle || meeting.id}-${stamp}.txt`
+}
+
+function analysisFilename(meeting: Meeting): string {
+  const stamp = new Date().toISOString().replace('T', '_').replace(/[:.]/g, '-').replace(/Z$/, '')
+  const safeTitle = meeting.title
+    .replace(/[\\/:*?"<>|\x00-\x1F]+/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80)
+  return `analysis-${safeTitle || meeting.id}-${stamp}.txt`
 }
 
 function buildTranscriptText(meeting: Meeting, entries: TranscriptEntry[]): string {
@@ -174,9 +196,135 @@ function InitialMediaPublisher({
   return null
 }
 
-function MeetingChat({ onClose }: { onClose: () => void }): React.JSX.Element {
+function meetingChatAttachmentPayload(value: string): MeetingChatAttachmentPayload | null {
+  try {
+    const parsed = JSON.parse(value) as Partial<MeetingChatAttachmentPayload>
+    const byteSize = Number(parsed.attachment?.byteSize)
+    if (
+      parsed.type === 'attachment'
+      && parsed.attachment
+      && typeof parsed.attachment.originalName === 'string'
+      && typeof parsed.attachment.mimeType === 'string'
+      && Number.isFinite(byteSize)
+      && typeof parsed.attachment.url === 'string'
+    ) {
+      return {
+        type: 'attachment',
+        attachment: {
+          originalName: parsed.attachment.originalName,
+          mimeType: parsed.attachment.mimeType || 'application/octet-stream',
+          byteSize,
+          url: parsed.attachment.url,
+        },
+      }
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+function meetingChatAttachmentSize(bytes: number | string): string {
+  const normalized = Number(bytes)
+  const size = Number.isFinite(normalized) ? normalized : 0
+  if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(size >= 10 * 1024 * 1024 ? 0 : 1)} МБ`
+  return `${Math.max(1, Math.round(size / 1024))} КБ`
+}
+
+function renderMeetingChatAttachmentPreview(attachment: MeetingChatAttachment): React.JSX.Element {
+  if (!attachment.url) {
+    return (
+      <div className="attachment-preview-empty">
+        <FileText size={34} />
+        <strong>{attachment.originalName}</strong>
+        <small>Файл еще не готов к просмотру.</small>
+      </div>
+    )
+  }
+  if (attachment.mimeType.startsWith('image/')) {
+    return <img className="attachment-preview-image" src={attachment.url} alt={attachment.originalName} />
+  }
+  if (attachment.mimeType.startsWith('audio/')) {
+    return <audio className="attachment-preview-media" controls src={attachment.url} />
+  }
+  if (attachment.mimeType.startsWith('video/')) {
+    return <video className="attachment-preview-video" controls src={attachment.url} />
+  }
+  if (attachment.mimeType === 'application/pdf' || attachment.mimeType.startsWith('text/')) {
+    return <iframe className="attachment-preview-frame" title={attachment.originalName} src={attachment.url} />
+  }
+  return (
+    <div className="attachment-preview-empty">
+      <FileText size={34} />
+      <strong>{attachment.originalName}</strong>
+      <small>Для этого типа файла доступно только скачивание.</small>
+    </div>
+  )
+}
+
+function renderMeetingChatAttachmentInline(
+  attachment: MeetingChatAttachment,
+  onPreview: () => void,
+  onOpenExternal: () => void,
+): React.JSX.Element {
+  if (attachment.mimeType.startsWith('image/') && attachment.url) {
+    return (
+      <button type="button" className="meeting-chat-attachment meeting-chat-attachment-image" onClick={onPreview}>
+        <img className="meeting-chat-inline-image" src={attachment.url} alt={attachment.originalName} loading="lazy" />
+        <div className="meeting-chat-attachment-caption">
+          <b>{attachment.originalName}</b>
+          <small>{meetingChatAttachmentSize(attachment.byteSize)}</small>
+        </div>
+      </button>
+    )
+  }
+  if (attachment.mimeType.startsWith('audio/') && attachment.url) {
+    return (
+      <div className="meeting-chat-attachment meeting-chat-attachment-media">
+        <audio controls preload="metadata" src={attachment.url} />
+        <div className="meeting-chat-attachment-caption">
+          <b>{attachment.originalName}</b>
+          <small>{meetingChatAttachmentSize(attachment.byteSize)}</small>
+        </div>
+      </div>
+    )
+  }
+  if (attachment.mimeType.startsWith('video/') && attachment.url) {
+    return (
+      <div className="meeting-chat-attachment meeting-chat-attachment-media">
+        <video controls preload="metadata" src={attachment.url} />
+        <div className="meeting-chat-attachment-caption">
+          <b>{attachment.originalName}</b>
+          <small>{meetingChatAttachmentSize(attachment.byteSize)}</small>
+        </div>
+      </div>
+    )
+  }
+  return (
+    <button type="button" className="meeting-chat-attachment" onClick={onOpenExternal}>
+      <span><FileText size={18} /></span>
+      <div>
+        <b>{attachment.originalName}</b>
+        <small>{meetingChatAttachmentSize(attachment.byteSize)}</small>
+      </div>
+    </button>
+  )
+}
+
+function MeetingChat({
+  callContext,
+  onClose,
+  onError,
+}: {
+  callContext?: DirectCallContext
+  onClose: () => void
+  onError: (message: string) => void
+}): React.JSX.Element {
   const { chatMessages, send, isSending } = useChat()
   const [draft, setDraft] = useState('')
+  const [uploading, setUploading] = useState(false)
+  const [previewAttachment, setPreviewAttachment] = useState<MeetingChatAttachment | null>(null)
+  const fileRef = useRef<HTMLInputElement | null>(null)
 
   const submit = async (event: React.FormEvent): Promise<void> => {
     event.preventDefault()
@@ -186,23 +334,115 @@ function MeetingChat({ onClose }: { onClose: () => void }): React.JSX.Element {
     setDraft('')
   }
 
+  const uploadAttachment = async (file: File): Promise<void> => {
+    if (!callContext || uploading) return
+    setUploading(true)
+    try {
+      const result = await api.uploadCallMaterial(callContext.conversationId, callContext.messageId, file, file.name, 'meeting-chat')
+      const attachment = result.message.attachments.at(-1)
+      await send(JSON.stringify({
+        type: 'attachment',
+        attachment: attachment
+          ? {
+              originalName: attachment.originalName,
+              mimeType: attachment.mimeType,
+              byteSize: Number(attachment.byteSize),
+              url: attachment.url,
+            }
+          : {
+              originalName: file.name,
+              mimeType: file.type || 'application/octet-stream',
+              byteSize: file.size,
+              url: '',
+            },
+      } satisfies MeetingChatAttachmentPayload))
+    } catch (reason) {
+      onError(reason instanceof Error ? reason.message : 'Не удалось отправить вложение встречи.')
+    } finally {
+      setUploading(false)
+      if (fileRef.current) fileRef.current.value = ''
+    }
+  }
+
+  const downloadAttachment = async (attachment: MeetingChatAttachment): Promise<void> => {
+    if (!attachment.url) return
+    try {
+      if (window.alephDesktop?.downloadFile) {
+        await window.alephDesktop.downloadFile(attachment.url, attachment.originalName)
+      } else {
+        window.open(attachment.url, '_blank', 'noopener')
+      }
+    } catch (reason) {
+      onError(reason instanceof Error ? reason.message : 'Не удалось скачать вложение.')
+    }
+  }
+
+  const openAttachmentExternal = (attachment: MeetingChatAttachment): void => {
+    if (attachment.url) window.open(attachment.url, '_blank', 'noopener')
+  }
+
   return (
-    <aside className="meeting-chat-panel">
-      <header><strong>Чат встречи</strong><button onClick={onClose} title="Закрыть чат"><X /></button></header>
-      <div className="meeting-chat-messages">
-        {chatMessages.map((message, index) => (
-          <div className="meeting-chat-message" key={message.id ?? index}>
-            <strong>{message.from?.name || 'Участник'}</strong>
-            <span>{message.message}</span>
+    <>
+      <aside className="meeting-chat-panel">
+        <header><strong>Чат встречи</strong><button onClick={onClose} title="Закрыть чат"><X /></button></header>
+        <div className="meeting-chat-messages">
+          {chatMessages.map((message, index) => {
+            const attachmentPayload = meetingChatAttachmentPayload(message.message)
+            return (
+              <div className="meeting-chat-message" key={message.id ?? index}>
+                <strong>{message.from?.name || 'Участник'}</strong>
+                {attachmentPayload ? (
+                  renderMeetingChatAttachmentInline(
+                    attachmentPayload.attachment,
+                    () => setPreviewAttachment(attachmentPayload.attachment),
+                    () => openAttachmentExternal(attachmentPayload.attachment),
+                  )
+                ) : (
+                  <span>{message.message}</span>
+                )}
+              </div>
+            )
+          })}
+          {!chatMessages.length && <p>Сообщений пока нет.</p>}
+        </div>
+        <form onSubmit={(event) => void submit(event)}>
+          <input
+            ref={fileRef}
+            hidden
+            type="file"
+            onChange={(event) => {
+              const file = event.target.files?.[0]
+              if (file) void uploadAttachment(file)
+            }}
+          />
+          {callContext && (
+            <button
+              type="button"
+              disabled={uploading}
+              title={uploading ? 'Вложение отправляется' : 'Прикрепить файл'}
+              onClick={() => fileRef.current?.click()}
+            >
+              <Paperclip />
+            </button>
+          )}
+          <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Сообщение" />
+          <button disabled={!draft.trim() || isSending} title="Отправить"><Send /></button>
+        </form>
+      </aside>
+      <Modal open={Boolean(previewAttachment)} onClose={() => setPreviewAttachment(null)} title={previewAttachment?.originalName ?? 'Вложение'} width={780}>
+        {previewAttachment && (
+          <div className="attachment-preview">
+            {renderMeetingChatAttachmentPreview(previewAttachment)}
+            <footer>
+              <span>{previewAttachment.mimeType || 'application/octet-stream'} - {meetingChatAttachmentSize(previewAttachment.byteSize)}</span>
+              <button className="button primary" type="button" disabled={!previewAttachment.url} onClick={() => void downloadAttachment(previewAttachment)}>
+                <Download size={16} />Скачать
+              </button>
+            </footer>
           </div>
-        ))}
-        {!chatMessages.length && <p>Сообщений пока нет.</p>}
-      </div>
-      <form onSubmit={(event) => void submit(event)}>
-        <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Сообщение" />
-        <button disabled={!draft.trim() || isSending} title="Отправить"><Send /></button>
-      </form>
-    </aside>
+        )}
+      </Modal>
+    </>
   )
 }
 
@@ -708,6 +948,10 @@ function MeetingConference({
   onReload,
   closeRequest,
   onTranscriptStopperChange,
+  aiAssistantActive,
+  onAiAssistantActiveChange,
+  whiteboardItems,
+  onWhiteboardItemsChange,
 }: {
   meeting: Meeting
   isOrganizer: boolean
@@ -717,6 +961,10 @@ function MeetingConference({
   onReload: () => Promise<void>
   closeRequest: number
   onTranscriptStopperChange: (stopper: (() => Promise<void>) | null) => void
+  aiAssistantActive: boolean
+  onAiAssistantActiveChange: (active: boolean) => void
+  whiteboardItems: WhiteboardItem[]
+  onWhiteboardItemsChange: (items: WhiteboardItem[]) => void
 }): React.JSX.Element {
   const room = useRoomContext()
   const participants = useParticipants()
@@ -791,26 +1039,33 @@ function MeetingConference({
       return
     }
     const entries = transcriptArchiveRef.current
-    if (!entries.length) return
     const text = buildTranscriptText(meeting, entries)
     const file = new Blob([text], { type: 'text/plain;charset=utf-8' })
-    transcriptUploadRef.current = api.uploadCallTranscript(
-      callContext.conversationId,
-      callContext.messageId,
-      file,
-      transcriptFilename(meeting),
-    ).then(() => undefined)
+    transcriptUploadRef.current = (async () => {
+      await api.uploadCallTranscript(
+        callContext.conversationId,
+        callContext.messageId,
+        file,
+        transcriptFilename(meeting),
+      )
+      await api.createCallAnalysis(
+        callContext.conversationId,
+        callContext.messageId,
+        text,
+        analysisFilename(meeting),
+      )
+    })()
     await transcriptUploadRef.current
   }, [callContext, isOrganizer, meeting])
 
   useEffect(() => {
-    if (!callContext || !isOrganizer) {
+    if (!callContext || !isOrganizer || !aiAssistantActive) {
       onTranscriptStopperChange(null)
       return
     }
     onTranscriptStopperChange(uploadTranscript)
     return () => onTranscriptStopperChange(null)
-  }, [callContext, isOrganizer, onTranscriptStopperChange, uploadTranscript])
+  }, [aiAssistantActive, callContext, isOrganizer, onTranscriptStopperChange, uploadTranscript])
 
   const appendTranscript = useCallback((entry: TranscriptEntry): void => {
     setTranscriptionError(null)
@@ -821,6 +1076,21 @@ function MeetingConference({
   const clearTranscript = (): void => {
     transcriptArchiveRef.current = []
     setTranscriptEntries([])
+  }
+
+  const inviteAiAssistant = (): void => {
+    if (aiAssistantActive) {
+      setTranscriptOpen(true)
+      return
+    }
+    clearTranscript()
+    setTranscriptionError(null)
+    setTranscriptionStatus('connecting')
+    setChatOpen(false)
+    setWhiteboardOpen(false)
+    setTranscriptOpen(true)
+    setTranscriptionRestart((value) => value + 1)
+    onAiAssistantActiveChange(true)
   }
 
   const toggleTranscript = (): void => {
@@ -907,7 +1177,7 @@ function MeetingConference({
   return (
     <>
       <CallTranscriber
-        active={transcriptOpen}
+        active={aiAssistantActive}
         restartKey={transcriptionRestart}
         localAudioTrack={localAudioTrack}
         onTranscript={appendTranscript}
@@ -918,7 +1188,12 @@ function MeetingConference({
       <div className={`aleph-conference ${chatOpen ? 'with-chat' : ''}`}>
         <div className="meeting-stage">
           {whiteboardOpen ? (
-            <MeetingWhiteboard onClose={() => setWhiteboardOpen(false)} onError={onError} />
+            <MeetingWhiteboard
+              initialItems={whiteboardItems}
+              onClose={() => setWhiteboardOpen(false)}
+              onError={onError}
+              onItemsChange={onWhiteboardItemsChange}
+            />
           ) : (
           <div className="meeting-participant-grid">
             {displayTracks.map((track) => {
@@ -953,6 +1228,15 @@ function MeetingConference({
                 <span>Вызов...</span>
               </div>
             ))}
+            {aiAssistantActive && (
+              <div className="meeting-pending-participant meeting-ai-assistant">
+                <div className="meeting-pending-pulse">
+                  <Avatar name="АИ" size="large" />
+                </div>
+                <strong>Алефа</strong>
+                <span>Пишет и расшифровывает</span>
+              </div>
+            )}
           </div>
           )}
           <div className="meeting-control-bar">
@@ -987,6 +1271,11 @@ function MeetingConference({
             <button onClick={toggleTranscript} className={transcriptOpen ? 'active' : ''}>
               <FileText /><span>Дешифровка</span>
             </button>
+            {isOrganizer && callContext && (
+              <button onClick={inviteAiAssistant} className={aiAssistantActive ? 'active' : ''}>
+                <Bot /><span>{aiAssistantActive ? 'Алефа пишет' : 'Позвать Алефу'}</span>
+              </button>
+            )}
             <button
               onClick={() => {
                 const nextOpen = !whiteboardOpen
@@ -1006,7 +1295,7 @@ function MeetingConference({
             </button>
           </div>
         </div>
-        {chatOpen && <MeetingChat onClose={() => setChatOpen(false)} />}
+        {chatOpen && <MeetingChat callContext={callContext} onClose={() => setChatOpen(false)} onError={onError} />}
         {transcriptOpen && (
           <MeetingTranscriptPanel
             entries={transcriptEntries}
@@ -1110,6 +1399,8 @@ export function MeetingPage(): React.JSX.Element {
   const callFinishedRef = useRef(false)
   const recordingStopRef = useRef<(() => Promise<void>) | null>(null)
   const transcriptStopRef = useRef<(() => Promise<void>) | null>(null)
+  const whiteboardUploadRef = useRef<Promise<void> | null>(null)
+  const whiteboardItemsRef = useRef<WhiteboardItem[]>([])
   const [audioEnabled, setAudioEnabled] = useState(true)
   const [videoEnabled, setVideoEnabled] = useState(true)
   const [audioState, setAudioState] = useState<DeviceState>('checking')
@@ -1127,6 +1418,13 @@ export function MeetingPage(): React.JSX.Element {
   const [error, setError] = useState<string | null>(null)
   const [cancelling, setCancelling] = useState(false)
   const [closeRequest, setCloseRequest] = useState(0)
+  const [aiAssistantActive, setAiAssistantActive] = useState(false)
+  const [whiteboardItems, setWhiteboardItems] = useState<WhiteboardItem[]>([])
+
+  const updateWhiteboardItems = useCallback((items: WhiteboardItem[]): void => {
+    whiteboardItemsRef.current = items
+    setWhiteboardItems(items)
+  }, [])
 
   useEffect(() => { void getMeetingWindowContext().then(setWindowContext) }, [])
 
@@ -1264,6 +1562,26 @@ export function MeetingPage(): React.JSX.Element {
     await stop()
   }, [])
 
+  const uploadWhiteboardSnapshot = useCallback(async (): Promise<void> => {
+    if (!callContext || whiteboardUploadRef.current) {
+      await whiteboardUploadRef.current
+      return
+    }
+    const items = whiteboardItemsRef.current
+    if (!items.length) return
+    whiteboardUploadRef.current = (async () => {
+      const blob = await whiteboardItemsToPngBlob(items)
+      await api.uploadCallMaterial(
+        callContext.conversationId,
+        callContext.messageId,
+        blob,
+        `whiteboard-${Date.now()}.png`,
+        'whiteboard',
+      )
+    })()
+    await whiteboardUploadRef.current
+  }, [callContext])
+
   const closeAfterDisconnect = useCallback(async (): Promise<void> => {
     let closeError: unknown
     try {
@@ -1277,6 +1595,11 @@ export function MeetingPage(): React.JSX.Element {
       closeError ??= reason
     }
     try {
+      await uploadWhiteboardSnapshot()
+    } catch (reason) {
+      closeError ??= reason
+    }
+    try {
       await stopCallTranscript()
     } catch (reason) {
       closeError ??= reason
@@ -1286,7 +1609,7 @@ export function MeetingPage(): React.JSX.Element {
       }
       closeMeetingWindow(navigate)
     }
-  }, [finishDirectCall, navigate, stopCallRecording, stopCallTranscript])
+  }, [finishDirectCall, navigate, stopCallRecording, stopCallTranscript, uploadWhiteboardSnapshot])
 
   const leavePrejoin = useCallback(async (): Promise<void> => {
     if (!meeting || cancelling) return
@@ -1340,7 +1663,7 @@ export function MeetingPage(): React.JSX.Element {
             videoTrack={connection.videoTrack}
             onDeviceError={handleDeviceError}
           />
-          {callContext && isOrganizer && <CallRecorder
+          {callContext && isOrganizer && aiAssistantActive && <CallRecorder
             callContext={callContext}
             localAudioTrack={connection.audioTrack}
             onStopperChange={setRecordingStopper}
@@ -1355,6 +1678,10 @@ export function MeetingPage(): React.JSX.Element {
             onReload={reloadMeetings}
             closeRequest={closeRequest}
             onTranscriptStopperChange={setTranscriptStopper}
+            aiAssistantActive={aiAssistantActive}
+            onAiAssistantActiveChange={setAiAssistantActive}
+            whiteboardItems={whiteboardItems}
+            onWhiteboardItemsChange={updateWhiteboardItems}
           />
           <RoomAudioRenderer />
         </LiveKitRoom>
