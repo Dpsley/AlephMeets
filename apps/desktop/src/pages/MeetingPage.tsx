@@ -44,6 +44,11 @@ import { BrandMark } from '../components/BrandMark'
 import { Avatar, Modal } from '../components/ui'
 import { WindowControls } from '../components/WindowControls'
 import { MeetingWhiteboard, whiteboardItemsToPngBlob, type WhiteboardItem } from '../components/MeetingWhiteboard'
+import {
+  ParticipantPicker,
+  participantUserIds,
+  type ParticipantSelection,
+} from '../components/ParticipantPicker'
 
 type DeviceState = 'checking' | 'available' | 'unavailable'
 type TranscriptionStatus = 'idle' | 'connecting' | 'listening' | 'error'
@@ -1000,7 +1005,7 @@ function MeetingConference({
   const [transcriptionRestart, setTranscriptionRestart] = useState(0)
   const [transcriptionStats, setTranscriptionStats] = useState<TranscriptionStats>(EMPTY_TRANSCRIPTION_STATS)
   const [contacts, setContacts] = useState<Contact[]>([])
-  const [selectedContactIds, setSelectedContactIds] = useState<string[]>([])
+  const [inviteParticipants, setInviteParticipants] = useState<ParticipantSelection[]>([])
   const [loadingContacts, setLoadingContacts] = useState(false)
   const [newHostId, setNewHostId] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -1117,6 +1122,7 @@ function MeetingConference({
 
   const openInvite = async (): Promise<void> => {
     setInviteOpen(true)
+    setInviteParticipants([])
     setLoadingContacts(true)
     try {
       const result = await api.contacts()
@@ -1137,12 +1143,13 @@ function MeetingConference({
   }
 
   const invite = async (): Promise<void> => {
+    const selectedContactIds = participantUserIds(inviteParticipants)
     if (!selectedContactIds.length || submitting) return
     setSubmitting(true)
     try {
       await api.inviteMeetingContacts(meeting.id, selectedContactIds)
       await onReload()
-      setSelectedContactIds([])
+      setInviteParticipants([])
       setInviteOpen(false)
     } catch (reason) {
       onError(reason instanceof Error ? reason.message : 'Не удалось пригласить участников.')
@@ -1334,26 +1341,29 @@ function MeetingConference({
         </div>
       </Modal>
 
-      <Modal open={inviteOpen} onClose={() => { if (!submitting) setInviteOpen(false) }} title="Пригласить во встречу" width={480}>
-        <div className="meeting-invite-list">
-          {loadingContacts && <div className="center-loader"><span className="spinner" /></div>}
-          {!loadingContacts && contacts.map((contact) => (
-            <label key={contact.id}>
-              <input
-                type="checkbox"
-                checked={selectedContactIds.includes(contact.id)}
-                onChange={(event) => setSelectedContactIds((current) => event.target.checked
-                  ? [...current, contact.id]
-                  : current.filter((id) => id !== contact.id))}
-              />
-              <Avatar name={contact.displayName} src={contact.avatarUrl} />
-              <span><strong>{contact.displayName}</strong>{(contact.email || contact.phone) && <small>{contact.email || contact.phone}</small>}</span>
-            </label>
-          ))}
-          {!loadingContacts && !contacts.length && <p className="soft-empty">Нет доступных контактов для приглашения.</p>}
+      <Modal
+        open={inviteOpen}
+        onClose={() => { if (!submitting) setInviteOpen(false) }}
+        title="Пригласить во встречу"
+        width={460}
+        className="participant-picker-modal meeting-invite-modal"
+      >
+        <div className="form-stack meeting-invite-list">
+          <ParticipantPicker
+            label="Участники"
+            contacts={contacts}
+            contactsLoading={loadingContacts}
+            contactOnly
+            placeholder="Начните вводить имя, телефон или email"
+            value={inviteParticipants}
+            onChange={setInviteParticipants}
+          />
+          {!loadingContacts && !contacts.length && (
+            <p className="meeting-invite-empty">Нет доступных контактов для приглашения.</p>
+          )}
           <footer className="modal-actions">
             <button className="button secondary" onClick={() => setInviteOpen(false)} disabled={submitting}>Отмена</button>
-            <button className="button primary" onClick={() => void invite()} disabled={!selectedContactIds.length || submitting}>Пригласить</button>
+            <button className="button primary" onClick={() => void invite()} disabled={!participantUserIds(inviteParticipants).length || submitting}>Пригласить</button>
           </footer>
         </div>
       </Modal>
