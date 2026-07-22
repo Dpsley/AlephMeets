@@ -344,9 +344,10 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
               void openMeetingWindow(call.meeting.id, {
                 meeting: call.meeting,
                 callContext: call.callContext,
+                autoJoin: true,
               }).then((opened) => {
                 if (!opened) navigate(`/meeting/${call.meeting.id}`, {
-                  state: { meeting: call.meeting, callContext: call.callContext },
+                  state: { meeting: call.meeting, callContext: call.callContext, autoJoin: true },
                 })
               })
             }}>Принять</button>

@@ -6,12 +6,11 @@ import {
   TrackToggle,
   TrackMutedIndicator,
   VideoTrack,
-  useChat,
   useParticipants,
   useRoomContext,
   useTracks,
 } from '@livekit/components-react'
-import { RoomEvent, Track, type LocalTrackPublication, type RemoteParticipant, type RemoteTrack, type RemoteTrackPublication } from 'livekit-client'
+import { RoomEvent, Track, RemoteTrackPublication, type LocalTrackPublication, type RemoteParticipant, type RemoteTrack } from 'livekit-client'
 import {
   ArrowLeft,
   Bot,
@@ -43,7 +42,14 @@ import { useApp } from '../state/AppContext'
 import { BrandMark } from '../components/BrandMark'
 import { Avatar, Modal } from '../components/ui'
 import { WindowControls } from '../components/WindowControls'
-import { MeetingWhiteboard, whiteboardItemsToPngBlob, type WhiteboardItem } from '../components/MeetingWhiteboard'
+import {
+  MeetingWhiteboard,
+  WHITEBOARD_TOPIC,
+  applyWhiteboardMessage,
+  readWhiteboardMessage,
+  whiteboardItemsToPngBlob,
+  type WhiteboardItem,
+} from '../components/MeetingWhiteboard'
 import {
   ParticipantPicker,
   participantUserIds,
@@ -71,6 +77,20 @@ type MeetingChatAttachmentPayload = {
   attachment: MeetingChatAttachment
 }
 
+type MeetingChatMessage = {
+  id: string
+  message: string
+  senderId: string
+  senderName: string
+  sentAt: number
+}
+
+type MeetingRealtimeMessage =
+  | { type: 'chat'; chat: MeetingChatMessage }
+  | { type: 'transcript:active'; active: boolean }
+  | { type: 'transcript:entry'; entry: TranscriptEntry }
+  | { type: 'whiteboard:visibility'; open: boolean }
+
 type TranscriptionStats = {
   audioLevel: number
   framesSent: number
@@ -82,6 +102,9 @@ type TranscriptionStats = {
 
 const TRANSCRIBE_WS_URL = import.meta.env.VITE_TRANSCRIBE_WS_URL || 'wss://api.alephtrade.com/agent01/audio_transcribe_ws'
 const TRANSCRIBE_SAMPLE_RATE = 16_000
+const MEETING_REALTIME_TOPIC = 'aleph:meeting-realtime'
+const meetingRealtimeEncoder = new TextEncoder()
+const meetingRealtimeDecoder = new TextDecoder()
 const EMPTY_TRANSCRIPTION_STATS: TranscriptionStats = {
   audioLevel: 0,
   framesSent: 0,
@@ -89,6 +112,38 @@ const EMPTY_TRANSCRIPTION_STATS: TranscriptionStats = {
   tracks: 0,
   sampleRate: TRANSCRIBE_SAMPLE_RATE,
   speakers: [],
+}
+
+function readMeetingRealtimeMessage(payload: Uint8Array): MeetingRealtimeMessage | null {
+  try {
+    const parsed = JSON.parse(meetingRealtimeDecoder.decode(payload)) as Record<string, unknown>
+    if (!parsed || typeof parsed !== 'object') return null
+    if (
+      parsed.type === 'chat'
+      && parsed.chat
+      && typeof parsed.chat === 'object'
+      && typeof (parsed.chat as Record<string, unknown>).message === 'string'
+    ) {
+      return parsed as unknown as MeetingRealtimeMessage
+    }
+    if (parsed.type === 'transcript:active' && typeof parsed.active === 'boolean') {
+      return parsed as unknown as MeetingRealtimeMessage
+    }
+    if (
+      parsed.type === 'transcript:entry'
+      && parsed.entry
+      && typeof parsed.entry === 'object'
+      && typeof (parsed.entry as Record<string, unknown>).text === 'string'
+    ) {
+      return parsed as unknown as MeetingRealtimeMessage
+    }
+    if (parsed.type === 'whiteboard:visibility' && typeof parsed.open === 'boolean') {
+      return parsed as unknown as MeetingRealtimeMessage
+    }
+    return null
+  } catch {
+    return null
+  }
 }
 
 function transcribeWebSocketUrl(sampleRate: number): string {
@@ -318,14 +373,19 @@ function renderMeetingChatAttachmentInline(
 
 function MeetingChat({
   callContext,
+  messages,
+  sendMessage,
+  isSending,
   onClose,
   onError,
 }: {
   callContext?: DirectCallContext
+  messages: MeetingChatMessage[]
+  sendMessage: (message: string) => Promise<void>
+  isSending: boolean
   onClose: () => void
   onError: (message: string) => void
 }): React.JSX.Element {
-  const { chatMessages, send, isSending } = useChat()
   const [draft, setDraft] = useState('')
   const [uploading, setUploading] = useState(false)
   const [previewAttachment, setPreviewAttachment] = useState<MeetingChatAttachment | null>(null)
@@ -335,7 +395,7 @@ function MeetingChat({
     event.preventDefault()
     const message = draft.trim()
     if (!message || isSending) return
-    await send(message)
+    await sendMessage(message)
     setDraft('')
   }
 
@@ -345,7 +405,7 @@ function MeetingChat({
     try {
       const result = await api.uploadCallMaterial(callContext.conversationId, callContext.messageId, file, file.name, 'meeting-chat')
       const attachment = result.message.attachments.at(-1)
-      await send(JSON.stringify({
+      await sendMessage(JSON.stringify({
         type: 'attachment',
         attachment: attachment
           ? {
@@ -391,11 +451,11 @@ function MeetingChat({
       <aside className="meeting-chat-panel">
         <header><strong>Чат встречи</strong><button onClick={onClose} title="Закрыть чат"><X /></button></header>
         <div className="meeting-chat-messages">
-          {chatMessages.map((message, index) => {
+          {messages.map((message, index) => {
             const attachmentPayload = meetingChatAttachmentPayload(message.message)
             return (
               <div className="meeting-chat-message" key={message.id ?? index}>
-                <strong>{message.from?.name || 'Участник'}</strong>
+                <strong>{message.senderName || 'Участник'}</strong>
                 {attachmentPayload ? (
                   renderMeetingChatAttachmentInline(
                     attachmentPayload.attachment,
@@ -408,7 +468,7 @@ function MeetingChat({
               </div>
             )
           })}
-          {!chatMessages.length && <p>Сообщений пока нет.</p>}
+          {!messages.length && <p>Сообщений пока нет.</p>}
         </div>
         <form onSubmit={(event) => void submit(event)}>
           <input
@@ -977,20 +1037,29 @@ function MeetingConference({
     { source: Track.Source.Camera, withPlaceholder: true },
     { source: Track.Source.ScreenShare, withPlaceholder: false },
   ], { onlySubscribed: false })
-  const displayTracks = participants.map((participant) => (
+  const screenShareTracks = tracks.filter((track) => track.source === Track.Source.ScreenShare)
+  const cameraTracks = participants.map((participant) => (
     tracks.find((track) => (
-      track.participant.identity === participant.identity
-      && track.source === Track.Source.ScreenShare
-    )) ?? tracks.find((track) => (
       track.participant.identity === participant.identity
       && track.source === Track.Source.Camera
     ))
   )).filter((track): track is NonNullable<typeof track> => Boolean(track))
+  const displayTracks = screenShareTracks.length > 0 ? screenShareTracks : cameraTracks
+
+  useEffect(() => {
+    screenShareTracks.forEach((track) => {
+      if (track.publication instanceof RemoteTrackPublication && !track.publication.isSubscribed) {
+        track.publication.setSubscribed(true)
+      }
+    })
+  }, [screenShareTracks])
+
   const candidates = participants.filter(
     (participant) => participant.identity !== room.localParticipant.identity,
   )
+  const attendees = meeting.attendees ?? []
   const connectedIds = new Set(participants.map((participant) => participant.identity))
-  const pendingAttendees = meeting.attendees.filter(
+  const pendingAttendees = attendees.filter(
     (attendee) => attendee.response === 'invited' && attendee.userId && !connectedIds.has(attendee.userId),
   )
   const [exitOpen, setExitOpen] = useState(false)
@@ -1013,8 +1082,20 @@ function MeetingConference({
     requestId: number
     sources: Array<{ id: string; name: string; thumbnail: string }>
   } | null>(null)
+  const [meetingChatMessages, setMeetingChatMessages] = useState<MeetingChatMessage[]>([])
+  const [meetingChatSending, setMeetingChatSending] = useState(false)
   const transcriptArchiveRef = useRef<TranscriptEntry[]>([])
   const transcriptUploadRef = useRef<Promise<void> | null>(null)
+  const meetingChatMessagesRef = useRef<MeetingChatMessage[]>([])
+  const sharedWhiteboardItemsRef = useRef<WhiteboardItem[]>(whiteboardItems)
+
+  useEffect(() => {
+    meetingChatMessagesRef.current = meetingChatMessages
+  }, [meetingChatMessages])
+
+  useEffect(() => {
+    sharedWhiteboardItemsRef.current = whiteboardItems
+  }, [whiteboardItems])
 
   useEffect(() => {
     if (!candidates.some((participant) => participant.identity === newHostId)) {
@@ -1037,6 +1118,20 @@ function MeetingConference({
     window.alephDesktop?.selectScreenShareSource(screenShareRequest.requestId, sourceId)
     setScreenShareRequest(null)
   }
+
+  const publishRealtime = useCallback(async (
+    message: MeetingRealtimeMessage,
+    destinationIdentities?: string[],
+  ): Promise<void> => {
+    await room.localParticipant.publishData(
+      meetingRealtimeEncoder.encode(JSON.stringify(message)),
+      {
+        reliable: true,
+        topic: MEETING_REALTIME_TOPIC,
+        destinationIdentities,
+      },
+    )
+  }, [room])
 
   const uploadTranscript = useCallback(async (): Promise<void> => {
     if (!callContext || !isOrganizer || transcriptUploadRef.current) {
@@ -1072,11 +1167,149 @@ function MeetingConference({
     return () => onTranscriptStopperChange(null)
   }, [aiAssistantActive, callContext, isOrganizer, onTranscriptStopperChange, uploadTranscript])
 
-  const appendTranscript = useCallback((entry: TranscriptEntry): void => {
+  const storeTranscriptEntry = useCallback((entry: TranscriptEntry): void => {
     setTranscriptionError(null)
-    transcriptArchiveRef.current = [...transcriptArchiveRef.current, entry]
-    setTranscriptEntries((current) => [...current.slice(-199), entry])
+    if (!transcriptArchiveRef.current.some((current) => current.id === entry.id)) {
+      transcriptArchiveRef.current = [...transcriptArchiveRef.current, entry]
+    }
+    setTranscriptEntries((current) => (
+      current.some((item) => item.id === entry.id) ? current : [...current.slice(-199), entry]
+    ))
   }, [])
+
+  const appendTranscript = useCallback((entry: TranscriptEntry): void => {
+    storeTranscriptEntry(entry)
+    void publishRealtime({ type: 'transcript:entry', entry }).catch((reason) => {
+      setTranscriptionError(reason instanceof Error ? reason.message : 'Не удалось передать расшифровку участникам.')
+    })
+  }, [publishRealtime, storeTranscriptEntry])
+
+  const appendMeetingChatMessage = useCallback((message: MeetingChatMessage): void => {
+    setMeetingChatMessages((current) => (
+      current.some((item) => item.id === message.id) ? current : [...current.slice(-199), message]
+    ))
+  }, [])
+
+  const sendMeetingChatMessage = useCallback(async (message: string): Promise<void> => {
+    if (meetingChatSending) return
+    setMeetingChatSending(true)
+    const chat: MeetingChatMessage = {
+      id: crypto.randomUUID(),
+      message,
+      senderId: room.localParticipant.identity,
+      senderName: room.localParticipant.name || room.localParticipant.identity,
+      sentAt: Date.now(),
+    }
+    try {
+      await publishRealtime({ type: 'chat', chat })
+      appendMeetingChatMessage(chat)
+    } finally {
+      setMeetingChatSending(false)
+    }
+  }, [appendMeetingChatMessage, meetingChatSending, publishRealtime, room])
+
+  const setSharedWhiteboardVisibility = useCallback((open: boolean): void => {
+    setWhiteboardOpen(open)
+    if (open) {
+      setChatOpen(false)
+      setTranscriptOpen(false)
+    }
+    void publishRealtime({ type: 'whiteboard:visibility', open }).catch((reason) => {
+      onError(reason instanceof Error ? reason.message : 'Не удалось синхронизировать доску.')
+    })
+  }, [onError, publishRealtime])
+
+  useEffect(() => {
+    const handleData = (
+      payload: Uint8Array,
+      participant?: RemoteParticipant,
+      _kind?: unknown,
+      topic?: string,
+    ): void => {
+      if (topic === WHITEBOARD_TOPIC) {
+        const message = readWhiteboardMessage(payload)
+        if (!message) return
+        const nextItems = applyWhiteboardMessage(sharedWhiteboardItemsRef.current, message)
+        sharedWhiteboardItemsRef.current = nextItems
+        onWhiteboardItemsChange(nextItems)
+        setWhiteboardOpen(true)
+        setChatOpen(false)
+        setTranscriptOpen(false)
+        return
+      }
+      if (topic !== MEETING_REALTIME_TOPIC) return
+      const message = readMeetingRealtimeMessage(payload)
+      if (!message) return
+      if (message.type === 'chat') {
+        appendMeetingChatMessage({
+          ...message.chat,
+          senderId: message.chat.senderId || participant?.identity || 'participant',
+          senderName: message.chat.senderName || participant?.name || participant?.identity || 'Участник',
+        })
+        return
+      }
+      if (message.type === 'transcript:active') {
+        onAiAssistantActiveChange(message.active)
+        setTranscriptionStatus(message.active ? 'listening' : 'idle')
+        if (message.active) {
+          setTranscriptOpen(true)
+          setChatOpen(false)
+          setWhiteboardOpen(false)
+        }
+        return
+      }
+      if (message.type === 'transcript:entry') {
+        storeTranscriptEntry(message.entry)
+        return
+      }
+      setWhiteboardOpen(message.open)
+      if (message.open) {
+        setChatOpen(false)
+        setTranscriptOpen(false)
+      }
+    }
+
+    const syncParticipant = (participant: RemoteParticipant): void => {
+      if (!isOrganizer) return
+      const destinations = [participant.identity]
+      const messages: MeetingRealtimeMessage[] = [
+        { type: 'transcript:active', active: aiAssistantActive },
+        { type: 'whiteboard:visibility', open: whiteboardOpen },
+        ...meetingChatMessagesRef.current.slice(-100).map((chat): MeetingRealtimeMessage => ({ type: 'chat', chat })),
+        ...transcriptArchiveRef.current.slice(-100).map((entry): MeetingRealtimeMessage => ({ type: 'transcript:entry', entry })),
+      ]
+      void (async () => {
+        for (const message of messages) await publishRealtime(message, destinations)
+        for (const item of sharedWhiteboardItemsRef.current) {
+          await room.localParticipant.publishData(
+            meetingRealtimeEncoder.encode(JSON.stringify({ type: 'whiteboard:add', item })),
+            { reliable: true, topic: WHITEBOARD_TOPIC, destinationIdentities: destinations },
+          )
+        }
+      })().catch((reason) => {
+        onError(reason instanceof Error ? reason.message : 'Не удалось синхронизировать состояние встречи.')
+      })
+    }
+
+    room.on(RoomEvent.DataReceived, handleData)
+    room.on(RoomEvent.ParticipantConnected, syncParticipant)
+    room.remoteParticipants.forEach(syncParticipant)
+    return () => {
+      room.off(RoomEvent.DataReceived, handleData)
+      room.off(RoomEvent.ParticipantConnected, syncParticipant)
+    }
+  }, [
+    aiAssistantActive,
+    appendMeetingChatMessage,
+    isOrganizer,
+    onAiAssistantActiveChange,
+    onError,
+    onWhiteboardItemsChange,
+    publishRealtime,
+    room,
+    storeTranscriptEntry,
+    whiteboardOpen,
+  ])
 
   const clearTranscript = (): void => {
     transcriptArchiveRef.current = []
@@ -1096,6 +1329,9 @@ function MeetingConference({
     setTranscriptOpen(true)
     setTranscriptionRestart((value) => value + 1)
     onAiAssistantActiveChange(true)
+    void publishRealtime({ type: 'transcript:active', active: true }).catch((reason) => {
+      setTranscriptionError(reason instanceof Error ? reason.message : 'Не удалось включить расшифровку для участников.')
+    })
   }
 
   const toggleTranscript = (): void => {
@@ -1128,7 +1364,7 @@ function MeetingConference({
       const result = await api.contacts()
       const unavailable = new Set([
         meeting.hostId,
-        ...meeting.attendees
+        ...attendees
           .filter((attendee) => attendee.response === 'invited' || attendee.response === 'accepted')
           .map((attendee) => attendee.userId)
           .filter(Boolean) as string[],
@@ -1184,7 +1420,7 @@ function MeetingConference({
   return (
     <>
       <CallTranscriber
-        active={aiAssistantActive}
+        active={aiAssistantActive && isOrganizer}
         restartKey={transcriptionRestart}
         localAudioTrack={localAudioTrack}
         onTranscript={appendTranscript}
@@ -1197,14 +1433,14 @@ function MeetingConference({
           {whiteboardOpen ? (
             <MeetingWhiteboard
               initialItems={whiteboardItems}
-              onClose={() => setWhiteboardOpen(false)}
+              onClose={() => setSharedWhiteboardVisibility(false)}
               onError={onError}
               onItemsChange={onWhiteboardItemsChange}
             />
           ) : (
-          <div className="meeting-participant-grid">
+          <div className={`meeting-participant-grid ${screenShareTracks.length ? 'screen-share-active' : ''}`}>
             {displayTracks.map((track) => {
-              const attendee = meeting.attendees.find((item) => item.userId === track.participant.identity)
+              const attendee = attendees.find((item) => item.userId === track.participant.identity)
               const displayName = track.participant.name || attendee?.displayName || meeting.hostDisplayName || track.participant.identity
               const avatarUrl = track.participant.identity === meeting.hostId
                 ? meeting.hostAvatarUrl
@@ -1286,11 +1522,7 @@ function MeetingConference({
             <button
               onClick={() => {
                 const nextOpen = !whiteboardOpen
-                setWhiteboardOpen(nextOpen)
-                if (nextOpen) {
-                  setChatOpen(false)
-                  setTranscriptOpen(false)
-                }
+                setSharedWhiteboardVisibility(nextOpen)
               }}
               className={whiteboardOpen ? 'active' : ''}
             >
@@ -1302,7 +1534,16 @@ function MeetingConference({
             </button>
           </div>
         </div>
-        {chatOpen && <MeetingChat callContext={callContext} onClose={() => setChatOpen(false)} onError={onError} />}
+        {chatOpen && (
+          <MeetingChat
+            callContext={callContext}
+            messages={meetingChatMessages}
+            sendMessage={sendMeetingChatMessage}
+            isSending={meetingChatSending}
+            onClose={() => setChatOpen(false)}
+            onError={onError}
+          />
+        )}
         {transcriptOpen && (
           <MeetingTranscriptPanel
             entries={transcriptEntries}
@@ -1398,10 +1639,11 @@ export function MeetingPage(): React.JSX.Element {
   const navigate = useNavigate()
   const location = useLocation()
   const { meetings, user, loading, reloadMeetings } = useApp()
-  const navigationState = location.state as { meeting?: Meeting; callContext?: DirectCallContext } | null
-  const [windowContext, setWindowContext] = useState<{ meeting?: Meeting; callContext?: DirectCallContext } | null>(null)
+  const navigationState = location.state as { meeting?: Meeting; callContext?: DirectCallContext; autoJoin?: boolean } | null
+  const [windowContext, setWindowContext] = useState<{ meeting?: Meeting; callContext?: DirectCallContext; autoJoin?: boolean } | null>(null)
   const meetingFromNavigation = navigationState?.meeting ?? windowContext?.meeting
   const callContext = navigationState?.callContext ?? windowContext?.callContext
+  const autoJoin = navigationState?.autoJoin ?? windowContext?.autoJoin ?? false
   const meeting = meetings.find((item) => item.id === meetingId) ?? meetingFromNavigation
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
@@ -1534,10 +1776,10 @@ export function MeetingPage(): React.JSX.Element {
 
   const isOrganizer = Boolean(meeting && user && meeting.hostId === user.id)
   useEffect(() => {
-    if (!isOrganizer || !mediaReady || joined || autoJoinStartedRef.current) return
+    if ((!isOrganizer && !autoJoin) || !mediaReady || joined || autoJoinStartedRef.current) return
     autoJoinStartedRef.current = true
     void join()
-  }, [isOrganizer, join, joined, mediaReady])
+  }, [autoJoin, isOrganizer, join, joined, mediaReady])
 
   const setRecordingStopper = useCallback((stopper: (() => Promise<void>) | null): void => {
     recordingStopRef.current = stopper

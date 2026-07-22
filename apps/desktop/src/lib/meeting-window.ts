@@ -3,6 +3,7 @@ import type { DirectCallContext, Meeting } from '../types'
 export interface MeetingWindowContext {
   meeting?: Meeting
   callContext?: DirectCallContext
+  autoJoin?: boolean
 }
 
 export async function openMeetingWindow(

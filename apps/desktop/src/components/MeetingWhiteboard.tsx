@@ -1,5 +1,4 @@
 import { useRoomContext } from '@livekit/components-react'
-import { RoomEvent, type RemoteParticipant } from 'livekit-client'
 import {
   ArrowRight,
   Circle,
@@ -79,7 +78,7 @@ type TextEditorState = {
   value: string
 }
 
-type WhiteboardMessage =
+export type WhiteboardMessage =
   | { type: 'whiteboard:add'; item: WhiteboardItem }
   | { type: 'whiteboard:remove'; itemId: string }
   | { type: 'whiteboard:clear' }
@@ -91,7 +90,7 @@ type ViewBox = {
   height: number
 }
 
-const WHITEBOARD_TOPIC = 'aleph:whiteboard'
+export const WHITEBOARD_TOPIC = 'aleph:whiteboard'
 const BOARD_WIDTH = 1000
 const BOARD_HEIGHT = 600
 const BOARD_ASPECT = BOARD_WIDTH / BOARD_HEIGHT
@@ -129,7 +128,7 @@ function author(room: ReturnType<typeof useRoomContext>): Pick<WhiteboardBase, '
   }
 }
 
-function readWhiteboardMessage(payload: Uint8Array): WhiteboardMessage | null {
+export function readWhiteboardMessage(payload: Uint8Array): WhiteboardMessage | null {
   try {
     const parsed = JSON.parse(decoder.decode(payload)) as unknown
     if (!parsed || typeof parsed !== 'object') return null
@@ -143,6 +142,21 @@ function readWhiteboardMessage(payload: Uint8Array): WhiteboardMessage | null {
   } catch {
     return null
   }
+}
+
+export function applyWhiteboardMessage(
+  items: readonly WhiteboardItem[],
+  message: WhiteboardMessage,
+): WhiteboardItem[] {
+  if (message.type === 'whiteboard:clear') return []
+  if (message.type === 'whiteboard:remove') {
+    return items.filter((item) => item.id !== message.itemId)
+  }
+  const index = items.findIndex((item) => item.id === message.item.id)
+  if (index === -1) return [...items, message.item]
+  const next = [...items]
+  next[index] = message.item
+  return next
 }
 
 function compactStroke(stroke: WhiteboardStroke): WhiteboardStroke {
@@ -524,6 +538,10 @@ export function MeetingWhiteboard({
   useEffect(() => {
     onItemsChange?.(items)
   }, [items, onItemsChange])
+
+  useEffect(() => {
+    setItems(initialItems)
+  }, [initialItems])
   const zoomPercent = Math.round((BOARD_WIDTH / viewBox.width) * 100)
 
   const applyItem = useCallback((item: WhiteboardItem): void => {
@@ -552,30 +570,6 @@ export function MeetingWhiteboard({
       onError(reason instanceof Error ? reason.message : 'Не удалось синхронизировать доску.')
     }
   }, [onError, room])
-
-  useEffect(() => {
-    const handleData = (
-      payload: Uint8Array,
-      _participant?: RemoteParticipant,
-      _kind?: unknown,
-      topic?: string,
-    ): void => {
-      if (topic !== WHITEBOARD_TOPIC) return
-      const message = readWhiteboardMessage(payload)
-      if (!message) return
-      if (message.type === 'whiteboard:clear') {
-        setItems([])
-      } else if (message.type === 'whiteboard:remove') {
-        removeItem(message.itemId)
-      } else {
-        applyItem(message.item)
-      }
-    }
-    room.on(RoomEvent.DataReceived, handleData)
-    return () => {
-      room.off(RoomEvent.DataReceived, handleData)
-    }
-  }, [applyItem, removeItem, room])
 
   const clientPoint = (clientX: number, clientY: number): WhiteboardPoint => {
     const svg = svgRef.current

@@ -1363,13 +1363,15 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
             'role', member.role
           ) ORDER BY u.display_name), '[]') AS members,
           (SELECT json_build_object(
-            'id', m.id, 'body', m.body, 'kind', m.kind, 'createdAt', m.created_at,
+           'id', m.id, 'body', m.body, 'kind', m.kind, 'createdAt', m.created_at,
             'senderId', m.sender_id
            ) FROM messages m WHERE m.conversation_id = c.id AND m.deleted_at IS NULL
+             AND NOT (m.kind = 'system' AND m.metadata->>'type' = 'call' AND m.metadata->>'status' = 'started')
              ORDER BY m.created_at DESC LIMIT 1) AS last_message,
           (SELECT count(*)::int FROM messages unread
            WHERE unread.conversation_id = c.id
              AND unread.sender_id IS DISTINCT FROM $1
+             AND NOT (unread.kind = 'system' AND unread.metadata->>'type' = 'call' AND unread.metadata->>'status' = 'started')
              AND unread.created_at > COALESCE(self_member.last_read_at, 'epoch')) AS unread_count
        FROM conversations c
        JOIN conversation_members self_member ON self_member.conversation_id = c.id AND self_member.user_id = $1
@@ -1514,6 +1516,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
        LEFT JOIN users u ON u.id = m.sender_id
        LEFT JOIN attachments a ON a.message_id = m.id
        WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
+         AND NOT (m.kind = 'system' AND m.metadata->>'type' = 'call' AND m.metadata->>'status' = 'started')
        GROUP BY m.id, u.display_name, u.avatar_url
        ORDER BY m.created_at`,
       [request.params.id, config.apiUrl],
@@ -1523,6 +1526,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
        FROM (
          SELECT max(created_at) AS created_at FROM messages
          WHERE conversation_id = $1 AND sender_id IS DISTINCT FROM $2 AND deleted_at IS NULL
+           AND NOT (kind = 'system' AND metadata->>'type' = 'call' AND metadata->>'status' = 'started')
        ) latest
        WHERE member.conversation_id = $1 AND member.user_id = $2
          AND latest.created_at IS NOT NULL
@@ -1546,6 +1550,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
        FROM (
          SELECT max(created_at) AS created_at FROM messages
          WHERE conversation_id = $1 AND sender_id IS DISTINCT FROM $2 AND deleted_at IS NULL
+           AND NOT (kind = 'system' AND metadata->>'type' = 'call' AND metadata->>'status' = 'started')
        ) latest
        WHERE member.conversation_id = $1 AND member.user_id = $2
          AND latest.created_at IS NOT NULL
@@ -1624,7 +1629,6 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
        )) RETURNING *`,
       [request.params.id, currentUser.id, input.meetingId],
     )
-    await pool.query('UPDATE conversations SET updated_at = now() WHERE id = $1', [request.params.id])
     const message = {
       ...camelizeRow(result.rows[0] as Record<string, unknown>),
       senderName: currentUser.displayName,
@@ -1632,14 +1636,13 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       deliveryStatus: 'delivered',
       attachments: [],
     }
-    await emitMessageToMembers(request.params.id, message)
     return reply.code(201).send({ message })
   })
 
   app.patch<{ Params: { id: string; messageId: string } }>('/api/conversations/:id/calls/:messageId', async (request, reply) => {
     const input = callLogFinishSchema.parse(request.body)
     const body = callSummary(input.status, input.durationMs)
-    const result = await pool.query(
+    let result = await pool.query(
       `UPDATE messages message SET
          body = $4,
          metadata = message.metadata || jsonb_build_object(
@@ -1648,6 +1651,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
          edited_at = now()
        WHERE message.id = $2 AND message.conversation_id = $1
          AND message.kind = 'system' AND message.metadata->>'type' = 'call'
+         AND message.metadata->>'status' = 'started'
          AND EXISTS (
            SELECT 1 FROM conversation_members member
            WHERE member.conversation_id = message.conversation_id AND member.user_id = $6
@@ -1655,6 +1659,19 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
        RETURNING *`,
       [request.params.id, request.params.messageId, input.status, body, input.durationMs, currentUser.id],
     )
+    const firstCompletion = Boolean(result.rowCount)
+    if (!firstCompletion) {
+      result = await pool.query(
+        `SELECT message.* FROM messages message
+         WHERE message.id = $2 AND message.conversation_id = $1
+           AND message.kind = 'system' AND message.metadata->>'type' = 'call'
+           AND EXISTS (
+             SELECT 1 FROM conversation_members member
+             WHERE member.conversation_id = message.conversation_id AND member.user_id = $3
+           )`,
+        [request.params.id, request.params.messageId, currentUser.id],
+      )
+    }
     if (!result.rowCount) return reply.code(404).send({ error: 'call_log_not_found' })
     const attachments = await pool.query(
       'SELECT * FROM attachments WHERE message_id=$1 ORDER BY created_at',
@@ -1665,7 +1682,11 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       deliveryStatus: 'delivered',
       attachments: attachments.rows.map((row) => publicAttachment(row as Record<string, unknown>)),
     }
-    await emitToConversationMembers(request.params.id, 'message:updated', message)
+    if (firstCompletion) {
+      await pool.query('UPDATE conversations SET updated_at = now() WHERE id = $1', [request.params.id])
+      await emitMessageToMembers(request.params.id, message)
+      await emitConversationUpdated(request.params.id)
+    }
     return { message }
   })
 

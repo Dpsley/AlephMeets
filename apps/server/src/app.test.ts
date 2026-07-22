@@ -608,6 +608,18 @@ test('stores a completed direct call in the conversation history', async () => {
     assert.equal(started.statusCode, 201, started.body)
     messageId = started.json().message.id
 
+    const whileActive = await app.inject({
+      method: 'GET',
+      url: `/api/conversations/${conversationId}/messages`,
+      headers: annaAuth,
+    })
+    assert.equal(whileActive.statusCode, 200, whileActive.body)
+    assert.equal(
+      whileActive.json().messages.some((message: { id: string }) => message.id === messageId),
+      false,
+      'active call must not appear in conversation history',
+    )
+
     const finished = await app.inject({
       method: 'PATCH',
       url: `/api/conversations/${conversationId}/calls/${messageId}`,
@@ -617,6 +629,27 @@ test('stores a completed direct call in the conversation history', async () => {
     assert.equal(finished.statusCode, 200, finished.body)
     assert.equal(finished.json().message.metadata.status, 'ended')
     assert.match(finished.json().message.body, /1:05/)
+
+    const duplicateFinish = await app.inject({
+      method: 'PATCH',
+      url: `/api/conversations/${conversationId}/calls/${messageId}`,
+      headers: dmitryAuth,
+      payload: { status: 'missed', durationMs: 0 },
+    })
+    assert.equal(duplicateFinish.statusCode, 200, duplicateFinish.body)
+    assert.equal(duplicateFinish.json().message.metadata.status, 'ended')
+
+    const afterFinish = await app.inject({
+      method: 'GET',
+      url: `/api/conversations/${conversationId}/messages`,
+      headers: annaAuth,
+    })
+    assert.equal(afterFinish.statusCode, 200, afterFinish.body)
+    assert.equal(
+      afterFinish.json().messages.filter((message: { id: string }) => message.id === messageId).length,
+      1,
+      'completed call must appear in conversation history',
+    )
   } finally {
     if (messageId) await pool.query('DELETE FROM messages WHERE id = $1', [messageId])
     if (meetingId) await pool.query('DELETE FROM meetings WHERE id = $1', [meetingId])
