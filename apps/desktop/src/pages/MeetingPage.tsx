@@ -10,7 +10,7 @@ import {
   useRoomContext,
   useTracks,
 } from '@livekit/components-react'
-import { RoomEvent, Track, RemoteTrackPublication, type LocalTrackPublication, type RemoteParticipant, type RemoteTrack } from 'livekit-client'
+import { ConnectionState, RoomEvent, Track, RemoteTrackPublication, type LocalTrackPublication, type RemoteParticipant, type RemoteTrack } from 'livekit-client'
 import {
   ArrowLeft,
   Bot,
@@ -89,7 +89,6 @@ type MeetingRealtimeMessage =
   | { type: 'chat'; chat: MeetingChatMessage }
   | { type: 'transcript:active'; active: boolean }
   | { type: 'transcript:entry'; entry: TranscriptEntry }
-  | { type: 'whiteboard:visibility'; open: boolean }
 
 type TranscriptionStats = {
   audioLevel: number
@@ -135,9 +134,6 @@ function readMeetingRealtimeMessage(payload: Uint8Array): MeetingRealtimeMessage
       && typeof parsed.entry === 'object'
       && typeof (parsed.entry as Record<string, unknown>).text === 'string'
     ) {
-      return parsed as unknown as MeetingRealtimeMessage
-    }
-    if (parsed.type === 'whiteboard:visibility' && typeof parsed.open === 'boolean') {
       return parsed as unknown as MeetingRealtimeMessage
     }
     return null
@@ -225,32 +221,48 @@ function InitialMediaPublisher({
 
   useEffect(() => {
     let active = true
+    let publishing = false
     const publish = async (): Promise<void> => {
-      if (audioEnabled) {
-        try {
-          if (audioTrack?.readyState === 'live') {
-            await room.localParticipant.publishTrack(audioTrack, { source: Track.Source.Microphone })
-          } else {
-            await room.localParticipant.setMicrophoneEnabled(true)
+      if (room.state !== ConnectionState.Connected || publishing) return
+      publishing = true
+      try {
+        if (audioEnabled && !room.localParticipant.getTrackPublication(Track.Source.Microphone)) {
+          try {
+            if (audioTrack?.readyState === 'live') {
+              audioTrack.enabled = true
+              await room.localParticipant.publishTrack(audioTrack, { source: Track.Source.Microphone })
+            } else {
+              await room.localParticipant.setMicrophoneEnabled(true)
+            }
+          } catch (error) {
+            if (active) onDeviceError('audio', error)
           }
-        } catch (error) {
-          if (active) onDeviceError('audio', error)
         }
-      }
-      if (videoEnabled) {
-        try {
-          if (videoTrack?.readyState === 'live') {
-            await room.localParticipant.publishTrack(videoTrack, { source: Track.Source.Camera })
-          } else {
-            await room.localParticipant.setCameraEnabled(true)
+        if (videoEnabled && !room.localParticipant.getTrackPublication(Track.Source.Camera)) {
+          try {
+            if (videoTrack?.readyState === 'live') {
+              videoTrack.enabled = true
+              videoTrack.contentHint = 'motion'
+              await room.localParticipant.publishTrack(videoTrack, { source: Track.Source.Camera })
+            } else {
+              await room.localParticipant.setCameraEnabled(true)
+            }
+          } catch (error) {
+            if (active) onDeviceError('video', error)
           }
-        } catch (error) {
-          if (active) onDeviceError('video', error)
         }
+      } finally {
+        publishing = false
       }
     }
+    room.on(RoomEvent.Connected, publish)
+    room.on(RoomEvent.Reconnected, publish)
     void publish()
-    return () => { active = false }
+    return () => {
+      active = false
+      room.off(RoomEvent.Connected, publish)
+      room.off(RoomEvent.Reconnected, publish)
+    }
   }, [audioEnabled, audioTrack, onDeviceError, room, videoEnabled, videoTrack])
 
   return null
@@ -1036,7 +1048,7 @@ function MeetingConference({
   const tracks = useTracks([
     { source: Track.Source.Camera, withPlaceholder: true },
     { source: Track.Source.ScreenShare, withPlaceholder: false },
-  ], { onlySubscribed: false })
+  ], { onlySubscribed: true })
   const screenShareTracks = tracks.filter((track) => track.source === Track.Source.ScreenShare)
   const cameraTracks = participants.map((participant) => (
     tracks.find((track) => (
@@ -1047,12 +1059,15 @@ function MeetingConference({
   const displayTracks = screenShareTracks.length > 0 ? screenShareTracks : cameraTracks
 
   useEffect(() => {
-    screenShareTracks.forEach((track) => {
-      if (track.publication instanceof RemoteTrackPublication && !track.publication.isSubscribed) {
-        track.publication.setSubscribed(true)
-      }
+    participants.forEach((participant) => {
+      if (participant.identity === room.localParticipant.identity) return
+      participant.videoTrackPublications.forEach((publication) => {
+        if (!(publication instanceof RemoteTrackPublication)) return
+        publication.setEnabled(true)
+        if (!publication.isSubscribed) publication.setSubscribed(true)
+      })
     })
-  }, [screenShareTracks])
+  }, [participants, room])
 
   const candidates = participants.filter(
     (participant) => participant.identity !== room.localParticipant.identity,
@@ -1084,14 +1099,22 @@ function MeetingConference({
   } | null>(null)
   const [meetingChatMessages, setMeetingChatMessages] = useState<MeetingChatMessage[]>([])
   const [meetingChatSending, setMeetingChatSending] = useState(false)
+  const [chatUnread, setChatUnread] = useState(false)
   const transcriptArchiveRef = useRef<TranscriptEntry[]>([])
   const transcriptUploadRef = useRef<Promise<void> | null>(null)
   const meetingChatMessagesRef = useRef<MeetingChatMessage[]>([])
+  const chatOpenRef = useRef(false)
   const sharedWhiteboardItemsRef = useRef<WhiteboardItem[]>(whiteboardItems)
 
   useEffect(() => {
     meetingChatMessagesRef.current = meetingChatMessages
   }, [meetingChatMessages])
+
+  const setMeetingChatOpen = useCallback((open: boolean): void => {
+    chatOpenRef.current = open
+    setChatOpen(open)
+    if (open) setChatUnread(false)
+  }, [])
 
   useEffect(() => {
     sharedWhiteboardItemsRef.current = whiteboardItems
@@ -1208,16 +1231,13 @@ function MeetingConference({
     }
   }, [appendMeetingChatMessage, meetingChatSending, publishRealtime, room])
 
-  const setSharedWhiteboardVisibility = useCallback((open: boolean): void => {
+  const setLocalWhiteboardVisibility = useCallback((open: boolean): void => {
     setWhiteboardOpen(open)
     if (open) {
-      setChatOpen(false)
+      setMeetingChatOpen(false)
       setTranscriptOpen(false)
     }
-    void publishRealtime({ type: 'whiteboard:visibility', open }).catch((reason) => {
-      onError(reason instanceof Error ? reason.message : 'Не удалось синхронизировать доску.')
-    })
-  }, [onError, publishRealtime])
+  }, [setMeetingChatOpen])
 
   useEffect(() => {
     const handleData = (
@@ -1232,20 +1252,22 @@ function MeetingConference({
         const nextItems = applyWhiteboardMessage(sharedWhiteboardItemsRef.current, message)
         sharedWhiteboardItemsRef.current = nextItems
         onWhiteboardItemsChange(nextItems)
-        setWhiteboardOpen(true)
-        setChatOpen(false)
-        setTranscriptOpen(false)
         return
       }
       if (topic !== MEETING_REALTIME_TOPIC) return
       const message = readMeetingRealtimeMessage(payload)
       if (!message) return
       if (message.type === 'chat') {
-        appendMeetingChatMessage({
+        const chat = {
           ...message.chat,
           senderId: message.chat.senderId || participant?.identity || 'participant',
           senderName: message.chat.senderName || participant?.name || participant?.identity || 'Участник',
-        })
+        }
+        const isNew = !meetingChatMessagesRef.current.some((item) => item.id === chat.id)
+        appendMeetingChatMessage(chat)
+        if (isNew && chat.senderId !== room.localParticipant.identity && !chatOpenRef.current) {
+          setChatUnread(true)
+        }
         return
       }
       if (message.type === 'transcript:active') {
@@ -1253,19 +1275,13 @@ function MeetingConference({
         setTranscriptionStatus(message.active ? 'listening' : 'idle')
         if (message.active) {
           setTranscriptOpen(true)
-          setChatOpen(false)
+          setMeetingChatOpen(false)
           setWhiteboardOpen(false)
         }
         return
       }
       if (message.type === 'transcript:entry') {
         storeTranscriptEntry(message.entry)
-        return
-      }
-      setWhiteboardOpen(message.open)
-      if (message.open) {
-        setChatOpen(false)
-        setTranscriptOpen(false)
       }
     }
 
@@ -1274,7 +1290,6 @@ function MeetingConference({
       const destinations = [participant.identity]
       const messages: MeetingRealtimeMessage[] = [
         { type: 'transcript:active', active: aiAssistantActive },
-        { type: 'whiteboard:visibility', open: whiteboardOpen },
         ...meetingChatMessagesRef.current.slice(-100).map((chat): MeetingRealtimeMessage => ({ type: 'chat', chat })),
         ...transcriptArchiveRef.current.slice(-100).map((entry): MeetingRealtimeMessage => ({ type: 'transcript:entry', entry })),
       ]
@@ -1307,8 +1322,8 @@ function MeetingConference({
     onWhiteboardItemsChange,
     publishRealtime,
     room,
+    setMeetingChatOpen,
     storeTranscriptEntry,
-    whiteboardOpen,
   ])
 
   const clearTranscript = (): void => {
@@ -1324,7 +1339,7 @@ function MeetingConference({
     clearTranscript()
     setTranscriptionError(null)
     setTranscriptionStatus('connecting')
-    setChatOpen(false)
+    setMeetingChatOpen(false)
     setWhiteboardOpen(false)
     setTranscriptOpen(true)
     setTranscriptionRestart((value) => value + 1)
@@ -1340,7 +1355,7 @@ function MeetingConference({
       return
     }
     setTranscriptionError(null)
-    setChatOpen(false)
+    setMeetingChatOpen(false)
     setWhiteboardOpen(false)
     setTranscriptOpen(true)
   }
@@ -1433,7 +1448,7 @@ function MeetingConference({
           {whiteboardOpen ? (
             <MeetingWhiteboard
               initialItems={whiteboardItems}
-              onClose={() => setSharedWhiteboardVisibility(false)}
+              onClose={() => setLocalWhiteboardVisibility(false)}
               onError={onError}
               onItemsChange={onWhiteboardItemsChange}
             />
@@ -1500,15 +1515,16 @@ function MeetingConference({
             <button
               onClick={() => {
                 const nextOpen = !chatOpen
-                setChatOpen(nextOpen)
+                setMeetingChatOpen(nextOpen)
                 if (nextOpen) {
                   setTranscriptOpen(false)
                   setWhiteboardOpen(false)
                 }
               }}
-              className={chatOpen ? 'active' : ''}
+              className={`meeting-chat-control ${chatOpen ? 'active' : ''}`}
             >
               <MessageSquare /><span>Чат</span>
+              {chatUnread && !chatOpen ? <i className="meeting-chat-unread" aria-label="Новые сообщения" /> : null}
             </button>
             <button onClick={() => setInfoOpen(true)}><Info /><span>Информация</span></button>
             <button onClick={toggleTranscript} className={transcriptOpen ? 'active' : ''}>
@@ -1522,7 +1538,7 @@ function MeetingConference({
             <button
               onClick={() => {
                 const nextOpen = !whiteboardOpen
-                setSharedWhiteboardVisibility(nextOpen)
+                setLocalWhiteboardVisibility(nextOpen)
               }}
               className={whiteboardOpen ? 'active' : ''}
             >
@@ -1540,7 +1556,7 @@ function MeetingConference({
             messages={meetingChatMessages}
             sendMessage={sendMeetingChatMessage}
             isSending={meetingChatSending}
-            onClose={() => setChatOpen(false)}
+            onClose={() => setMeetingChatOpen(false)}
             onError={onError}
           />
         )}
@@ -1899,6 +1915,7 @@ export function MeetingPage(): React.JSX.Element {
           token={connection.token}
           serverUrl={connection.serverUrl}
           connect
+          connectOptions={{ autoSubscribe: true }}
           audio={false}
           video={false}
           onDisconnected={() => {

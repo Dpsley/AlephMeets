@@ -1,4 +1,5 @@
 import { useRoomContext } from '@livekit/components-react'
+import { RoomEvent, type RemoteParticipant } from 'livekit-client'
 import {
   ArrowRight,
   Circle,
@@ -78,6 +79,20 @@ type TextEditorState = {
   value: string
 }
 
+type WhiteboardCursorMessage = {
+  type: 'whiteboard:cursor'
+  active: boolean
+  x?: number
+  y?: number
+}
+
+type RemoteWhiteboardCursor = WhiteboardPoint & {
+  participantId: string
+  name: string
+  color: string
+  updatedAt: number
+}
+
 export type WhiteboardMessage =
   | { type: 'whiteboard:add'; item: WhiteboardItem }
   | { type: 'whiteboard:remove'; itemId: string }
@@ -91,6 +106,7 @@ type ViewBox = {
 }
 
 export const WHITEBOARD_TOPIC = 'aleph:whiteboard'
+const WHITEBOARD_CURSOR_TOPIC = 'aleph:whiteboard-cursor'
 const BOARD_WIDTH = 1000
 const BOARD_HEIGHT = 600
 const BOARD_ASPECT = BOARD_WIDTH / BOARD_HEIGHT
@@ -105,6 +121,26 @@ const DEFAULT_ARROW_LENGTH = 160
 const INITIAL_VIEW_BOX: ViewBox = { x: 0, y: 0, width: BOARD_WIDTH, height: BOARD_HEIGHT }
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
+
+function readCursorMessage(payload: Uint8Array): WhiteboardCursorMessage | null {
+  try {
+    const parsed = JSON.parse(decoder.decode(payload)) as Partial<WhiteboardCursorMessage>
+    if (parsed.type !== 'whiteboard:cursor' || typeof parsed.active !== 'boolean') return null
+    if (!parsed.active) return { type: 'whiteboard:cursor', active: false }
+    if (!Number.isFinite(parsed.x) || !Number.isFinite(parsed.y)) return null
+    return { type: 'whiteboard:cursor', active: true, x: Number(parsed.x), y: Number(parsed.y) }
+  } catch {
+    return null
+  }
+}
+
+function cursorColor(participantId: string): string {
+  let hash = 0
+  for (let index = 0; index < participantId.length; index += 1) {
+    hash = ((hash << 5) - hash + participantId.charCodeAt(index)) | 0
+  }
+  return `hsl(${Math.abs(hash * 137.508) % 360} 78% 48%)`
+}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value))
@@ -528,12 +564,14 @@ export function MeetingWhiteboard({
   const erasingRef = useRef(false)
   const panningRef = useRef<{ clientX: number; clientY: number; viewBox: ViewBox } | null>(null)
   const movingRef = useRef<MoveState | null>(null)
+  const cursorPublishedAtRef = useRef(0)
   const [items, setItems] = useState<WhiteboardItem[]>(() => initialItems)
   const [tool, setTool] = useState<WhiteboardTool>('pen')
   const [color, setColor] = useState('#2563eb')
   const [viewBox, setViewBox] = useState<ViewBox>(INITIAL_VIEW_BOX)
   const [exporting, setExporting] = useState(false)
   const [editingText, setEditingText] = useState<TextEditorState | null>(null)
+  const [remoteCursors, setRemoteCursors] = useState<RemoteWhiteboardCursor[]>([])
 
   useEffect(() => {
     onItemsChange?.(items)
@@ -570,6 +608,54 @@ export function MeetingWhiteboard({
       onError(reason instanceof Error ? reason.message : 'Не удалось синхронизировать доску.')
     }
   }, [onError, room])
+
+  const publishCursor = useCallback((point?: WhiteboardPoint, active = true): void => {
+    const now = performance.now()
+    if (active && now - cursorPublishedAtRef.current < 45) return
+    cursorPublishedAtRef.current = now
+    const message: WhiteboardCursorMessage = active && point
+      ? { type: 'whiteboard:cursor', active: true, x: point.x, y: point.y }
+      : { type: 'whiteboard:cursor', active: false }
+    void room.localParticipant.publishData(encoder.encode(JSON.stringify(message)), {
+      reliable: false,
+      topic: WHITEBOARD_CURSOR_TOPIC,
+    }).catch(() => undefined)
+  }, [room])
+
+  useEffect(() => {
+    const handleCursor = (
+      payload: Uint8Array,
+      participant?: RemoteParticipant,
+      _kind?: unknown,
+      topic?: string,
+    ): void => {
+      if (topic !== WHITEBOARD_CURSOR_TOPIC || !participant) return
+      const message = readCursorMessage(payload)
+      if (!message) return
+      setRemoteCursors((current) => {
+        const withoutParticipant = current.filter((cursor) => cursor.participantId !== participant.identity)
+        if (!message.active || message.x === undefined || message.y === undefined) return withoutParticipant
+        return [...withoutParticipant, {
+          participantId: participant.identity,
+          name: participant.name || participant.identity || 'Участник',
+          color: cursorColor(participant.identity),
+          x: clamp(message.x, 0, BOARD_WIDTH),
+          y: clamp(message.y, 0, BOARD_HEIGHT),
+          updatedAt: Date.now(),
+        }]
+      })
+    }
+    const cleanupTimer = window.setInterval(() => {
+      const oldestAllowed = Date.now() - 5_000
+      setRemoteCursors((current) => current.filter((cursor) => cursor.updatedAt >= oldestAllowed))
+    }, 1_000)
+    room.on(RoomEvent.DataReceived, handleCursor)
+    return () => {
+      window.clearInterval(cleanupTimer)
+      room.off(RoomEvent.DataReceived, handleCursor)
+      publishCursor(undefined, false)
+    }
+  }, [publishCursor, room])
 
   const clientPoint = (clientX: number, clientY: number): WhiteboardPoint => {
     const svg = svgRef.current
@@ -755,6 +841,11 @@ export function MeetingWhiteboard({
     replaceItem(next)
   }
 
+  const handlePointerMove = (event: React.PointerEvent<SVGSVGElement>): void => {
+    publishCursor(boardPoint(event))
+    continueDraft(event)
+  }
+
   const finishDraft = (event: React.PointerEvent<SVGSVGElement>): void => {
     if (panningRef.current) {
       panningRef.current = null
@@ -837,6 +928,7 @@ export function MeetingWhiteboard({
     setExporting(true)
     try {
       const clone = svg.cloneNode(true) as SVGSVGElement
+      clone.querySelector('.whiteboard-cursors')?.remove()
       clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
       clone.setAttribute('width', String(BOARD_WIDTH * 2))
       clone.setAttribute('height', String(BOARD_HEIGHT * 2))
@@ -923,9 +1015,12 @@ export function MeetingWhiteboard({
           zoomAt(event.clientX, event.clientY, event.deltaY > 0 ? 1.12 : 0.88)
         }}
         onPointerDown={beginDraft}
-        onPointerMove={continueDraft}
+        onPointerMove={handlePointerMove}
         onPointerUp={finishDraft}
         onPointerCancel={finishDraft}
+        onPointerLeave={(event) => {
+          if (!event.currentTarget.hasPointerCapture(event.pointerId)) publishCursor(undefined, false)
+        }}
       >
         <defs>
           <pattern id="whiteboard-grid" width={GRID_SIZE} height={GRID_SIZE} patternUnits="userSpaceOnUse">
@@ -940,6 +1035,28 @@ export function MeetingWhiteboard({
         <rect className="whiteboard-grid-fill" width={BOARD_WIDTH} height={BOARD_HEIGHT} rx="18" fill="url(#whiteboard-grid-large)" />
         <g>{nonTextItems.map(renderNonTextItem)}</g>
         <g>{textItems.map(renderTextItem)}</g>
+        <g className="whiteboard-cursors" pointerEvents="none">
+          {remoteCursors.map((cursor) => {
+            const label = cursor.name.length > 28 ? `${cursor.name.slice(0, 27)}…` : cursor.name
+            const labelWidth = Math.max(76, label.length * 8 + 20)
+            const labelX = cursor.x + labelWidth + 18 > BOARD_WIDTH ? -labelWidth - 18 : 18
+            const labelY = cursor.y > BOARD_HEIGHT - 55 ? -42 : 17
+            return (
+              <g key={cursor.participantId} transform={`translate(${cursor.x} ${cursor.y})`}>
+                <path
+                  className="whiteboard-cursor-pointer"
+                  d="M 0 0 L 1 25 L 7 18 L 13 30 L 19 27 L 13 16 L 23 15 Z"
+                  fill={cursor.color}
+                  stroke="#ffffff"
+                  strokeWidth="2"
+                  strokeLinejoin="round"
+                />
+                <rect x={labelX} y={labelY} width={labelWidth} height="28" rx="8" fill={cursor.color} />
+                <text className="whiteboard-cursor-label" x={labelX + 10} y={labelY + 19} fill="#ffffff">{label}</text>
+              </g>
+            )
+          })}
+        </g>
       </svg>
       {editingText ? (
         <div className="whiteboard-text-editor">
