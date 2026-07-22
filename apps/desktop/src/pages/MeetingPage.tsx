@@ -208,13 +208,13 @@ function InitialMediaPublisher({
   audioEnabled,
   videoEnabled,
   audioTrack,
-  videoTrack,
+  videoDeviceId,
   onDeviceError,
 }: {
   audioEnabled: boolean
   videoEnabled: boolean
   audioTrack?: MediaStreamTrack
-  videoTrack?: MediaStreamTrack
+  videoDeviceId?: string
   onDeviceError: (kind: MediaKind, error: unknown) => void
 }): null {
   const room = useRoomContext()
@@ -241,13 +241,11 @@ function InitialMediaPublisher({
         }
         if (videoEnabled && !room.localParticipant.getTrackPublication(Track.Source.Camera)) {
           try {
-            if (videoTrack?.readyState === 'live') {
-              videoTrack.enabled = true
-              videoTrack.contentHint = 'motion'
-              await room.localParticipant.publishTrack(videoTrack, { source: Track.Source.Camera })
-            } else {
-              await room.localParticipant.setCameraEnabled(true)
-            }
+            await room.localParticipant.setCameraEnabled(
+              true,
+              videoDeviceId ? { deviceId: videoDeviceId } : undefined,
+              { videoCodec: 'vp8', simulcast: false },
+            )
           } catch (error) {
             if (active) onDeviceError('video', error)
           }
@@ -280,7 +278,7 @@ function InitialMediaPublisher({
       room.off(RoomEvent.Reconnected, publish)
       room.off(RoomEvent.LocalTrackUnpublished, scheduleRepublish)
     }
-  }, [audioEnabled, audioTrack, onDeviceError, room, videoEnabled, videoTrack])
+  }, [audioEnabled, audioTrack, onDeviceError, room, videoDeviceId, videoEnabled])
 
   return null
 }
@@ -1088,18 +1086,28 @@ function MeetingConference({
       publication: RemoteTrackPublication,
       _participant: RemoteParticipant,
     ): void => subscribeVideo(publication)
+    const handleTrackSubscriptionFailed = (
+      _trackSid: string,
+      participant: RemoteParticipant,
+      reason?: unknown,
+    ): void => {
+      const details = reason instanceof Error ? reason.message : reason === undefined ? 'ошибка подписки на видеопоток' : String(reason)
+      onError(`Не удалось получить видео участника ${participant.name || participant.identity}: ${details}`)
+    }
     const restoreSubscriptions = (): void => {
       room.remoteParticipants.forEach(subscribeParticipantVideo)
     }
 
     restoreSubscriptions()
     room.on(RoomEvent.TrackPublished, handleTrackPublished)
+    room.on(RoomEvent.TrackSubscriptionFailed, handleTrackSubscriptionFailed)
     room.on(RoomEvent.Reconnected, restoreSubscriptions)
     return () => {
       room.off(RoomEvent.TrackPublished, handleTrackPublished)
+      room.off(RoomEvent.TrackSubscriptionFailed, handleTrackSubscriptionFailed)
       room.off(RoomEvent.Reconnected, restoreSubscriptions)
     }
-  }, [room])
+  }, [onError, room])
 
   const candidates = participants.filter(
     (participant) => participant.identity !== room.localParticipant.identity,
@@ -1715,7 +1723,7 @@ export function MeetingPage(): React.JSX.Element {
     serverUrl: string
     isHost: boolean
     audioTrack?: MediaStreamTrack
-    videoTrack?: MediaStreamTrack
+    videoDeviceId?: string
   } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [cancelling, setCancelling] = useState(false)
@@ -1812,14 +1820,15 @@ export function MeetingPage(): React.JSX.Element {
       const token = await api.meetingToken(meetingId)
       const previewStream = streamRef.current
       const audioTrack = audioEnabled ? previewStream?.getAudioTracks()[0] : undefined
-      const videoTrack = videoEnabled ? previewStream?.getVideoTracks()[0] : undefined
+      const previewVideoTrack = videoEnabled ? previewStream?.getVideoTracks()[0] : undefined
+      const videoDeviceId = previewVideoTrack?.getSettings().deviceId
       previewStream?.getTracks().forEach((track) => {
-        if (track !== audioTrack && track !== videoTrack) track.stop()
+        if (track !== audioTrack) track.stop()
       })
       if (videoRef.current) videoRef.current.srcObject = null
       streamRef.current = null
       if (token.isHost) await api.updateMeetingStatus(meetingId, 'live')
-      setConnection({ ...token, audioTrack, videoTrack })
+      setConnection({ ...token, audioTrack, videoDeviceId })
       setJoined(true)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'Не удалось подключиться к встрече.')
@@ -1967,7 +1976,7 @@ export function MeetingPage(): React.JSX.Element {
             audioEnabled={audioEnabled && audioState === 'available'}
             videoEnabled={videoEnabled && videoState === 'available'}
             audioTrack={connection.audioTrack}
-            videoTrack={connection.videoTrack}
+            videoDeviceId={connection.videoDeviceId}
             onDeviceError={handleDeviceError}
           />
           {callContext && isOrganizer && aiAssistantActive && <CallRecorder
