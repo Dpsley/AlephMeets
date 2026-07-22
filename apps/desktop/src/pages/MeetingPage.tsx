@@ -222,14 +222,18 @@ function InitialMediaPublisher({
   useEffect(() => {
     let active = true
     let publishing = false
+    let checkingVideo = false
+    let lastVideoBytesSent: number | undefined
+    let stalledVideoChecks = 0
     const retryTimers = new Set<number>()
     const publish = async (): Promise<void> => {
       if (room.state !== ConnectionState.Connected || publishing) return
       publishing = true
       try {
-        if (audioEnabled && !room.localParticipant.getTrackPublication(Track.Source.Microphone)) {
+        const microphonePublication = room.localParticipant.getTrackPublication(Track.Source.Microphone)
+        if (audioEnabled && (!microphonePublication || microphonePublication.isMuted)) {
           try {
-            if (audioTrack?.readyState === 'live') {
+            if (!microphonePublication && audioTrack?.readyState === 'live') {
               audioTrack.enabled = true
               await room.localParticipant.publishTrack(audioTrack, { source: Track.Source.Microphone })
             } else {
@@ -239,7 +243,8 @@ function InitialMediaPublisher({
             if (active) onDeviceError('audio', error)
           }
         }
-        if (videoEnabled && !room.localParticipant.getTrackPublication(Track.Source.Camera)) {
+        const cameraPublication = room.localParticipant.getTrackPublication(Track.Source.Camera)
+        if (videoEnabled && (!cameraPublication || cameraPublication.isMuted)) {
           try {
             await room.localParticipant.setCameraEnabled(
               true,
@@ -252,6 +257,43 @@ function InitialMediaPublisher({
         }
       } finally {
         publishing = false
+      }
+    }
+    const verifyVideoTransport = async (): Promise<void> => {
+      if (!active || checkingVideo || !videoEnabled || room.remoteParticipants.size === 0) return
+      const publication = room.localParticipant.getTrackPublication(Track.Source.Camera)
+      if (!publication?.videoTrack || publication.isMuted) {
+        lastVideoBytesSent = undefined
+        stalledVideoChecks = 0
+        return
+      }
+
+      checkingVideo = true
+      try {
+        const report = await publication.videoTrack.getRTCStatsReport()
+        let foundVideoSender = false
+        let bytesSent = 0
+        report?.forEach((stat) => {
+          if (stat.type === 'outbound-rtp' && !stat.isRemote && (stat.kind === 'video' || stat.mediaType === 'video')) {
+            foundVideoSender = true
+            bytesSent += Number(stat.bytesSent ?? 0)
+          }
+        })
+        if (!foundVideoSender) return
+
+        stalledVideoChecks = lastVideoBytesSent !== undefined && bytesSent <= lastVideoBytesSent
+          ? stalledVideoChecks + 1
+          : 0
+        lastVideoBytesSent = bytesSent
+        if (stalledVideoChecks < 2) return
+
+        stalledVideoChecks = 0
+        lastVideoBytesSent = undefined
+        await publication.videoTrack.restartTrack(videoDeviceId ? { deviceId: videoDeviceId } : undefined)
+      } catch (error) {
+        if (active) onDeviceError('video', error)
+      } finally {
+        checkingVideo = false
       }
     }
     const scheduleRepublish = (publication: LocalTrackPublication): void => {
@@ -271,8 +313,10 @@ function InitialMediaPublisher({
     room.on(RoomEvent.Reconnected, publish)
     room.on(RoomEvent.LocalTrackUnpublished, scheduleRepublish)
     void publish()
+    const videoHealthTimer = window.setInterval(() => { void verifyVideoTransport() }, 4_000)
     return () => {
       active = false
+      window.clearInterval(videoHealthTimer)
       retryTimers.forEach((timer) => window.clearTimeout(timer))
       room.off(RoomEvent.Connected, publish)
       room.off(RoomEvent.Reconnected, publish)
@@ -1042,6 +1086,8 @@ function MeetingConference({
   onTranscriptStopperChange,
   aiAssistantActive,
   onAiAssistantActiveChange,
+  onAudioEnabledChange,
+  onVideoEnabledChange,
   whiteboardItems,
   onWhiteboardItemsChange,
 }: {
@@ -1055,6 +1101,8 @@ function MeetingConference({
   onTranscriptStopperChange: (stopper: (() => Promise<void>) | null) => void
   aiAssistantActive: boolean
   onAiAssistantActiveChange: (active: boolean) => void
+  onAudioEnabledChange: (enabled: boolean) => void
+  onVideoEnabledChange: (enabled: boolean) => void
   whiteboardItems: WhiteboardItem[]
   onWhiteboardItemsChange: (items: WhiteboardItem[]) => void
 }): React.JSX.Element {
@@ -1063,8 +1111,13 @@ function MeetingConference({
   const tracks = useTracks([
     { source: Track.Source.Camera, withPlaceholder: true },
     { source: Track.Source.ScreenShare, withPlaceholder: false },
-  ], { onlySubscribed: true })
-  const screenShareTracks = tracks.filter((track) => track.source === Track.Source.ScreenShare)
+  ], { onlySubscribed: false })
+  const screenShareTracks = tracks.filter((track) => (
+    track.source === Track.Source.ScreenShare
+    && 'publication' in track
+    && track.publication?.isSubscribed === true
+    && track.publication?.isMuted === false
+  ))
   const cameraTracks = participants.map((participant) => (
     tracks.find((track) => (
       track.participant.identity === participant.identity
@@ -1074,6 +1127,10 @@ function MeetingConference({
   const displayTracks = screenShareTracks.length > 0 ? screenShareTracks : cameraTracks
 
   useEffect(() => {
+    let active = true
+    let checkingReception = false
+    const retryTimers = new Set<number>()
+    const receptionState = new Map<string, { bytesReceived?: number; stalledChecks: number; recoveries: number; notified: boolean }>()
     const subscribeVideo = (publication: RemoteTrackPublication): void => {
       if (publication.kind !== Track.Kind.Video) return
       if (!publication.isSubscribed) publication.setSubscribed(true)
@@ -1086,24 +1143,100 @@ function MeetingConference({
       publication: RemoteTrackPublication,
       _participant: RemoteParticipant,
     ): void => subscribeVideo(publication)
+    const handleTrackSubscribed = (
+      track: RemoteTrack,
+      publication: RemoteTrackPublication,
+      _participant: RemoteParticipant,
+    ): void => {
+      if (track.kind !== Track.Kind.Video) return
+      publication.setEnabled(true)
+      void room.startVideo().catch(() => undefined)
+    }
     const handleTrackSubscriptionFailed = (
-      _trackSid: string,
+      trackSid: string,
       participant: RemoteParticipant,
       reason?: unknown,
     ): void => {
+      const publication = participant.trackPublications.get(trackSid)
+      if (publication?.kind !== Track.Kind.Video) return
       const details = reason instanceof Error ? reason.message : reason === undefined ? 'ошибка подписки на видеопоток' : String(reason)
       onError(`Не удалось получить видео участника ${participant.name || participant.identity}: ${details}`)
     }
     const restoreSubscriptions = (): void => {
       room.remoteParticipants.forEach(subscribeParticipantVideo)
     }
+    const verifyVideoReception = async (): Promise<void> => {
+      if (!active || checkingReception) return
+      checkingReception = true
+      try {
+        for (const participant of room.remoteParticipants.values()) {
+          for (const publication of participant.videoTrackPublications.values()) {
+            if (publication.isMuted) {
+              receptionState.delete(publication.trackSid)
+              continue
+            }
+            if (!publication.isSubscribed || !publication.videoTrack) {
+              publication.setSubscribed(true)
+              continue
+            }
+
+            const report = await publication.videoTrack.getRTCStatsReport()
+            let foundVideoReceiver = false
+            let bytesReceived = 0
+            report?.forEach((stat) => {
+              if (stat.type === 'inbound-rtp' && !stat.isRemote && (stat.kind === 'video' || stat.mediaType === 'video')) {
+                foundVideoReceiver = true
+                bytesReceived += Number(stat.bytesReceived ?? 0)
+              }
+            })
+            if (!foundVideoReceiver) continue
+
+            const state = receptionState.get(publication.trackSid) ?? {
+              stalledChecks: 0,
+              recoveries: 0,
+              notified: false,
+            }
+            state.stalledChecks = state.bytesReceived !== undefined && bytesReceived <= state.bytesReceived
+              ? state.stalledChecks + 1
+              : 0
+            state.bytesReceived = bytesReceived
+            if (state.stalledChecks >= 2) {
+              state.stalledChecks = 0
+              state.bytesReceived = undefined
+              state.recoveries += 1
+              publication.setSubscribed(false)
+              const timer = window.setTimeout(() => {
+                retryTimers.delete(timer)
+                if (active) publication.setSubscribed(true)
+              }, 250)
+              retryTimers.add(timer)
+              if (state.recoveries >= 2 && !state.notified) {
+                state.notified = true
+                onError(`Видеопоток участника ${participant.name || participant.identity} опубликован, но кадры не поступают.`)
+              }
+            }
+            receptionState.set(publication.trackSid, state)
+          }
+        }
+      } catch (reason) {
+        console.warn('Unable to read remote video transport statistics', reason)
+      } finally {
+        checkingReception = false
+      }
+    }
 
     restoreSubscriptions()
     room.on(RoomEvent.TrackPublished, handleTrackPublished)
+    room.on(RoomEvent.TrackSubscribed, handleTrackSubscribed)
     room.on(RoomEvent.TrackSubscriptionFailed, handleTrackSubscriptionFailed)
     room.on(RoomEvent.Reconnected, restoreSubscriptions)
+    const receptionHealthTimer = window.setInterval(() => { void verifyVideoReception() }, 4_000)
     return () => {
+      active = false
+      window.clearInterval(receptionHealthTimer)
+      retryTimers.forEach((timer) => window.clearTimeout(timer))
       room.off(RoomEvent.TrackPublished, handleTrackPublished)
+      room.off(RoomEvent.TrackSubscribed, handleTrackSubscribed)
       room.off(RoomEvent.TrackSubscriptionFailed, handleTrackSubscriptionFailed)
       room.off(RoomEvent.Reconnected, restoreSubscriptions)
     }
@@ -1540,10 +1673,18 @@ function MeetingConference({
           </div>
           )}
           <div className="meeting-control-bar">
-            <TrackToggle source={Track.Source.Microphone} onDeviceError={(reason) => onError(mediaErrorMessage('audio', reason))}>
+            <TrackToggle
+              source={Track.Source.Microphone}
+              onChange={(enabled, userInitiated) => { if (userInitiated) onAudioEnabledChange(enabled) }}
+              onDeviceError={(reason) => onError(mediaErrorMessage('audio', reason))}
+            >
               <span>Микрофон</span>
             </TrackToggle>
-            <TrackToggle source={Track.Source.Camera} onDeviceError={() => undefined}>
+            <TrackToggle
+              source={Track.Source.Camera}
+              onChange={(enabled, userInitiated) => { if (userInitiated) onVideoEnabledChange(enabled) }}
+              onDeviceError={() => undefined}
+            >
               <span>Камера</span>
             </TrackToggle>
             <TrackToggle
@@ -1996,6 +2137,8 @@ export function MeetingPage(): React.JSX.Element {
             onTranscriptStopperChange={setTranscriptStopper}
             aiAssistantActive={aiAssistantActive}
             onAiAssistantActiveChange={setAiAssistantActive}
+            onAudioEnabledChange={setAudioEnabled}
+            onVideoEnabledChange={setVideoEnabled}
             whiteboardItems={whiteboardItems}
             onWhiteboardItemsChange={updateWhiteboardItems}
           />
