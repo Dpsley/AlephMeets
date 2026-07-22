@@ -1148,10 +1148,17 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
         throw Object.assign(new Error('Участник не найден.'), { statusCode: 404 })
       }
       await client.query(
-        `INSERT INTO meeting_attendees (meeting_id, user_id, email)
-         SELECT $1, id, email FROM users WHERE id IN ($2,$3)
-         ON CONFLICT DO NOTHING`,
-        [meeting.id, currentUser.id, newHostId],
+        `INSERT INTO meeting_attendees (meeting_id, user_id, email, response, joined_at, left_at)
+         SELECT $1, id, email, 'accepted', now(), now() FROM users WHERE id=$2
+         ON CONFLICT (meeting_id, user_id) WHERE user_id IS NOT NULL
+         DO UPDATE SET response='accepted',
+                       joined_at=COALESCE(meeting_attendees.joined_at, now()),
+                       left_at=now()`,
+        [meeting.id, currentUser.id],
+      )
+      await client.query(
+        'DELETE FROM meeting_attendees WHERE meeting_id=$1 AND user_id=$2',
+        [meeting.id, newHostId],
       )
       const result = await client.query(
         'UPDATE meetings SET host_id=$1, updated_at=now() WHERE id=$2 RETURNING *',

@@ -222,6 +222,7 @@ function InitialMediaPublisher({
   useEffect(() => {
     let active = true
     let publishing = false
+    const retryTimers = new Set<number>()
     const publish = async (): Promise<void> => {
       if (room.state !== ConnectionState.Connected || publishing) return
       publishing = true
@@ -255,13 +256,29 @@ function InitialMediaPublisher({
         publishing = false
       }
     }
+    const scheduleRepublish = (publication: LocalTrackPublication): void => {
+      if (!active || room.state !== ConnectionState.Connected) return
+      const shouldRestore = (
+        (publication.source === Track.Source.Camera && videoEnabled)
+        || (publication.source === Track.Source.Microphone && audioEnabled)
+      )
+      if (!shouldRestore) return
+      const timer = window.setTimeout(() => {
+        retryTimers.delete(timer)
+        void publish()
+      }, 250)
+      retryTimers.add(timer)
+    }
     room.on(RoomEvent.Connected, publish)
     room.on(RoomEvent.Reconnected, publish)
+    room.on(RoomEvent.LocalTrackUnpublished, scheduleRepublish)
     void publish()
     return () => {
       active = false
+      retryTimers.forEach((timer) => window.clearTimeout(timer))
       room.off(RoomEvent.Connected, publish)
       room.off(RoomEvent.Reconnected, publish)
+      room.off(RoomEvent.LocalTrackUnpublished, scheduleRepublish)
     }
   }, [audioEnabled, audioTrack, onDeviceError, room, videoEnabled, videoTrack])
 
@@ -1059,15 +1076,30 @@ function MeetingConference({
   const displayTracks = screenShareTracks.length > 0 ? screenShareTracks : cameraTracks
 
   useEffect(() => {
-    participants.forEach((participant) => {
-      if (participant.identity === room.localParticipant.identity) return
-      participant.videoTrackPublications.forEach((publication) => {
-        if (!(publication instanceof RemoteTrackPublication)) return
-        publication.setEnabled(true)
-        if (!publication.isSubscribed) publication.setSubscribed(true)
-      })
-    })
-  }, [participants, room])
+    const subscribeVideo = (publication: RemoteTrackPublication): void => {
+      if (publication.kind !== Track.Kind.Video) return
+      if (!publication.isSubscribed) publication.setSubscribed(true)
+      publication.setEnabled(true)
+    }
+    const subscribeParticipantVideo = (participant: RemoteParticipant): void => {
+      participant.videoTrackPublications.forEach(subscribeVideo)
+    }
+    const handleTrackPublished = (
+      publication: RemoteTrackPublication,
+      _participant: RemoteParticipant,
+    ): void => subscribeVideo(publication)
+    const restoreSubscriptions = (): void => {
+      room.remoteParticipants.forEach(subscribeParticipantVideo)
+    }
+
+    restoreSubscriptions()
+    room.on(RoomEvent.TrackPublished, handleTrackPublished)
+    room.on(RoomEvent.Reconnected, restoreSubscriptions)
+    return () => {
+      room.off(RoomEvent.TrackPublished, handleTrackPublished)
+      room.off(RoomEvent.Reconnected, restoreSubscriptions)
+    }
+  }, [room])
 
   const candidates = participants.filter(
     (participant) => participant.identity !== room.localParticipant.identity,
@@ -1463,7 +1495,9 @@ function MeetingConference({
               return (
                 <ParticipantTile key={`${track.participant.identity}-${track.source}`} trackRef={track}>
                   <div className="meeting-participant-avatar"><Avatar name={displayName} src={avatarUrl} size="large" /></div>
-                  {'publication' in track && track.publication && <VideoTrack trackRef={track} />}
+                  {'publication' in track && track.publication && (
+                    <VideoTrack trackRef={track} autoPlay playsInline manageSubscription={false} />
+                  )}
                   <div className="lk-participant-metadata">
                     <div className="lk-participant-metadata-item">
                       <TrackMutedIndicator
@@ -1712,7 +1746,6 @@ export function MeetingPage(): React.JSX.Element {
   }, [addDeviceNotice])
 
   useEffect(() => {
-    if (joined) return
     let active = true
     const acquiredStreams: MediaStream[] = []
 
@@ -1763,7 +1796,7 @@ export function MeetingPage(): React.JSX.Element {
       acquiredStreams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()))
       streamRef.current = null
     }
-  }, [handleDeviceError, joined])
+  }, [handleDeviceError])
 
   useEffect(() => {
     streamRef.current?.getVideoTracks().forEach((track) => { track.enabled = videoEnabled })
@@ -1777,9 +1810,13 @@ export function MeetingPage(): React.JSX.Element {
     setError(null)
     try {
       const token = await api.meetingToken(meetingId)
-      const audioTrack = audioEnabled ? streamRef.current?.getAudioTracks()[0]?.clone() : undefined
-      const videoTrack = videoEnabled ? streamRef.current?.getVideoTracks()[0]?.clone() : undefined
-      streamRef.current?.getTracks().forEach((track) => track.stop())
+      const previewStream = streamRef.current
+      const audioTrack = audioEnabled ? previewStream?.getAudioTracks()[0] : undefined
+      const videoTrack = videoEnabled ? previewStream?.getVideoTracks()[0] : undefined
+      previewStream?.getTracks().forEach((track) => {
+        if (track !== audioTrack && track !== videoTrack) track.stop()
+      })
+      if (videoRef.current) videoRef.current.srcObject = null
       streamRef.current = null
       if (token.isHost) await api.updateMeetingStatus(meetingId, 'live')
       setConnection({ ...token, audioTrack, videoTrack })
@@ -1916,6 +1953,7 @@ export function MeetingPage(): React.JSX.Element {
           serverUrl={connection.serverUrl}
           connect
           connectOptions={{ autoSubscribe: true }}
+          options={{ adaptiveStream: false, dynacast: false }}
           audio={false}
           video={false}
           onDisconnected={() => {

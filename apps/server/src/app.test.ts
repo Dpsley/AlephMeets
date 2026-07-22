@@ -281,10 +281,17 @@ test('transfers organizer role and lets only the new organizer end the room', as
     assert.equal(transferred.json().meeting.hostId, testUsers.anna!.id)
 
     const oldOrganizer = await pool.query(
-      'SELECT 1 FROM meeting_attendees WHERE meeting_id=$1 AND user_id=$2',
+      'SELECT response, left_at IS NOT NULL AS has_left FROM meeting_attendees WHERE meeting_id=$1 AND user_id=$2',
       [meetingId, testUsers.dmitry!.id],
     )
     assert.equal(oldOrganizer.rowCount, 1)
+    assert.deepEqual(oldOrganizer.rows[0], { response: 'accepted', has_left: true })
+
+    const newOrganizerAttendee = await pool.query(
+      'SELECT 1 FROM meeting_attendees WHERE meeting_id=$1 AND user_id=$2',
+      [meetingId, testUsers.anna!.id],
+    )
+    assert.equal(newOrganizerAttendee.rowCount, 0)
 
     const oldHostEnd = await app.inject({
       method: 'POST',
