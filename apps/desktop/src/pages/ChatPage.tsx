@@ -90,7 +90,7 @@ function participantsFromIds(contacts: readonly Contact[], ids: readonly string[
 
 export function ChatPage(): React.JSX.Element {
   const location = useLocation()
-  const { user, presenceByUserId, startDirectCall } = useApp()
+  const { user, presenceByUserId, startDirectCall, startConversationCall } = useApp()
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -290,11 +290,12 @@ export function ChatPage(): React.JSX.Element {
   }
 
   const startCall = async (): Promise<void> => {
-    if (!directContact || !user || calling) return
+    if (!selected || !user || calling) return
     setCalling(true)
     setCallError(null)
     try {
-      await startDirectCall(directContact)
+      if (selected.kind === 'group') await startConversationCall(selected)
+      else if (directContact) await startDirectCall(directContact)
     } catch (reason) {
       setCallError(reason instanceof Error ? reason.message : 'Не удалось начать звонок.')
     } finally {
@@ -442,12 +443,30 @@ export function ChatPage(): React.JSX.Element {
         <div className="search-box chat-search"><button className="search-trigger" onClick={() => conversationSearchRef.current?.focus()} title="Поиск по чатам" aria-label="Поиск по чатам"><Search size={17} /></button><input ref={conversationSearchRef} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Поиск" /></div>
         <button className="group-create-button" onClick={openCreateGroup}><UserPlus size={18} />Создать групповой чат</button>
         <div className="conversation-list">
-          {filtered.map((conversation) => <button key={conversation.id} className={selectedId === conversation.id ? 'active' : ''} onClick={() => setSelectedId(conversation.id)}><Avatar name={conversation.title || 'Чат'} src={conversation.kind === 'direct' ? conversation.members.find((member) => member.id !== user?.id)?.avatarUrl : conversation.avatarUrl} size="large" /><div className="conversation-copy"><div><strong>{conversation.title || 'Диалог'}</strong><time>{conversation.lastMessage ? relativeTime(conversation.lastMessage.createdAt) : ''}</time></div><p>{conversation.lastMessage?.kind === 'audio' ? 'Голосовое сообщение' : conversation.lastMessage?.kind === 'file' ? 'Вложение' : conversation.lastMessage?.body ?? 'Нет сообщений'}</p></div>{conversation.unreadCount > 0 && <span className="unread-badge">{conversation.unreadCount}</span>}</button>)}
+          {filtered.map((conversation) => {
+            const conversationContact = conversation.kind === 'direct'
+              ? conversation.members.find((member) => member.id !== user?.id)
+              : undefined
+            return (
+              <button key={conversation.id} className={selectedId === conversation.id ? 'active' : ''} onClick={() => setSelectedId(conversation.id)}>
+                <Avatar
+                  name={conversation.title || 'Чат'}
+                  src={conversationContact?.avatarUrl ?? conversation.avatarUrl}
+                  status={conversationContact
+                    ? presenceByUserId[conversationContact.id] ?? conversationContact.status
+                    : undefined}
+                  size="large"
+                />
+                <div className="conversation-copy"><div><strong>{conversation.title || 'Диалог'}</strong><time>{conversation.lastMessage ? relativeTime(conversation.lastMessage.createdAt) : ''}</time></div><p>{conversation.lastMessage?.kind === 'audio' ? 'Голосовое сообщение' : conversation.lastMessage?.kind === 'file' ? 'Вложение' : conversation.lastMessage?.body ?? 'Нет сообщений'}</p></div>
+                {conversation.unreadCount > 0 && <span className="unread-badge">{conversation.unreadCount}</span>}
+              </button>
+            )
+          })}
         </div>
       </aside>
       <section className="chat-main">
         {selected ? <>
-          <header className="chat-header"><div><Avatar name={selected.title || 'Чат'} src={directContact?.avatarUrl ?? selected.avatarUrl} status={directStatus} /><div><h2>{selected.title}</h2><span className={selected.kind === 'direct' ? `chat-presence-${directStatus ?? 'offline'}` : ''}>{selected.kind === 'group' ? `${selected.members.length} участников` : directStatus === 'online' ? 'В сети' : 'Не в сети'}</span></div></div><div><button className={`icon-button ${messageSearchOpen ? 'active' : ''}`} onClick={() => setMessageSearchOpen((open) => !open)} title="Поиск по сообщениям" aria-label="Поиск по сообщениям"><Search size={19} /></button>{selected.kind === 'group' && selected.currentUserRole === 'owner' && <button className="icon-button" onClick={openGroupManagement} title="Управление группой" aria-label="Управление группой"><Settings2 size={19} /></button>}{directContact && <button className="icon-button call-button" onClick={() => void startCall()} disabled={calling} title={`Позвонить: ${directContact.displayName}`} aria-label={`Позвонить: ${directContact.displayName}`}><Phone size={19} /></button>}</div></header>
+          <header className="chat-header"><div><Avatar name={selected.title || 'Чат'} src={directContact?.avatarUrl ?? selected.avatarUrl} status={directStatus} /><div><h2>{selected.title}</h2><span className={selected.kind === 'direct' ? `chat-presence-${directStatus ?? 'offline'}` : ''}>{selected.kind === 'group' ? `${selected.members.length} участников` : directStatus === 'online' ? 'В сети' : 'Не в сети'}</span></div></div><div><button className={`icon-button ${messageSearchOpen ? 'active' : ''}`} onClick={() => setMessageSearchOpen((open) => !open)} title="Поиск по сообщениям" aria-label="Поиск по сообщениям"><Search size={19} /></button>{selected.kind === 'group' && selected.currentUserRole === 'owner' && <button className="icon-button" onClick={openGroupManagement} title="Управление группой" aria-label="Управление группой"><Settings2 size={19} /></button>}{(directContact || selected.kind === 'group') && <button className="icon-button call-button" onClick={() => void startCall()} disabled={calling} title={selected.kind === 'group' ? 'Позвонить всем участникам' : `Позвонить: ${directContact?.displayName}`} aria-label={selected.kind === 'group' ? 'Позвонить всем участникам' : `Позвонить: ${directContact?.displayName}`}><Phone size={19} /></button>}</div></header>
           {messageSearchOpen && <div className="message-search-bar"><Search size={18} /><input value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="Поиск по сообщениям" autoFocus /><button className="icon-button" onClick={() => { setMessageSearch(''); setMessageSearchOpen(false) }} title="Закрыть поиск"><X size={17} /></button></div>}
           {callError && <div className="chat-call-error">{callError}</div>}
           <div className="message-scroll">
@@ -617,7 +636,7 @@ export function ChatPage(): React.JSX.Element {
     <Modal open={manageGroupOpen} onClose={() => setManageGroupOpen(false)} title="Управление группой" width={560} className="participant-picker-modal">
       {selected?.kind === 'group' && <div className="form-stack">
         <label><span>Название группы</span><div className="group-title-editor"><input value={groupTitle} onChange={(event) => setGroupTitle(event.target.value)} maxLength={150} /><button className="button secondary" onClick={() => void renameGroup()} disabled={!groupTitle.trim() || groupSaving}>Сохранить</button></div></label>
-        <div className="group-management-list"><strong>Участники</strong>{selected.members.map((member) => <div className="group-management-row" key={member.id}><div className="group-member-avatar"><Avatar name={member.displayName} src={member.avatarUrl} size="small" /></div><span className="group-member-copy">{member.displayName}<small>{member.role === 'owner' ? 'Владелец' : member.email || member.phone || 'Контакт Aleph ID'}</small></span>{member.role !== 'owner' && <button className="icon-button danger" onClick={() => void removeGroupMember(member.id)} title="Удалить участника"><UserMinus size={17} /></button>}</div>)}</div>
+        <div className="group-management-list"><strong>Участники</strong>{selected.members.map((member) => <div className="group-management-row" key={member.id}><div className="group-member-avatar"><Avatar name={member.displayName} src={member.avatarUrl} status={presenceByUserId[member.id] ?? member.status} size="small" /></div><span className="group-member-copy">{member.displayName}<small>{member.role === 'owner' ? 'Владелец' : member.email || member.phone || 'Контакт Aleph ID'}</small></span>{member.role !== 'owner' && <button className="icon-button danger" onClick={() => void removeGroupMember(member.id)} title="Удалить участника"><UserMinus size={17} /></button>}</div>)}</div>
         <div className="group-management-list">
           <ParticipantPicker
             label="Добавить участника"

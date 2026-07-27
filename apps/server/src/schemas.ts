@@ -26,6 +26,11 @@ export const meetingInvitationSchema = z.object({
   userIds: z.array(z.uuid()).min(1).max(50),
 })
 
+export const meetingCallMergeSchema = z.object({
+  incomingMeetingId: z.uuid(),
+  callerUserId: z.uuid(),
+})
+
 export const messageInputSchema = z.object({
   body: z.string().trim().min(1).max(20_000),
   replyToId: z.uuid().nullable().optional(),

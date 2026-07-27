@@ -37,7 +37,13 @@ import type { Attachment, Contact, DirectCallContext, Meeting } from '../types'
 import { api } from '../lib/api'
 import { plainTextFromRichText } from '../lib/format'
 import { getMeetingWindowContext } from '../lib/meeting-window'
-import { ensureDesktopMediaAccess, isRetryableMediaError, mediaErrorMessage, type MediaKind } from '../lib/media'
+import {
+  ensureDesktopMediaAccess,
+  isRetryableMediaError,
+  mediaErrorMessage,
+  retryDesktopMediaAccess,
+  type MediaKind,
+} from '../lib/media'
 import { useApp } from '../state/AppContext'
 import { BrandMark } from '../components/BrandMark'
 import { Avatar, Modal } from '../components/ui'
@@ -1088,6 +1094,7 @@ function MeetingConference({
   onAiAssistantActiveChange,
   onAudioEnabledChange,
   onVideoEnabledChange,
+  onVideoAvailable,
   whiteboardItems,
   onWhiteboardItemsChange,
 }: {
@@ -1103,6 +1110,7 @@ function MeetingConference({
   onAiAssistantActiveChange: (active: boolean) => void
   onAudioEnabledChange: (enabled: boolean) => void
   onVideoEnabledChange: (enabled: boolean) => void
+  onVideoAvailable: () => void
   whiteboardItems: WhiteboardItem[]
   onWhiteboardItemsChange: (items: WhiteboardItem[]) => void
 }): React.JSX.Element {
@@ -1273,6 +1281,7 @@ function MeetingConference({
   const [meetingChatMessages, setMeetingChatMessages] = useState<MeetingChatMessage[]>([])
   const [meetingChatSending, setMeetingChatSending] = useState(false)
   const [chatUnread, setChatUnread] = useState(false)
+  const [cameraControlVersion, setCameraControlVersion] = useState(0)
   const transcriptArchiveRef = useRef<TranscriptEntry[]>([])
   const transcriptUploadRef = useRef<Promise<void> | null>(null)
   const meetingChatMessagesRef = useRef<MeetingChatMessage[]>([])
@@ -1304,6 +1313,12 @@ function MeetingConference({
     if (isOrganizer) setExitOpen(true)
     else void room.disconnect()
   }, [closeRequest, isOrganizer, room])
+
+  useEffect(() => {
+    const leaveCurrentCall = (): void => { void room.disconnect() }
+    window.addEventListener('aleph:leave-current-call', leaveCurrentCall)
+    return () => window.removeEventListener('aleph:leave-current-call', leaveCurrentCall)
+  }, [room])
 
   useEffect(() => {
     return window.alephDesktop?.onScreenShareSources(setScreenShareRequest)
@@ -1605,6 +1620,30 @@ function MeetingConference({
     }
   }
 
+  const toggleCamera = async (): Promise<void> => {
+    const enabled = room.localParticipant.isCameraEnabled
+    try {
+      if (enabled) {
+        await room.localParticipant.setCameraEnabled(false)
+        onVideoEnabledChange(false)
+      } else {
+        await retryDesktopMediaAccess(['camera'])
+        await room.localParticipant.setCameraEnabled(
+          true,
+          undefined,
+          { videoCodec: 'vp8', simulcast: false },
+        )
+        onVideoAvailable()
+        onVideoEnabledChange(true)
+      }
+      setCameraControlVersion((version) => version + 1)
+    } catch (reason) {
+      onVideoEnabledChange(false)
+      onError(reason instanceof Error ? reason.message : mediaErrorMessage('video', reason))
+      setCameraControlVersion((version) => version + 1)
+    }
+  }
+
   return (
     <>
       <CallTranscriber
@@ -1680,13 +1719,16 @@ function MeetingConference({
             >
               <span>Микрофон</span>
             </TrackToggle>
-            <TrackToggle
-              source={Track.Source.Camera}
-              onChange={(enabled, userInitiated) => { if (userInitiated) onVideoEnabledChange(enabled) }}
-              onDeviceError={() => undefined}
+            <button
+              type="button"
+              data-lk-source="camera"
+              data-lk-enabled={String(room.localParticipant.isCameraEnabled)}
+              data-camera-version={cameraControlVersion}
+              onClick={() => void toggleCamera()}
             >
+              {room.localParticipant.isCameraEnabled ? <Camera /> : <CameraOff />}
               <span>Камера</span>
-            </TrackToggle>
+            </button>
             <TrackToggle
               source={Track.Source.ScreenShare}
               onDeviceError={(reason) => {
@@ -1894,6 +1936,35 @@ export function MeetingPage(): React.JSX.Element {
     }
   }, [addDeviceNotice])
 
+  const markVideoAvailable = useCallback((): void => {
+    setVideoState('available')
+    setDeviceNotices((current) => current.filter((notice) => !/камера/i.test(notice)))
+  }, [])
+
+  const retryPreviewCamera = useCallback(async (): Promise<void> => {
+    setError(null)
+    setVideoState('checking')
+    try {
+      await retryDesktopMediaAccess(['camera'])
+      const cameraStream = await navigator.mediaDevices.getUserMedia({ audio: false, video: true })
+      const cameraTrack = cameraStream.getVideoTracks()[0]
+      if (!cameraTrack) throw new DOMException('Камера не найдена.', 'NotFoundError')
+      const preview = streamRef.current ?? new MediaStream()
+      preview.getVideoTracks().forEach((track) => {
+        preview.removeTrack(track)
+        track.stop()
+      })
+      preview.addTrack(cameraTrack)
+      streamRef.current = preview
+      if (videoRef.current) videoRef.current.srcObject = preview
+      markVideoAvailable()
+      setVideoEnabled(true)
+    } catch (reason) {
+      handleDeviceError('video', reason)
+      setError(reason instanceof Error ? reason.message : mediaErrorMessage('video', reason))
+    }
+  }, [handleDeviceError, markVideoAvailable])
+
   useEffect(() => {
     let active = true
     const acquiredStreams: MediaStream[] = []
@@ -1943,6 +2014,7 @@ export function MeetingPage(): React.JSX.Element {
     return () => {
       active = false
       acquiredStreams.forEach((stream) => stream.getTracks().forEach((track) => track.stop()))
+      streamRef.current?.getTracks().forEach((track) => track.stop())
       streamRef.current = null
     }
   }, [handleDeviceError])
@@ -1993,7 +2065,7 @@ export function MeetingPage(): React.JSX.Element {
   }, [])
 
   const finishDirectCall = useCallback(async (): Promise<void> => {
-    if (!callContext || callFinishedRef.current) return
+    if (!callContext || callContext.groupCall || callFinishedRef.current) return
     callFinishedRef.current = true
     await api.finishCallLog(
       callContext.conversationId,
@@ -2139,6 +2211,7 @@ export function MeetingPage(): React.JSX.Element {
             onAiAssistantActiveChange={setAiAssistantActive}
             onAudioEnabledChange={setAudioEnabled}
             onVideoEnabledChange={setVideoEnabled}
+            onVideoAvailable={markVideoAvailable}
             whiteboardItems={whiteboardItems}
             onWhiteboardItemsChange={updateWhiteboardItems}
           />
@@ -2172,9 +2245,16 @@ export function MeetingPage(): React.JSX.Element {
               {audioEnabled && audioState === 'available' ? <Mic /> : <MicOff />}
               <span>{audioState === 'checking' ? 'Проверка...' : audioEnabled ? 'Микрофон' : 'Без звука'}</span>
             </button>
-            <button className={!videoEnabled ? 'off' : ''} disabled={videoState !== 'available'} onClick={() => setVideoEnabled((value) => !value)}>
+            <button
+              className={!videoEnabled ? 'off' : ''}
+              disabled={videoState === 'checking'}
+              onClick={() => {
+                if (videoState === 'available') setVideoEnabled((value) => !value)
+                else void retryPreviewCamera()
+              }}
+            >
               {videoEnabled && videoState === 'available' ? <Camera /> : <CameraOff />}
-              <span>{videoState === 'checking' ? 'Проверка...' : videoEnabled ? 'Камера' : 'Без видео'}</span>
+              <span>{videoState === 'checking' ? 'Проверка...' : videoState === 'unavailable' ? 'Разрешить камеру' : videoEnabled ? 'Камера' : 'Без видео'}</span>
             </button>
           </div>
         </section>

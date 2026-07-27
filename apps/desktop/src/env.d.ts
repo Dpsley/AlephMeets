@@ -7,8 +7,11 @@ interface Window {
     maximize: () => void
     close: () => void
     isMaximized: () => Promise<boolean>
+    claimRingtone: () => Promise<boolean>
     onMaximizedChanged: (listener: (maximized: boolean) => void) => () => void
     getVersion: () => Promise<string>
+    showNotification: (notification: { id: string; title: string; body: string; route?: string }) => void
+    onNavigate: (listener: (route: string) => void) => () => void
     ensureMediaAccess: (kinds: Array<'camera' | 'microphone'>) => Promise<Array<{
       kind: 'camera' | 'microphone'
       status: string

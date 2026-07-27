@@ -13,11 +13,13 @@ import {
   Settings2,
   ShieldCheck,
   Sun,
+  Volume2,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Avatar, Modal } from '../components/ui'
 import { api } from '../lib/api'
 import { ensureDesktopMediaAccess, mediaErrorMessage } from '../lib/media'
+import { RINGTONE_OPTIONS, startRingtone } from '../lib/ringtone'
 import { useApp } from '../state/AppContext'
 import type { ExchangeSettings } from '../types'
 
@@ -46,7 +48,7 @@ const settingsSections: Array<{
 ]
 
 export function SettingsPage(): React.JSX.Element {
-  const { user, presenceByUserId, theme, setTheme } = useApp()
+  const { user, presenceByUserId, theme, ringtone, setTheme, setRingtone } = useApp()
   const [activeSection, setActiveSection] = useState<SettingsSection>('general')
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([])
   const [exchange, setExchange] = useState<ExchangeSettings | null>(null)
@@ -68,6 +70,7 @@ export function SettingsPage(): React.JSX.Element {
   const micStreamRef = useRef<MediaStream | null>(null)
   const micAudioContextRef = useRef<AudioContext | null>(null)
   const micAnimationRef = useRef<number | null>(null)
+  const ringtonePreviewStopRef = useRef<(() => void) | null>(null)
 
   const videoDevices = useMemo(() => devices.filter((device) => device.kind === 'videoinput'), [devices])
   const audioInputDevices = useMemo(() => devices.filter((device) => device.kind === 'audioinput'), [devices])
@@ -101,7 +104,10 @@ export function SettingsPage(): React.JSX.Element {
     }
   }, [])
 
-  useEffect(() => () => stopMicTest(false), [stopMicTest])
+  useEffect(() => () => {
+    stopMicTest(false)
+    ringtonePreviewStopRef.current?.()
+  }, [stopMicTest])
 
   const changeMicrophone = (deviceId: string): void => {
     setSelectedMicrophoneId(deviceId)
@@ -211,6 +217,17 @@ export function SettingsPage(): React.JSX.Element {
   const requestNotifications = async (): Promise<void> => {
     if (typeof Notification === 'undefined') return
     setNotificationPermission(await Notification.requestPermission())
+  }
+
+  const previewRingtone = (): void => {
+    ringtonePreviewStopRef.current?.()
+    const stop = startRingtone(ringtone, false)
+    ringtonePreviewStopRef.current = stop
+    setTimeout(() => {
+      if (ringtonePreviewStopRef.current !== stop) return
+      stop()
+      ringtonePreviewStopRef.current = null
+    }, 1_600)
   }
 
   return (
@@ -378,6 +395,25 @@ export function SettingsPage(): React.JSX.Element {
               {notificationPermission !== 'granted' && (
                 <button className="button secondary small" onClick={() => void requestNotifications()}>Разрешить</button>
               )}
+            </div>
+            <div className="setting-row ringtone-setting-row">
+              <span className="setting-icon"><Volume2 /></span>
+              <div>
+                <strong>Мелодия входящего звонка</strong>
+                <small>Воспроизводится до принятия или отклонения вызова</small>
+              </div>
+              <select
+                value={ringtone}
+                onChange={(event) => setRingtone(event.target.value as typeof ringtone)}
+                aria-label="Мелодия входящего звонка"
+              >
+                {RINGTONE_OPTIONS.map((option) => (
+                  <option value={option.value} key={option.value}>{option.label}</option>
+                ))}
+              </select>
+              <button className="button secondary small" type="button" onClick={previewRingtone} disabled={ringtone === 'silent'}>
+                Прослушать
+              </button>
             </div>
           </div>
 

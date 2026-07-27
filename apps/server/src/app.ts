@@ -37,6 +37,7 @@ import {
   conversationMembersSchema,
   conversationTitleSchema,
   exchangeSettingsSchema,
+  meetingCallMergeSchema,
   meetingHostTransferSchema,
   meetingInvitationSchema,
   meetingInputSchema,
@@ -69,6 +70,7 @@ interface IdParams {
 interface AppDependencies {
   authenticate?: (accessToken: string) => Promise<CurrentUser>
   roomService?: Pick<RoomServiceClient, 'deleteRoom' | 'listParticipants' | 'listRooms'>
+  meetingInvitationTimeoutMs?: number
 }
 
 interface ExchangeAccountRow {
@@ -497,6 +499,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
   })
   const presenceDisconnectTimers = new Map<string, ReturnType<typeof setTimeout>>()
   const meetingInvitationTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  const meetingInvitationTimeoutMs = dependencies.meetingInvitationTimeoutMs ?? 45_000
   const activeExchangeSyncs = new Map<string, Promise<ExchangeSyncResult>>()
 
   await app.register(cors, {
@@ -627,6 +630,92 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     }
   }
 
+  const serializeCallMessage = async (row: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const attachments = await pool.query(
+      'SELECT * FROM attachments WHERE message_id=$1 ORDER BY created_at',
+      [row.id],
+    )
+    const sender = row.sender_id
+      ? await pool.query('SELECT display_name, avatar_url FROM users WHERE id=$1', [row.sender_id])
+      : null
+    return {
+      ...camelizeRow(row),
+      senderName: sender?.rows[0]?.display_name ?? null,
+      senderAvatarUrl: sender?.rows[0]?.avatar_url ?? null,
+      deliveryStatus: 'delivered',
+      attachments: attachments.rows.map((attachment) => publicAttachment(attachment as Record<string, unknown>)),
+    }
+  }
+
+  const finishPendingMeetingCall = async (
+    meetingId: string,
+    status: 'ended' | 'declined' | 'missed',
+  ): Promise<Record<string, unknown> | null> => {
+    const pending = await pool.query(
+      `SELECT id, COALESCE(metadata->>'startedAt', created_at::text) AS started_at
+       FROM messages
+       WHERE kind='system'
+         AND metadata->>'type'='call'
+         AND metadata->>'meetingId'=$1
+         AND metadata->>'status'='started'
+       ORDER BY created_at LIMIT 1`,
+      [meetingId],
+    )
+    const pendingRow = pending.rows[0] as { id: string; started_at: Date | string } | undefined
+    if (!pendingRow) return null
+    const durationMs = status === 'ended'
+      ? Math.max(0, Date.now() - new Date(pendingRow.started_at).getTime())
+      : 0
+    const body = callSummary(status, durationMs)
+    const result = await pool.query(
+      `UPDATE messages message SET
+         body=$2,
+         metadata=message.metadata || jsonb_build_object(
+           'status',$3::text,'durationMs',$4::int,'endedAt',now()
+         ),
+         edited_at=now()
+       WHERE message.id=$1
+         AND message.metadata->>'status'='started'
+       RETURNING *`,
+      [pendingRow.id, body, status, durationMs],
+    )
+    const row = result.rows[0] as Record<string, unknown> | undefined
+    if (!row) return null
+    const conversationId = String(row.conversation_id)
+    const message = await serializeCallMessage(row)
+    await pool.query('UPDATE conversations SET updated_at=now() WHERE id=$1', [conversationId])
+    await emitMessageToMembers(conversationId, message)
+    await emitConversationUpdated(conversationId)
+    return message
+  }
+
+  const endUnansweredMeeting = async (
+    meetingId: string,
+    callStatus: 'declined' | 'missed',
+  ): Promise<void> => {
+    const meetingResult = await pool.query(
+      `UPDATE meetings meeting SET status='ended', updated_at=now()
+       WHERE meeting.id=$1 AND meeting.status='live'
+         AND NOT EXISTS (
+           SELECT 1 FROM meeting_attendees attendee
+           WHERE attendee.meeting_id=meeting.id
+             AND (attendee.response='accepted' OR attendee.joined_at IS NOT NULL)
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM meeting_attendees attendee
+           WHERE attendee.meeting_id=meeting.id AND attendee.response='invited'
+         )
+       RETURNING room_name`,
+      [meetingId],
+    )
+    const roomName = meetingResult.rows[0]?.room_name
+    if (!roomName) return
+    await finishPendingMeetingCall(meetingId, callStatus)
+    const activeRooms = await roomService.listRooms([String(roomName)])
+    if (activeRooms.length) await roomService.deleteRoom(String(roomName))
+    await emitMeetingUpdated(meetingId, { meetingId, status: 'ended' })
+  }
+
   const sendCallMaterialsEmail = async (
     conversationId: string,
     messageId: string,
@@ -715,10 +804,11 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
         [meetingId, userId],
       ).then(async (result) => {
         if (!result.rowCount) return
-        io.to(`user:${userId}`).emit('call:cancelled', { meetingId })
+        io.to(`user:${userId}`).emit('call:cancelled', { meetingId, reason: 'missed' })
         await emitMeetingUpdated(meetingId, { meetingId, invitationUserId: userId })
+        await endUnansweredMeeting(meetingId, 'missed')
       }).catch((error) => app.log.error(error))
-    }, 45_000))
+    }, meetingInvitationTimeoutMs))
   }
 
   app.addHook('onRequest', (request, _reply, done) => {
@@ -1203,6 +1293,13 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       meetingId: request.params.id,
       status: 'ended',
     })
+    const answered = await pool.query(
+      `SELECT 1 FROM meeting_attendees
+       WHERE meeting_id=$1 AND (response='accepted' OR joined_at IS NOT NULL)
+       LIMIT 1`,
+      [request.params.id],
+    )
+    await finishPendingMeetingCall(request.params.id, answered.rowCount ? 'ended' : 'missed')
     return { meeting: updated }
   })
 
@@ -1260,6 +1357,113 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     return { invited: contacts.rows.map((contact) => String(contact.id)) }
   })
 
+  app.post<{ Params: IdParams }>('/api/meetings/:id/invitations/merge-call', async (request, reply) => {
+    const input = meetingCallMergeSchema.parse(request.body)
+    if (request.params.id === input.incomingMeetingId) {
+      return reply.code(400).send({ error: 'same_meeting', message: 'Нельзя объединить встречу саму с собой.' })
+    }
+
+    const validation = await pool.query(
+      `SELECT current_meeting.id, incoming_meeting.room_name AS incoming_room_name
+       FROM meetings current_meeting
+       JOIN meetings incoming_meeting
+         ON incoming_meeting.id=$2
+        AND incoming_meeting.host_id=$3
+        AND incoming_meeting.status='live'
+       JOIN meeting_attendees incoming_invitation
+         ON incoming_invitation.meeting_id=incoming_meeting.id
+        AND incoming_invitation.user_id=$4
+        AND incoming_invitation.response='invited'
+       WHERE current_meeting.id=$1
+         AND current_meeting.status='live'
+         AND (
+           current_meeting.host_id=$4
+           OR EXISTS (
+             SELECT 1 FROM meeting_attendees current_attendee
+             WHERE current_attendee.meeting_id=current_meeting.id
+               AND current_attendee.user_id=$4
+               AND (
+                 current_attendee.response='accepted'
+                 OR current_attendee.joined_at IS NOT NULL
+               )
+           )
+         )
+         AND (
+           SELECT count(*) FROM meeting_attendees incoming_attendee
+           WHERE incoming_attendee.meeting_id=incoming_meeting.id
+         )=1`,
+      [request.params.id, input.incomingMeetingId, input.callerUserId, currentUser.id],
+    )
+    if (!validation.rowCount) {
+      return reply.code(409).send({
+        error: 'call_merge_not_available',
+        message: 'Этот входящий вызов уже завершен или не может быть добавлен в текущую встречу.',
+      })
+    }
+
+    await inTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO meeting_attendees (meeting_id, user_id, email, response)
+         SELECT $1, user_record.id, user_record.email, 'invited'
+         FROM users user_record WHERE user_record.id=$2
+         ON CONFLICT (meeting_id, user_id) WHERE user_id IS NOT NULL
+         DO UPDATE SET response='invited', joined_at=NULL, left_at=NULL`,
+        [request.params.id, input.callerUserId],
+      )
+      await client.query(
+        `UPDATE meeting_attendees SET response='declined'
+         WHERE meeting_id=$1 AND user_id=$2 AND response='invited'`,
+        [input.incomingMeetingId, currentUser.id],
+      )
+      await client.query(
+        `UPDATE meetings SET status='ended', updated_at=now()
+         WHERE id=$1 AND status='live'`,
+        [input.incomingMeetingId],
+      )
+    })
+
+    clearMeetingInvitationTimer(input.incomingMeetingId, currentUser.id)
+    await finishPendingMeetingCall(input.incomingMeetingId, 'declined')
+    const incomingRoomName = String(validation.rows[0].incoming_room_name)
+    const activeRooms = await roomService.listRooms([incomingRoomName])
+    if (activeRooms.length) await roomService.deleteRoom(incomingRoomName)
+
+    const currentMeetingResult = await pool.query(
+      `SELECT meeting.*,
+         host.display_name AS host_display_name, host.avatar_url AS host_avatar_url,
+         COALESCE(json_agg(json_build_object(
+           'email', attendee_link.email, 'userId', attendee_link.user_id,
+           'response', attendee_link.response, 'displayName', attendee.display_name,
+           'department', attendee.department, 'position', attendee.position,
+           'avatarUrl', attendee.avatar_url
+         )) FILTER (
+           WHERE attendee_link.email IS NOT NULL OR attendee_link.user_id IS NOT NULL
+         ), '[]') AS attendees
+       FROM meetings meeting
+       JOIN users host ON host.id=meeting.host_id
+       LEFT JOIN meeting_attendees attendee_link ON attendee_link.meeting_id=meeting.id
+       LEFT JOIN users attendee ON attendee.id=attendee_link.user_id
+       WHERE meeting.id=$1
+       GROUP BY meeting.id, host.id`,
+      [request.params.id],
+    )
+    const meeting = camelizeRow(currentMeetingResult.rows[0] as Record<string, unknown>)
+    io.to(`user:${input.callerUserId}`).emit('call:redirected', { meeting, invitation: true })
+    io.to(`user:${currentUser.id}`).emit('call:cancelled', {
+      meetingId: input.incomingMeetingId,
+      reason: 'merged',
+    })
+    await emitMeetingUpdated(input.incomingMeetingId, {
+      meetingId: input.incomingMeetingId,
+      status: 'ended',
+    })
+    await emitMeetingUpdated(request.params.id, {
+      meetingId: request.params.id,
+      invitationUserId: input.callerUserId,
+    })
+    return { meeting }
+  })
+
   app.post<{ Params: IdParams }>('/api/meetings/:id/invitations/decline', async (request, reply) => {
     const result = await pool.query(
       `UPDATE meeting_attendees SET response='declined'
@@ -1274,6 +1478,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       meetingId: request.params.id,
       invitationUserId: currentUser.id,
     })
+    await endUnansweredMeeting(request.params.id, 'declined')
     return { success: true }
   })
 

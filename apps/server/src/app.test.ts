@@ -39,7 +39,7 @@ const testUsers: Record<string, CurrentUser> = {
 const deletedLiveKitRooms: string[] = []
 let liveKitRoomExists = true
 
-async function createTestApp() {
+async function createTestApp(meetingInvitationTimeoutMs?: number) {
   return createApp({
     authenticate: async (token) => {
       const user = testUsers[token]
@@ -55,6 +55,7 @@ async function createTestApp() {
         : [],
       deleteRoom: async (roomName) => { deletedLiveKitRooms.push(roomName) },
     },
+    meetingInvitationTimeoutMs,
   })
 }
 
@@ -400,6 +401,150 @@ test('invites a contact into a live meeting and records a decline', async () => 
     assert.equal(attendee.rows[0]?.response, 'declined')
   } finally {
     if (meetingId) await pool.query('DELETE FROM meetings WHERE id=$1', [meetingId])
+    await app.close()
+  }
+})
+
+test('records an unanswered direct call as missed after the invitation timeout', async () => {
+  const app = await createTestApp(30)
+  let meetingId: string | undefined
+  let messageId: string | undefined
+  try {
+    await pool.query(
+      `INSERT INTO contacts (owner_id, contact_user_id)
+       VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+      [testUsers.dmitry!.id, testUsers.anna!.id],
+    )
+    const conversation = await app.inject({
+      method: 'POST',
+      url: '/api/conversations',
+      headers: dmitryAuth,
+      payload: { memberIds: [testUsers.anna!.id] },
+    })
+    const conversationId = conversation.json().conversation.id as string
+    const startsAt = new Date()
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/meetings',
+      headers: dmitryAuth,
+      payload: {
+        title: '__missed_call_timeout_test__',
+        startsAt: startsAt.toISOString(),
+        endsAt: new Date(startsAt.getTime() + 60 * 60_000).toISOString(),
+        timezone: 'Europe/Moscow',
+        attendees: [],
+        attendeeUserIds: [],
+      },
+    })
+    meetingId = created.json().meeting.id
+    await pool.query("UPDATE meetings SET status='live' WHERE id=$1", [meetingId])
+    const started = await app.inject({
+      method: 'POST',
+      url: `/api/conversations/${conversationId}/calls`,
+      headers: dmitryAuth,
+      payload: { meetingId },
+    })
+    messageId = started.json().message.id
+
+    const invited = await app.inject({
+      method: 'POST',
+      url: `/api/meetings/${meetingId}/invitations`,
+      headers: dmitryAuth,
+      payload: { userIds: [testUsers.anna!.id] },
+    })
+    assert.equal(invited.statusCode, 200, invited.body)
+    await new Promise((resolve) => setTimeout(resolve, 120))
+
+    const result = await pool.query(
+      `SELECT body, metadata->>'status' AS status FROM messages WHERE id=$1`,
+      [messageId],
+    )
+    assert.equal(result.rows[0]?.status, 'missed')
+    assert.equal(result.rows[0]?.body, 'Пропущенный звонок')
+    const meeting = await pool.query('SELECT status FROM meetings WHERE id=$1', [meetingId])
+    assert.equal(meeting.rows[0]?.status, 'ended')
+  } finally {
+    if (messageId) await pool.query('DELETE FROM messages WHERE id=$1', [messageId])
+    if (meetingId) await pool.query('DELETE FROM meetings WHERE id=$1', [meetingId])
+    await app.close()
+  }
+})
+
+test('moves a second direct caller into the active meeting', async () => {
+  const app = await createTestApp()
+  let currentMeetingId: string | undefined
+  let incomingMeetingId: string | undefined
+  let messageId: string | undefined
+  try {
+    const conversation = await app.inject({
+      method: 'POST',
+      url: '/api/conversations',
+      headers: annaAuth,
+      payload: { memberIds: [testUsers.dmitry!.id] },
+    })
+    const conversationId = conversation.json().conversation.id as string
+    const startsAt = new Date()
+    const currentMeeting = await app.inject({
+      method: 'POST',
+      url: '/api/meetings',
+      headers: dmitryAuth,
+      payload: {
+        title: '__current_call_merge_test__',
+        startsAt: startsAt.toISOString(),
+        endsAt: new Date(startsAt.getTime() + 60 * 60_000).toISOString(),
+        timezone: 'Europe/Moscow',
+        attendees: [],
+        attendeeUserIds: [],
+      },
+    })
+    currentMeetingId = currentMeeting.json().meeting.id
+    const incomingMeeting = await app.inject({
+      method: 'POST',
+      url: '/api/meetings',
+      headers: annaAuth,
+      payload: {
+        title: '__incoming_call_merge_test__',
+        startsAt: startsAt.toISOString(),
+        endsAt: new Date(startsAt.getTime() + 60 * 60_000).toISOString(),
+        timezone: 'Europe/Moscow',
+        attendees: [],
+        attendeeUserIds: [testUsers.dmitry!.id],
+      },
+    })
+    incomingMeetingId = incomingMeeting.json().meeting.id
+    await pool.query("UPDATE meetings SET status='live' WHERE id=ANY($1::uuid[])", [[currentMeetingId, incomingMeetingId]])
+    const started = await app.inject({
+      method: 'POST',
+      url: `/api/conversations/${conversationId}/calls`,
+      headers: annaAuth,
+      payload: { meetingId: incomingMeetingId },
+    })
+    messageId = started.json().message.id
+
+    const merged = await app.inject({
+      method: 'POST',
+      url: `/api/meetings/${currentMeetingId}/invitations/merge-call`,
+      headers: dmitryAuth,
+      payload: {
+        incomingMeetingId,
+        callerUserId: testUsers.anna!.id,
+      },
+    })
+    assert.equal(merged.statusCode, 200, merged.body)
+    assert.equal(merged.json().meeting.id, currentMeetingId)
+    const incomingStatus = await pool.query('SELECT status FROM meetings WHERE id=$1', [incomingMeetingId])
+    assert.equal(incomingStatus.rows[0]?.status, 'ended')
+    const caller = await pool.query(
+      'SELECT response FROM meeting_attendees WHERE meeting_id=$1 AND user_id=$2',
+      [currentMeetingId, testUsers.anna!.id],
+    )
+    assert.equal(caller.rows[0]?.response, 'invited')
+    const call = await pool.query("SELECT metadata->>'status' AS status FROM messages WHERE id=$1", [messageId])
+    assert.equal(call.rows[0]?.status, 'declined')
+  } finally {
+    if (messageId) await pool.query('DELETE FROM messages WHERE id=$1', [messageId])
+    if (incomingMeetingId) await pool.query('DELETE FROM meetings WHERE id=$1', [incomingMeetingId])
+    if (currentMeetingId) await pool.query('DELETE FROM meetings WHERE id=$1', [currentMeetingId])
     await app.close()
   }
 })

@@ -1,6 +1,7 @@
 import { Check, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState, type KeyboardEvent } from 'react'
 import { api } from '../lib/api'
+import { useApp } from '../state/AppContext'
 import type { Contact } from '../types'
 import { Avatar } from './ui'
 
@@ -110,6 +111,7 @@ export function ParticipantPicker({
   value: ParticipantSelection[]
   onChange: (participants: ParticipantSelection[]) => void
 }): React.JSX.Element {
+  const { presenceByUserId } = useApp()
   const [loadedContacts, setLoadedContacts] = useState<Contact[]>([])
   const [loadedContactsLoading, setLoadedContactsLoading] = useState(false)
   const [input, setInput] = useState('')
@@ -215,7 +217,15 @@ export function ParticipantPicker({
         <div className="participant-selected-list">
           {value.map((participant) => (
             <div className="participant-chip" key={participant.userId ?? normalizedEmail(participant.email)}>
-              <Avatar name={participantLabel(participant)} src={participant.avatarUrl} size="small" />
+              <Avatar
+                name={participantLabel(participant)}
+                src={participant.avatarUrl}
+                status={participant.userId
+                  ? presenceByUserId[participant.userId]
+                    ?? contacts.find((contact) => contact.id === participant.userId)?.status
+                  : undefined}
+                size="small"
+              />
               <span className="participant-chip-copy">
                 <strong>{participantLabel(participant)}</strong>
                 {participantMeta(participant) && <small>{participantMeta(participant)}</small>}
@@ -270,7 +280,11 @@ export function ParticipantPicker({
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => addContact(contact)}
               >
-                <Avatar name={contact.displayName} src={contact.avatarUrl} />
+                <Avatar
+                  name={contact.displayName}
+                  src={contact.avatarUrl}
+                  status={presenceByUserId[contact.id] ?? contact.status}
+                />
                 <span className="participant-suggestion-copy">
                   <strong>{contact.displayName}</strong>
                   <small>{contactMeta(contact)}</small>

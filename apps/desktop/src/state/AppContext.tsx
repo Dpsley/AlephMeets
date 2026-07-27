@@ -10,7 +10,8 @@ import {
 } from '../lib/auth'
 import { API_URL, api } from '../lib/api'
 import { openMeetingWindow } from '../lib/meeting-window'
-import type { DirectCallContext, Meeting, Message, User } from '../types'
+import { startRingtone, storedRingtone, type RingtoneMode } from '../lib/ringtone'
+import type { Conversation, DirectCallContext, Meeting, Message, User } from '../types'
 
 export type ThemeMode = 'light' | 'dark'
 
@@ -22,14 +23,17 @@ interface AppState {
   loading: boolean
   error: string | null
   theme: ThemeMode
+  ringtone: RingtoneMode
   presenceByUserId: Record<string, User['status']>
   setTheme: (theme: ThemeMode) => void
+  setRingtone: (ringtone: RingtoneMode) => void
   requestLoginCode: (phone: string) => Promise<void>
   verifyLoginCode: (phone: string, code: string) => Promise<void>
   logout: () => Promise<void>
   reloadMeetings: () => Promise<void>
   inviteToCall: (targetUserId: string, meeting: Meeting, callContext: DirectCallContext) => void
   startDirectCall: (contact: User) => Promise<void>
+  startConversationCall: (conversation: Conversation) => Promise<void>
 }
 
 interface IncomingCall {
@@ -56,8 +60,10 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [theme, setThemeState] = useState<ThemeMode>(() => localStorage.getItem('aleph-theme') === 'dark' ? 'dark' : 'light')
+  const [ringtone, setRingtoneState] = useState<RingtoneMode>(storedRingtone)
   const [presenceByUserId, setPresenceByUserId] = useState<Record<string, User['status']>>({})
   const [incomingCall, setIncomingCall] = useState<IncomingCall | null>(null)
+  const [incomingCallError, setIncomingCallError] = useState<string | null>(null)
   const [messageNotice, setMessageNotice] = useState<MessageNotice | null>(null)
   const callSocketRef = useRef<Socket | null>(null)
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -71,10 +77,23 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
     setThemeState(nextTheme)
   }, [])
 
+  const setRingtone = useCallback((nextRingtone: RingtoneMode): void => {
+    setRingtoneState(nextRingtone)
+    localStorage.setItem('aleph-ringtone', nextRingtone)
+  }, [])
+
   useEffect(() => {
     document.documentElement.dataset.theme = theme
     localStorage.setItem('aleph-theme', theme)
   }, [theme])
+
+  useEffect(() => {
+    const syncRingtone = (event: StorageEvent): void => {
+      if (event.key === 'aleph-ringtone') setRingtoneState(storedRingtone())
+    }
+    window.addEventListener('storage', syncRingtone)
+    return () => window.removeEventListener('storage', syncRingtone)
+  }, [])
 
   const loadSession = useCallback(async (): Promise<void> => {
     const [session, meetingResult, exchange] = await Promise.all([
@@ -178,6 +197,65 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
     }
   }, [inviteToCall, navigate, reloadMeetings, user])
 
+  const startConversationCall = useCallback(async (conversation: Conversation): Promise<void> => {
+    if (!user) throw new Error('Профиль пользователя не загружен.')
+    const recipients = conversation.members.filter((member) => member.id !== user.id)
+    if (!recipients.length) throw new Error('В беседе нет участников для вызова.')
+    const start = new Date()
+    const created = await api.createMeeting({
+      title: `Звонок: ${conversation.title || 'Групповой чат'}`,
+      startsAt: start.toISOString(),
+      endsAt: new Date(start.getTime() + 60 * 60_000).toISOString(),
+      timezone: user.timezone,
+      attendees: recipients.map((member) => member.email).filter((email): email is string => Boolean(email)),
+      attendeeUserIds: recipients.map((member) => member.id),
+      waitingRoom: false,
+      muteOnEntry: false,
+      allowJoinBeforeHost: true,
+    })
+    const activated = await api.updateMeetingStatus(created.meeting.id, 'live')
+    const callLog = await api.startCallLog(conversation.id, activated.meeting.id)
+    const callContext: DirectCallContext = {
+      conversationId: conversation.id,
+      messageId: callLog.message.id,
+      startedAt: start.toISOString(),
+      groupCall: true,
+    }
+    for (const recipient of recipients) inviteToCall(recipient.id, activated.meeting, callContext)
+    await reloadMeetings()
+    if (!await openMeetingWindow(activated.meeting.id, { meeting: activated.meeting, callContext })) {
+      navigate(`/meeting/${activated.meeting.id}`, { state: { callContext } })
+    }
+  }, [inviteToCall, navigate, reloadMeetings, user])
+
+  const navigateFromSystem = useCallback((route: string): void => {
+    const target = new URL(route, 'https://alephmeets.local')
+    if (target.pathname === '/chat' && target.searchParams.has('conversationId')) {
+      navigate('/chat', { state: { conversationId: target.searchParams.get('conversationId') ?? undefined } })
+      return
+    }
+    navigate(`${target.pathname}${target.search}${target.hash}`)
+  }, [navigate])
+
+  const showSystemNotification = useCallback((notification: {
+    id: string
+    title: string
+    body: string
+    route?: string
+  }): void => {
+    if (window.alephDesktop?.showNotification) {
+      window.alephDesktop.showNotification(notification)
+      return
+    }
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return
+    const webNotification = new Notification(notification.title, { body: notification.body })
+    if (notification.route) {
+      webNotification.onclick = () => navigateFromSystem(notification.route as string)
+    }
+  }, [navigateFromSystem])
+
+  useEffect(() => window.alephDesktop?.onNavigate(navigateFromSystem), [navigateFromSystem])
+
   useEffect(() => {
     if (!user || !getAccessToken()) return
     const socket = io(API_URL, {
@@ -212,10 +290,38 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
           detail: { conversationId: call.callContext.conversationId },
         }))
       }
-      if (!location.pathname.startsWith('/meeting/')) setIncomingCall(call)
+      setIncomingCallError(null)
+      setIncomingCall(call)
+      showSystemNotification({
+        id: `incoming-call:${call.meeting.id}`,
+        title: 'Входящий вызов',
+        body: `${call.caller.displayName} приглашает вас в звонок`,
+      })
     })
-    socket.on('call:cancelled', ({ meetingId }: { meetingId: string }) => {
-      setIncomingCall((current) => current?.meeting.id === meetingId ? null : current)
+    socket.on('call:cancelled', ({ meetingId, reason }: { meetingId: string; reason?: string }) => {
+      setIncomingCall((current) => {
+        if (current?.meeting.id !== meetingId) return current
+        if (reason === 'missed' && !current.callContext) {
+          showSystemNotification({
+            id: `missed-call:${meetingId}`,
+            title: 'Пропущенный вызов',
+            body: `Вы не ответили на вызов от ${current.caller.displayName}`,
+          })
+        }
+        return null
+      })
+    })
+    socket.on('call:redirected', ({ meeting: redirectedMeeting }: { meeting: Meeting }) => {
+      setIncomingCall(null)
+      void openMeetingWindow(redirectedMeeting.id, {
+        meeting: redirectedMeeting,
+        autoJoin: true,
+      }).then((opened) => {
+        window.dispatchEvent(new CustomEvent('aleph:leave-current-call'))
+        if (!opened) navigate(`/meeting/${redirectedMeeting.id}`, {
+          state: { meeting: redirectedMeeting, autoJoin: true },
+        })
+      })
     })
     socket.on('message:new', (message: Message) => {
       window.dispatchEvent(new CustomEvent('aleph:conversations-updated', {
@@ -234,10 +340,17 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
       })
       if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current)
       noticeTimerRef.current = setTimeout(() => setMessageNotice(null), 6000)
-      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-        const notification = new Notification(message.senderName || 'AlephMeets', { body })
-        notification.onclick = () => navigate('/chat', { state: { conversationId: message.conversationId } })
-      }
+      const missedCall = message.kind === 'system'
+        && message.metadata?.type === 'call'
+        && message.metadata.status === 'missed'
+      showSystemNotification({
+        id: `message:${message.id}`,
+        title: missedCall ? 'Пропущенный вызов' : message.senderName || 'AlephMeets',
+        body: missedCall
+          ? `Вызов от ${message.senderName || 'пользователя'} остался без ответа`
+          : body,
+        route: `/chat?conversationId=${encodeURIComponent(message.conversationId)}`,
+      })
     })
     return () => {
       clearInterval(heartbeat)
@@ -245,46 +358,26 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
       callSocketRef.current = null
       if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current)
     }
-  }, [location.pathname, navigate, reloadMeetings, user])
+  }, [navigate, reloadMeetings, showSystemNotification, user])
 
   useEffect(() => {
     if (!incomingCall) return
-    const audioContext = new AudioContext()
     let active = true
-    let interval: ReturnType<typeof setInterval> | undefined
-    const ring = (): void => {
-      if (!active || audioContext.state === 'closed') return
-      const now = audioContext.currentTime
-      const gain = audioContext.createGain()
-      gain.connect(audioContext.destination)
-      gain.gain.setValueAtTime(0.0001, now)
-      gain.gain.exponentialRampToValueAtTime(0.055, now + 0.03)
-      gain.gain.setValueAtTime(0.055, now + 1.05)
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + 1.18)
-      for (const frequency of [440, 480]) {
-        const oscillator = audioContext.createOscillator()
-        oscillator.frequency.setValueAtTime(frequency, now)
-        oscillator.connect(gain)
-        oscillator.start(now)
-        oscillator.stop(now + 1.2)
-      }
-    }
-    void audioContext.resume().then(() => {
-      if (!active) return
-      ring()
-      interval = setInterval(ring, 2800)
+    let stop = (): void => undefined
+    void (window.alephDesktop?.claimRingtone?.() ?? Promise.resolve(true)).then((claimed) => {
+      if (!active || !claimed) return
+      stop = startRingtone(ringtone)
     })
     return () => {
       active = false
-      if (interval) clearInterval(interval)
-      void audioContext.close()
+      stop()
     }
-  }, [incomingCall])
+  }, [incomingCall, ringtone])
 
   const declineIncomingCall = useCallback((): void => {
     if (!incomingCall) return
     void api.declineMeetingInvitation(incomingCall.meeting.id).catch(() => undefined)
-    if (incomingCall.callContext) {
+    if (incomingCall.callContext && !incomingCall.callContext.groupCall) {
       void api.finishCallLog(
         incomingCall.callContext.conversationId,
         incomingCall.callContext.messageId,
@@ -292,8 +385,61 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
         Date.now() - new Date(incomingCall.callContext.startedAt).getTime(),
       )
     }
+    setIncomingCallError(null)
     setIncomingCall(null)
   }, [incomingCall])
+
+  const currentMeetingId = useMemo(() => {
+    const match = location.pathname.match(/^\/meeting\/([^/]+)/)
+    return match?.[1] ? decodeURIComponent(match[1]) : null
+  }, [location.pathname])
+  const currentMeeting = currentMeetingId
+    ? meetings.find((meeting) => meeting.id === currentMeetingId)
+    : undefined
+  const hasParallelIncomingCall = Boolean(
+    incomingCall && currentMeetingId && currentMeetingId !== incomingCall.meeting.id,
+  )
+  const canMergeParallelCall = Boolean(
+    hasParallelIncomingCall
+    && currentMeeting
+    && (incomingCall?.meeting.attendees?.length ?? 0) <= 1,
+  )
+
+  const openIncomingCall = useCallback(async (
+    call: IncomingCall,
+    leaveCurrentMeeting: boolean,
+  ): Promise<void> => {
+    setIncomingCall(null)
+    setIncomingCallError(null)
+    const opened = await openMeetingWindow(call.meeting.id, {
+      meeting: call.meeting,
+      callContext: call.callContext,
+      autoJoin: true,
+    })
+    if (leaveCurrentMeeting && currentMeetingId) {
+      if (currentMeeting?.hostId === user?.id) {
+        void api.endMeetingForEveryone(currentMeetingId).catch(() => undefined)
+      }
+      window.dispatchEvent(new CustomEvent('aleph:leave-current-call'))
+    }
+    if (!opened) {
+      navigate(`/meeting/${call.meeting.id}`, {
+        state: { meeting: call.meeting, callContext: call.callContext, autoJoin: true },
+      })
+    }
+  }, [currentMeeting?.hostId, currentMeetingId, navigate, user?.id])
+
+  const mergeParallelCall = useCallback(async (): Promise<void> => {
+    if (!incomingCall || !currentMeetingId) return
+    setIncomingCallError(null)
+    try {
+      await api.mergeIncomingCall(currentMeetingId, incomingCall.meeting.id, incomingCall.caller.id)
+      setIncomingCall(null)
+      await reloadMeetings()
+    } catch (reason) {
+      setIncomingCallError(reason instanceof Error ? reason.message : 'Не удалось пригласить звонящего в текущую встречу.')
+    }
+  }, [currentMeetingId, incomingCall, reloadMeetings])
 
   const value = useMemo(() => ({
     user,
@@ -303,14 +449,17 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
     loading,
     error,
     theme,
+    ringtone,
     presenceByUserId,
     setTheme,
+    setRingtone,
     requestLoginCode,
     verifyLoginCode,
     logout,
     reloadMeetings,
     inviteToCall,
     startDirectCall,
+    startConversationCall,
   }), [
     user,
     meetings,
@@ -318,39 +467,52 @@ export function AppProvider({ children }: { children: React.ReactNode }): React.
     loading,
     error,
     theme,
+    ringtone,
     presenceByUserId,
     setTheme,
+    setRingtone,
     requestLoginCode,
     verifyLoginCode,
     logout,
     reloadMeetings,
     inviteToCall,
     startDirectCall,
+    startConversationCall,
   ])
 
   return (
     <AppContext.Provider value={value}>
       {children}
-      <Modal open={Boolean(incomingCall)} onClose={declineIncomingCall} title="Входящий вызов" width={380}>
+      <Modal
+        open={Boolean(incomingCall)}
+        onClose={declineIncomingCall}
+        title={hasParallelIncomingCall ? 'Еще один входящий вызов' : 'Входящий вызов'}
+        width={hasParallelIncomingCall ? 460 : 380}
+      >
         {incomingCall && <div className="incoming-call">
-          <Avatar name={incomingCall.caller.displayName} src={incomingCall.caller.avatarUrl} size="large" />
+          <Avatar
+            name={incomingCall.caller.displayName}
+            src={incomingCall.caller.avatarUrl}
+            status={presenceByUserId[incomingCall.caller.id] ?? incomingCall.caller.status}
+            size="large"
+          />
           <strong>{incomingCall.caller.displayName}</strong>
-          <span>приглашает вас в аудио- и видеозвонок</span>
-          <div>
+          <span>
+            {hasParallelIncomingCall
+              ? 'Вы уже участвуете во встрече. Выберите, как обработать новый вызов.'
+              : 'приглашает вас в аудио- и видеозвонок'}
+          </span>
+          {incomingCallError && <p className="form-error">{incomingCallError}</p>}
+          <div className={hasParallelIncomingCall ? 'incoming-call-actions-stacked' : ''}>
             <button className="button secondary" onClick={declineIncomingCall}>Отклонить</button>
-            <button className="button primary" onClick={() => {
-              const call = incomingCall
-              setIncomingCall(null)
-              void openMeetingWindow(call.meeting.id, {
-                meeting: call.meeting,
-                callContext: call.callContext,
-                autoJoin: true,
-              }).then((opened) => {
-                if (!opened) navigate(`/meeting/${call.meeting.id}`, {
-                  state: { meeting: call.meeting, callContext: call.callContext, autoJoin: true },
-                })
-              })
-            }}>Принять</button>
+            {canMergeParallelCall && (
+              <button className="button secondary" onClick={() => void mergeParallelCall()}>
+                Пригласить в текущий звонок
+              </button>
+            )}
+            <button className="button primary" onClick={() => void openIncomingCall(incomingCall, hasParallelIncomingCall)}>
+              {hasParallelIncomingCall ? 'Завершить текущий и принять' : 'Принять'}
+            </button>
           </div>
         </div>}
       </Modal>

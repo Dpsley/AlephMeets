@@ -114,6 +114,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ userIds }),
     }),
+  mergeIncomingCall: (id: string, incomingMeetingId: string, callerUserId: string) =>
+    request<{ meeting: Meeting }>(`/api/meetings/${id}/invitations/merge-call`, {
+      method: 'POST',
+      body: JSON.stringify({ incomingMeetingId, callerUserId }),
+    }),
   declineMeetingInvitation: (id: string) =>
     request<{ success: boolean }>(`/api/meetings/${id}/invitations/decline`, { method: 'POST' }),
   contacts: () => request<{ contacts: Contact[] }>('/api/contacts'),

@@ -6,12 +6,20 @@ contextBridge.exposeInMainWorld('alephDesktop', {
   maximize: () => ipcRenderer.send('window:maximize'),
   close: () => ipcRenderer.send('window:close'),
   isMaximized: () => ipcRenderer.invoke('window:is-maximized') as Promise<boolean>,
+  claimRingtone: () => ipcRenderer.invoke('ringtone:claim') as Promise<boolean>,
   onMaximizedChanged: (listener: (maximized: boolean) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, maximized: boolean): void => listener(maximized)
     ipcRenderer.on('window:maximized-changed', handler)
     return () => ipcRenderer.removeListener('window:maximized-changed', handler)
   },
   getVersion: () => ipcRenderer.invoke('app:version') as Promise<string>,
+  showNotification: (notification: { id: string; title: string; body: string; route?: string }) =>
+    ipcRenderer.send('notification:show', notification),
+  onNavigate: (listener: (route: string) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, route: string): void => listener(route)
+    ipcRenderer.on('app:navigate', handler)
+    return () => ipcRenderer.removeListener('app:navigate', handler)
+  },
   ensureMediaAccess: (kinds: Array<'camera' | 'microphone'>) =>
     ipcRenderer.invoke('media:ensure-access', kinds) as Promise<Array<{
       kind: 'camera' | 'microphone'

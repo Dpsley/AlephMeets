@@ -12,6 +12,22 @@ export async function ensureDesktopMediaAccess(kinds: DesktopMediaAccessKind[]):
   )
 }
 
+export async function retryDesktopMediaAccess(kinds: DesktopMediaAccessKind[]): Promise<void> {
+  try {
+    await ensureDesktopMediaAccess(kinds)
+  } catch (reason) {
+    if (window.alephDesktop?.platform === 'darwin') {
+      await Promise.all(kinds.map((kind) => window.alephDesktop?.openMediaSettings(kind)))
+      const label = kinds.includes('camera') ? 'камере' : 'микрофону'
+      throw new DOMException(
+        `Разрешите AlephMeets доступ к ${label} в открытых настройках macOS и перезапустите приложение.`,
+        'NotAllowedError',
+      )
+    }
+    throw reason
+  }
+}
+
 export function isMissingDeviceError(error: unknown): boolean {
   const name = error && typeof error === 'object' && 'name' in error ? String(error.name) : ''
   const message = error instanceof Error ? error.message : String(error)

@@ -1,4 +1,18 @@
-import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, safeStorage, session, shell, systemPreferences } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  desktopCapturer,
+  dialog,
+  ipcMain,
+  Menu,
+  nativeImage,
+  Notification,
+  safeStorage,
+  session,
+  shell,
+  systemPreferences,
+  Tray,
+} from 'electron'
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { extname, join } from 'node:path'
 import { appIconPath } from './app-icon'
@@ -21,7 +35,10 @@ const pendingDisplayRequests = new Map<number, {
   callback: (streams: Electron.Streams) => void
   timer: ReturnType<typeof setTimeout>
 }>()
+const recentNotificationIds = new Map<string, ReturnType<typeof setTimeout>>()
 let nextDisplayRequestId = 1
+let mainWindow: BrowserWindow | null = null
+let tray: Tray | null = null
 
 type MediaAccessKind = 'camera' | 'microphone'
 
@@ -127,6 +144,34 @@ function uniqueDownloadName(filename: string): string {
   return candidate
 }
 
+function focusWindow(target: BrowserWindow | null, route?: string): void {
+  const window = target && !target.isDestroyed() ? target : mainWindow
+  if (!window || window.isDestroyed()) return
+  if (window.isMinimized()) window.restore()
+  window.show()
+  window.focus()
+  if (!route) return
+  const sendRoute = (): void => window.webContents.send('app:navigate', route)
+  if (window.webContents.isLoading()) window.webContents.once('did-finish-load', sendRoute)
+  else sendRoute()
+}
+
+function createTray(): void {
+  if (tray || !appIconPath()) return
+  const source = nativeImage.createFromPath(appIconPath())
+  const image = process.platform === 'darwin'
+    ? source.resize({ width: 18, height: 18 })
+    : source
+  tray = new Tray(image)
+  tray.setToolTip('AlephMeets')
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Открыть AlephMeets', click: () => focusWindow(mainWindow) },
+    { type: 'separator' },
+    { label: 'Выйти', click: () => app.quit() },
+  ]))
+  tray.on('click', () => focusWindow(mainWindow))
+}
+
 function createWindow(authSlot = 'primary'): BrowserWindow {
   const browserWindow = new BrowserWindow({
     width: 1440,
@@ -147,10 +192,12 @@ function createWindow(authSlot = 'primary'): BrowserWindow {
     },
   })
   const webContentsId = browserWindow.webContents.id
+  if (authSlot === 'primary') mainWindow = browserWindow
   authSlots.set(webContentsId, authSlot)
   browserWindow.on('closed', () => {
     authSlots.delete(webContentsId)
     if (authSlot !== 'primary') transientAuth.delete(authSlot)
+    if (mainWindow === browserWindow) mainWindow = null
   })
   browserWindow.on('maximize', () => browserWindow.webContents.send('window:maximized-changed', true))
   browserWindow.on('unmaximize', () => browserWindow.webContents.send('window:maximized-changed', false))
@@ -284,7 +331,61 @@ app.whenReady().then(async () => {
     BrowserWindow.fromWebContents(event.sender)?.close()
   })
   ipcMain.handle('window:is-maximized', (event) => BrowserWindow.fromWebContents(event.sender)?.isMaximized() ?? false)
+  ipcMain.handle('ringtone:claim', (event) => {
+    const source = BrowserWindow.fromWebContents(event.sender)
+    if (!source || source.isDestroyed()) return false
+    const focused = BrowserWindow.getFocusedWindow()
+    if (focused) return focused === source
+    const meetingWindow = [...meetingWindows.values()].find((window) => !window.isDestroyed())
+    return (meetingWindow ?? mainWindow) === source
+  })
   ipcMain.handle('app:version', () => app.getVersion())
+  ipcMain.on('notification:show', (event, value: unknown) => {
+    if (!value || typeof value !== 'object') return
+    const payload = value as {
+      id?: unknown
+      title?: unknown
+      body?: unknown
+      route?: unknown
+    }
+    if (
+      typeof payload.id !== 'string'
+      || typeof payload.title !== 'string'
+      || typeof payload.body !== 'string'
+    ) return
+    if (recentNotificationIds.has(payload.id)) return
+    const cleanup = setTimeout(() => recentNotificationIds.delete(payload.id as string), 60_000)
+    recentNotificationIds.set(payload.id, cleanup)
+    const sourceWindow = BrowserWindow.fromWebContents(event.sender)
+    const route = typeof payload.route === 'string' ? payload.route : undefined
+    const activeMeetingWindow = [...meetingWindows.values()].find((window) => !window.isDestroyed())
+    const handleClick = (): void => focusWindow(
+      route
+        ? mainWindow
+        : activeMeetingWindow
+          ?? (sourceWindow && !sourceWindow.isDestroyed() ? sourceWindow : mainWindow),
+      route,
+    )
+    if (process.platform === 'win32' && tray) {
+      tray.displayBalloon({
+        title: payload.title.slice(0, 100),
+        content: payload.body.slice(0, 240),
+        icon: appIconPath(),
+        noSound: true,
+      })
+      tray.removeAllListeners('balloon-click')
+      tray.once('balloon-click', handleClick)
+    } else if (Notification.isSupported()) {
+      const notification = new Notification({
+        title: payload.title.slice(0, 100),
+        body: payload.body.slice(0, 240),
+        icon: appIconPath(),
+        silent: true,
+      })
+      notification.on('click', handleClick)
+      notification.show()
+    }
+  })
   ipcMain.handle('media:ensure-access', async (_event, kinds?: unknown[]) => {
     const requested = Array.isArray(kinds) && kinds.length ? kinds : ['microphone', 'camera']
     const unique = [...new Set(requested.filter(isMediaAccessKind))]
@@ -397,7 +498,8 @@ app.whenReady().then(async () => {
 
   if (!await enforceMandatoryUpdate()) return
 
-  createWindow()
+  mainWindow = createWindow()
+  createTray()
   destroyMandatoryUpdateGate()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -407,4 +509,11 @@ app.whenReady().then(async () => {
 app.on('window-all-closed', () => {
   for (const requestId of pendingDisplayRequests.keys()) finishDisplayRequest(requestId)
   if (process.platform !== 'darwin') app.quit()
+})
+
+app.on('before-quit', () => {
+  for (const timer of recentNotificationIds.values()) clearTimeout(timer)
+  recentNotificationIds.clear()
+  tray?.destroy()
+  tray = null
 })

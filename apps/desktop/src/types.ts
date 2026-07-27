@@ -106,6 +106,7 @@ export interface DirectCallContext {
   conversationId: string
   messageId: string
   startedAt: string
+  groupCall?: boolean
 }
 
 export interface Conversation {
