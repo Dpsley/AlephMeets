@@ -38,6 +38,25 @@ Users whose Aleph ID profile has `department`, or whose email domain is
 Aleph ID service credentials. Configure `AD_CONTOL_SECRET` on the API server for
 the AD control string.
 
+### macOS Keychain access
+
+Desktop tokens are encrypted with Electron `safeStorage`. On macOS this requires
+access to the login Keychain. If access is unavailable or encryption fails, the
+app offers a choice: cancel and restore Keychain access, or sign in until the app
+quits. Temporary sessions require explicit confirmation, keep tokens only in the
+main process memory, and remove any previously saved session. Token refreshes and
+meeting windows share that temporary session; a full quit requires SMS sign-in
+again. No plaintext token file is written.
+
+To restore persistent sign-in, fully quit AlephMeets, unlock the `login` keychain
+in Keychain Access, relaunch the app, and allow access for AlephMeets if macOS
+prompts. An app update can require authorization again; use a consistent Apple
+Developer ID signing identity for distributed builds. Do not reset the user's
+entire keychain as a troubleshooting step.
+
+References: [Electron 39 safeStorage](https://github.com/electron/electron/blob/v39.8.10/docs/api/safe-storage.md),
+[Apple: trusted apps requesting Keychain access](https://support.apple.com/guide/keychain-access/kyca1331/mac).
+
 ## Current features
 
 - SMS sign-in through Aleph ID, with encrypted desktop token storage

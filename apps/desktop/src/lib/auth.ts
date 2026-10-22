@@ -32,10 +32,10 @@ export function getRefreshToken(): string | null {
 }
 
 export async function saveAuthTokens(value: AuthTokens): Promise<void> {
-  tokens = value
   const serialized = JSON.stringify(value)
   if (window.alephDesktop) await window.alephDesktop.setAuthTokens(serialized)
   else localStorage.setItem(browserStorageKey, serialized)
+  tokens = value
 }
 
 export async function clearAuthTokens(): Promise<void> {

@@ -59,7 +59,7 @@ export function LoginPage(): React.JSX.Element {
           <button className="button primary full auth-submit" onClick={() => void verify()} disabled={code.length < 5 || submitting}>{submitting ? 'Проверка...' : 'Войти'}</button>
           <div className="auth-secondary-actions"><button onClick={() => { setStep('phone'); setCode(''); setError(null) }}><ArrowLeft size={15} />Изменить номер</button><button onClick={() => void sendCode()}>Отправить повторно</button></div>
         </>}
-        <small className="auth-security"><LockKeyhole size={14} />Сессия хранится в зашифрованном хранилище системы.</small>
+        <small className="auth-security"><LockKeyhole size={14} />Для сохранения сессии используется защищённое хранилище системы.</small>
       </main>
     </div>
   )

@@ -56,6 +56,9 @@ contextBridge.exposeInMainWorld('alephDesktop', {
   selectScreenShareSource: (requestId: number, sourceId?: string) =>
     ipcRenderer.send('screen-share:select', requestId, sourceId),
   getAuthTokens: () => ipcRenderer.invoke('auth:get') as Promise<string | null>,
-  setAuthTokens: (value: string) => ipcRenderer.invoke('auth:set', value) as Promise<void>,
+  setAuthTokens: async (value: string): Promise<void> => {
+    const result = await ipcRenderer.invoke('auth:set', value) as { error: string } | null
+    if (result?.error) throw new Error(result.error)
+  },
   clearAuthTokens: () => ipcRenderer.invoke('auth:clear') as Promise<void>,
 })

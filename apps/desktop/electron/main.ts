@@ -7,15 +7,15 @@ import {
   Menu,
   nativeImage,
   Notification,
-  safeStorage,
   session,
   shell,
   systemPreferences,
   Tray,
 } from 'electron'
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, writeFileSync } from 'node:fs'
 import { extname, join } from 'node:path'
 import { appIconPath } from './app-icon'
+import { createAuthStorage } from './auth-storage'
 import { destroyMandatoryUpdateGate, enforceMandatoryUpdate } from './mandatory-updater'
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
@@ -25,7 +25,6 @@ if (process.platform === 'win32') {
 }
 
 const authSlots = new Map<number, string>()
-const transientAuth = new Map<string, Buffer>()
 const meetingWindows = new Map<string, BrowserWindow>()
 const meetingContexts = new Map<number, Record<string, unknown> | null>()
 const forceClosingMeetingWindows = new Set<number>()
@@ -91,35 +90,29 @@ function finishDisplayRequest(requestId: number, sourceId?: string): void {
   }
 }
 
-function authFilePath(): string {
-  return join(app.getPath('userData'), 'auth-tokens.bin')
-}
-
-function readAuth(slot: string): string | null {
-  try {
-    const encrypted = slot === 'primary'
-      ? (existsSync(authFilePath()) ? readFileSync(authFilePath()) : null)
-      : transientAuth.get(slot) ?? null
-    return encrypted ? safeStorage.decryptString(encrypted) : null
-  } catch {
-    return null
-  }
-}
-
-function writeAuth(slot: string, value: string): void {
-  if (!safeStorage.isEncryptionAvailable()) throw new Error('Secure token storage is unavailable')
-  const encrypted = safeStorage.encryptString(value)
-  if (slot === 'primary') writeFileSync(authFilePath(), encrypted)
-  else transientAuth.set(slot, encrypted)
-}
-
-function clearAuth(slot: string): void {
-  if (slot === 'primary') {
-    if (existsSync(authFilePath())) unlinkSync(authFilePath())
-  } else {
-    transientAuth.delete(slot)
-  }
-}
+const authStorage = createAuthStorage(
+  () => join(app.getPath('userData'), 'auth-tokens.bin'),
+  async () => {
+    const options: Electron.MessageBoxOptions = {
+      type: 'warning',
+      title: 'AlephMeets — хранение сессии',
+      message: 'Защищённое хранилище недоступно',
+      detail: (process.platform === 'darwin'
+        ? 'Разблокируйте связку ключей «Вход» (login) в приложении «Связка ключей» и разрешите AlephMeets доступ, если macOS его запросит. Затем полностью закройте и снова откройте AlephMeets.\n\n'
+        : 'Проверьте доступ к защищённому хранилищу системы и перезапустите AlephMeets.\n\n')
+        + 'Можно войти до закрытия приложения: токены останутся только в памяти и не будут записаны на диск. После полного выхода из AlephMeets потребуется новый код из SMS.',
+      buttons: ['Отмена', 'Войти до закрытия приложения'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+    }
+    const owner = BrowserWindow.getFocusedWindow() ?? mainWindow
+    const result = owner && !owner.isDestroyed()
+      ? await dialog.showMessageBox(owner, options)
+      : await dialog.showMessageBox(options)
+    return result.response === 1
+  },
+)
 
 function safeDownloadName(filename: string): string {
   const trimmed = filename.trim()
@@ -196,7 +189,7 @@ function createWindow(authSlot = 'primary'): BrowserWindow {
   authSlots.set(webContentsId, authSlot)
   browserWindow.on('closed', () => {
     authSlots.delete(webContentsId)
-    if (authSlot !== 'primary') transientAuth.delete(authSlot)
+    if (authSlot !== 'primary') authStorage.clear(authSlot)
     if (mainWindow === browserWindow) mainWindow = null
   })
   browserWindow.on('maximize', () => browserWindow.webContents.send('window:maximized-changed', true))
@@ -485,15 +478,22 @@ app.whenReady().then(async () => {
   ipcMain.handle('meeting:context', (event) => meetingContexts.get(event.sender.id) ?? null)
   ipcMain.handle('auth:get', (event) => {
     const slot = authSlots.get(event.sender.id) ?? 'primary'
-    return readAuth(slot)
+    return authStorage.read(slot)
   })
-  ipcMain.handle('auth:set', (event, value: string) => {
+  ipcMain.handle('auth:set', async (event, value: string) => {
     const slot = authSlots.get(event.sender.id) ?? 'primary'
-    writeAuth(slot, value)
+    try {
+      await authStorage.write(slot, value)
+      return null
+    } catch (error) {
+      return { error: error instanceof Error && error.message.startsWith('Вход отменён:')
+        ? error.message
+        : 'Не удалось сохранить сессию. Проверьте доступ к папке данных AlephMeets и свободное место на диске.' }
+    }
   })
   ipcMain.handle('auth:clear', (event) => {
     const slot = authSlots.get(event.sender.id) ?? 'primary'
-    clearAuth(slot)
+    authStorage.clear(slot)
   })
 
   if (!await enforceMandatoryUpdate()) return
