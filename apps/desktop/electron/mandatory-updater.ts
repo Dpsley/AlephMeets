@@ -1,9 +1,6 @@
-import { app, autoUpdater as nativeUpdater, BrowserWindow, dialog, shell } from 'electron'
+import { app, BrowserWindow, dialog } from 'electron'
 import electronUpdater from 'electron-updater'
 import { appIconPath } from './app-icon'
-import { supportsMacAutoUpdate } from './mac-update-support'
-import { UpdateInstallation } from './update-installation'
-import { log } from './logging'
 
 const { autoUpdater } = electronUpdater
 let releasedGate: UpdateGate | null = null
@@ -17,7 +14,6 @@ type GateStatus = {
 class UpdateGate {
   private readonly window: BrowserWindow
   private released = false
-  private installing = false
 
   constructor() {
     this.window = new BrowserWindow({
@@ -39,7 +35,7 @@ class UpdateGate {
     })
 
     this.window.on('closed', () => {
-      if (!this.released && !this.installing) app.quit()
+      if (!this.released) app.quit()
     })
   }
 
@@ -50,7 +46,6 @@ class UpdateGate {
 
   async setStatus({ title, detail, progress }: GateStatus): Promise<void> {
     if (this.window.isDestroyed()) return
-    if (title !== 'Загружаем обновление') log.info('[updater] status', { title, detail, progress })
     const normalizedProgress = progress === undefined
       ? null
       : Math.max(0, Math.min(100, Math.round(progress)))
@@ -78,37 +73,19 @@ class UpdateGate {
     return result.response === 0
   }
 
-  async askToInstallManually(version: string): Promise<boolean> {
+  async askToRetry(message: string): Promise<boolean> {
     if (this.window.isDestroyed()) return false
     const result = await dialog.showMessageBox(this.window, {
-      type: 'info',
-      title: 'Обновление AlephMeets',
-      message: `Установите AlephMeets ${version}`,
-      detail: 'Эта сборка требует ручной установки обновления. Скачайте DMG со страницы релиза, полностью закройте AlephMeets и перенесите приложение в папку «Программы», заменив предыдущую версию.',
-      buttons: ['Открыть страницу загрузки', 'Закрыть приложение'],
-      defaultId: 0, cancelId: 1, noLink: true,
-    })
-    return result.response === 0
-  }
-
-  async askToRetry(message: string): Promise<'retry' | 'manual' | 'close'> {
-    if (this.window.isDestroyed()) return 'close'
-    const mac = process.platform === 'darwin'
-    const result = await dialog.showMessageBox(this.window, {
       type: 'error',
-      title: 'Не удалось обновить AlephMeets',
-      message: 'Для продолжения требуется обновление',
+      title: 'Не удалось проверить обновление',
+      message: 'Проверка обновлений обязательна',
       detail: message,
-      buttons: mac ? ['Повторить', 'Скачать вручную', 'Закрыть приложение'] : ['Повторить', 'Закрыть приложение'],
+      buttons: ['Повторить', 'Закрыть приложение'],
       defaultId: 0,
-      cancelId: mac ? 2 : 1,
+      cancelId: 1,
       noLink: true,
     })
-    return result.response === 0 ? 'retry' : mac && result.response === 1 ? 'manual' : 'close'
-  }
-
-  setInstalling(value: boolean): void {
-    this.installing = value
+    return result.response === 0
   }
 
   closeApplication(): void {
@@ -138,13 +115,11 @@ export async function enforceMandatoryUpdate(): Promise<boolean> {
   autoUpdater.autoInstallOnAppQuit = true
   autoUpdater.autoRunAppAfterInstall = true
   autoUpdater.allowPrerelease = false
-  autoUpdater.logger = log
+  autoUpdater.logger = console
   autoUpdater.on('error', (error) => console.error('[updater]', error))
 
   const gate = new UpdateGate()
   await gate.show()
-  const macAutoUpdate = process.platform !== 'darwin' || supportsMacAutoUpdate(app.getPath('exe'))
-  log.info('[updater] automatic installation supported', macAutoUpdate)
 
   while (true) {
     try {
@@ -165,13 +140,6 @@ export async function enforceMandatoryUpdate(): Promise<boolean> {
         detail: 'Обновление необходимо для продолжения работы.',
         progress: 0,
       })
-      if (!macAutoUpdate) {
-        if (await gate.askToInstallManually(result.updateInfo.version)) {
-          await shell.openExternal(`https://github.com/Dpsley/AlephMeets/releases/tag/v${encodeURIComponent(result.updateInfo.version)}`)
-        }
-        gate.closeApplication()
-        return false
-      }
       if (!await gate.askToUpdate(result.updateInfo.version)) {
         gate.closeApplication()
         return false
@@ -185,42 +153,27 @@ export async function enforceMandatoryUpdate(): Promise<boolean> {
         })
       }
       autoUpdater.on('download-progress', onProgress)
-      const installation = new UpdateInstallation(autoUpdater, process.platform === 'darwin' ? nativeUpdater : null, app)
 
       try {
-        await installation.watch(autoUpdater.downloadUpdate())
-        autoUpdater.removeListener('download-progress', onProgress)
-        if (process.platform === 'darwin') {
-          await gate.setStatus({
-            title: 'Подготавливаем обновление',
-            detail: 'Загрузка завершена. macOS проверяет и распаковывает приложение. Это может занять несколько минут.',
-          })
-        }
-        await installation.waitUntilReady()
-        await gate.setStatus({
-          title: 'Устанавливаем обновление',
-          detail: 'AlephMeets сейчас перезапустится.',
-          progress: 100,
-        })
-        gate.setInstalling(true)
-        await installation.install(() => autoUpdater.quitAndInstall(true, true))
-        return false
+        await autoUpdater.downloadUpdate()
       } finally {
         autoUpdater.removeListener('download-progress', onProgress)
-        installation.dispose()
       }
+
+      await gate.setStatus({
+        title: 'Устанавливаем обновление',
+        detail: 'AlephMeets сейчас перезапустится.',
+        progress: 100,
+      })
+      autoUpdater.quitAndInstall(true, true)
+      return false
     } catch (reason) {
-      gate.setInstalling(false)
       console.error('[updater] mandatory update failed', reason)
       await gate.setStatus({
-        title: 'Не удалось обновить AlephMeets',
-        detail: 'Повторите попытку или установите обновление вручную.',
+        title: 'Не удалось проверить обновление',
+        detail: 'Для запуска AlephMeets требуется успешная проверка версии.',
       })
-      const action = await gate.askToRetry(errorMessage(reason))
-      if (action === 'manual') {
-        await shell.openExternal('https://github.com/Dpsley/AlephMeets/releases/latest')
-      }
-      if (action !== 'retry') {
+      if (!await gate.askToRetry(errorMessage(reason))) {
         gate.closeApplication()
         return false
       }

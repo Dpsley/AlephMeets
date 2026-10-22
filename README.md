@@ -106,13 +106,6 @@ Packaged clients check the latest public GitHub Release before opening the main
 window. A newer version is mandatory: the user can install it or close the app.
 If GitHub cannot be reached, the gate only allows retrying or closing.
 
-On macOS, ad-hoc builds use manual DMG installation from the release page.
-Automatic installation requires a stable Apple Developer ID signing identity.
-The updater waits for Squirrel.Mac to finish unpacking and verifying a signed
-update before showing the restart step. Preparation and restart have timeouts;
-late errors offer retry, manual installation, or closing the app. A client already
-stuck at 100% must be fully quit and replaced using the release DMG in Applications.
-
 Create a release by pushing a semantic version tag from the commit to publish:
 
 ```bash
@@ -129,23 +122,6 @@ desktop semantic version.
 Production macOS updates require the Apple signing/notarization secrets described
 in `.github/workflows/build-desktop.yml`; ad-hoc signatures are only suitable for
 internal testing.
-
-## Desktop diagnostic logs
-
-Packaged apps write startup/version information, updater events, API failures,
-renderer errors and process crashes to a per-user file:
-
-- Windows: `%APPDATA%\AlephMeets\logs\main.log`
-- macOS: `~/Library/Logs/AlephMeets/main.log`
-- Linux: `${XDG_CONFIG_HOME:-~/.config}/AlephMeets/logs/main.log`
-
-Directories are created automatically; administrator rights are not required.
-If the normal location is unwritable, logging falls back to
-`<system temporary directory>/AlephMeets/logs/main.log` (on Windows:
-`%TEMP%\AlephMeets\logs\main.log`). A later write failure also switches to
-the fallback. A logger failure does not crash the app. Logs rotate at 5 MiB:
-the previous file is `main.old.log`. Bodies, request headers and authentication
-values are not recorded; sensitive fields and token-like strings are redacted.
 
 ## Server deployment
 

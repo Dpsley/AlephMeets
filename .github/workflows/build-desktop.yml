@@ -9,7 +9,7 @@ on:
 
 concurrency:
   group: desktop-release-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main' || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+  cancel-in-progress: false
 
 jobs:
   version:
@@ -149,10 +149,6 @@ jobs:
             exit 1
           fi
           codesign --verify --deep --strict "apps/desktop/release/mac-universal/AlephMeets.app"
-          signature="$(codesign --display --verbose=2 "apps/desktop/release/mac-universal/AlephMeets.app" 2>&1)"
-          if [[ "$signature" == *"Signature=adhoc"* || "$signature" != *"TeamIdentifier="* || "$signature" == *"TeamIdentifier=not set"* ]]; then
-            echo "::warning ::macOS build has no stable signing identity; users must install updates manually from DMG."
-          fi
       - uses: actions/upload-artifact@v4
         with:
           name: AlephMeets-macOS
