@@ -189,18 +189,24 @@ html:not([data-platform="darwin"]) .auth-page > header { padding-right: 152px; }
 .meeting-room .lk-connection-quality[data-lk-quality="unknown"]::after { content: 'Оценка связи'; color: #aab0b8; }
 .meeting-loading-screen { position: relative; width: 100%; height: 100%; background: #f7f8fa; }
 .meeting-loading-screen .meeting-loading { height: 100%; }
-.message-meta { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px; margin-top: 4px; color: inherit; opacity: .72; }
+.message-body { min-width: 0; display: flex; flex-direction: column; padding-bottom: 6px; }
+.message-body p { overflow-wrap: anywhere; }
+.file-attachment { min-width: 0; max-width: 100%; }
+.file-attachment > span { flex: none; }
+.file-attachment > div { min-width: 0; }
+.file-attachment strong { overflow-wrap: anywhere; }
+.message-meta { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px; margin-top: 4px; color: inherit; opacity: .72; font-size: 10px; line-height: 15px; white-space: nowrap; }
 .message-meta time { margin: 0; }
-.message-meta svg { width: 15px; height: 15px; }
-.message-body .message-meta { position: absolute; right: 8px; bottom: 5px; margin: 0; }
+.message-meta svg { flex: none; width: 15px; height: 15px; }
+.message-body .message-meta { align-self: flex-end; }
 .message-body-media { width: min(520px, 68%); max-width: min(520px, 68%); padding: 4px 4px 24px; overflow: hidden; }
 .message-body-media .image-attachment-link { width: 100%; }
 .message-body-media .image-attachment { width: 100%; max-width: 100%; max-height: 330px; }
 .message-body-media .video-attachment { width: 100%; max-height: 330px; }
-.message-body-media .message-meta { right: 9px; bottom: 8px; padding: 2px 6px; border-radius: 999px; color: white; background: rgba(10, 14, 20, .62); opacity: 1; }
+.message-body-media .message-meta { position: absolute; right: 9px; bottom: 8px; margin: 0; padding: 2px 6px; border-radius: 999px; color: white; background: rgba(10, 14, 20, .62); opacity: 1; }
 .message-body-audio { width: fit-content; max-width: min(540px, 72%); padding: 0; border: 0 !important; background: transparent !important; box-shadow: none !important; overflow: visible; }
-.message-body-audio .audio-attachment { display: block; width: min(520px, 70vw); height: 54px; }
-.message-body-audio .message-meta { right: 8px; bottom: 5px; padding: 1px 5px; border-radius: 999px; color: white; background: rgba(10, 14, 20, .5); opacity: .95; }
+.message-body-audio .audio-attachment { display: block; width: min(520px, 70vw); max-width: 100%; height: 54px; }
+.message-body-audio .message-meta { position: absolute; right: 8px; bottom: 5px; margin: 0; padding: 1px 5px; border-radius: 999px; color: white; background: rgba(10, 14, 20, .5); opacity: .95; }
 .call-history-message { width: fit-content; max-width: 430px; display: flex; align-items: center; gap: 10px; margin: 8px auto; padding: 9px 12px; border: 1px solid #dfe4ea; border-radius: 10px; color: #424a54; background: #f7f9fb; }
 .call-history-message > span { width: 32px; height: 32px; display: grid; place-items: center; flex: none; border-radius: 50%; color: #287edc; background: #e8f3ff; }
 .call-history-message > div { display: grid; gap: 3px; min-width: 150px; }
