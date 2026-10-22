@@ -97,4 +97,23 @@ describe('API request headers', () => {
       message: 'Не удалось подключиться к API. Проверьте, что сервер запущен.',
     })
   })
+
+  it('reports an HTML 404 from a misconfigured proxy without showing a JSON parser error', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<!DOCTYPE html><title>Not found</title>', {
+      status: 404, headers: { 'Content-Type': 'text/html' },
+    })))
+
+    await expect(api.requestSms('79990000001')).rejects.toMatchObject({
+      status: 404,
+      message: 'Сервер API вернул HTTP 404 вместо JSON. Проверьте адрес API и настройку сервера.',
+    })
+  })
+
+  it('rejects a successful HTML response from a website in place of the API', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<!DOCTYPE html><title>Website</title>', { status: 200 })))
+    await expect(api.requestSms('79990000001')).rejects.toMatchObject({
+      status: 200,
+      message: 'Сервер API вернул неверный ответ вместо JSON. Проверьте адрес API и настройку сервера.',
+    })
+  })
 })

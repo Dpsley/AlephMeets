@@ -106,6 +106,13 @@ Packaged clients check the latest public GitHub Release before opening the main
 window. A newer version is mandatory: the user can install it or close the app.
 If GitHub cannot be reached, the gate only allows retrying or closing.
 
+On macOS, ad-hoc builds use manual DMG installation from the release page.
+Automatic installation requires a stable Apple Developer ID signing identity.
+The updater waits for Squirrel.Mac to finish unpacking and verifying a signed
+update before showing the restart step. Preparation and restart have timeouts;
+late errors offer retry, manual installation, or closing the app. A client already
+stuck at 100% must be fully quit and replaced using the release DMG in Applications.
+
 Create a release by pushing a semantic version tag from the commit to publish:
 
 ```bash
