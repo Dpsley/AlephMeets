@@ -130,6 +130,23 @@ Production macOS updates require the Apple signing/notarization secrets describe
 in `.github/workflows/build-desktop.yml`; ad-hoc signatures are only suitable for
 internal testing.
 
+## Desktop diagnostic logs
+
+Packaged apps write startup/version information, updater events, API failures,
+renderer errors and process crashes to a per-user file:
+
+- Windows: `%APPDATA%\AlephMeets\logs\main.log`
+- macOS: `~/Library/Logs/AlephMeets/main.log`
+- Linux: `${XDG_CONFIG_HOME:-~/.config}/AlephMeets/logs/main.log`
+
+Directories are created automatically; administrator rights are not required.
+If the normal location is unwritable, logging falls back to
+`<system temporary directory>/AlephMeets/logs/main.log` (on Windows:
+`%TEMP%\AlephMeets\logs\main.log`). A later write failure also switches to
+the fallback. A logger failure does not crash the app. Logs rotate at 5 MiB:
+the previous file is `main.old.log`. Bodies, request headers and authentication
+values are not recorded; sensitive fields and token-like strings are redacted.
+
 ## Server deployment
 
 The production Docker stack and VPS instructions are in

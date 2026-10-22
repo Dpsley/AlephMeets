@@ -3,6 +3,7 @@ import electronUpdater from 'electron-updater'
 import { appIconPath } from './app-icon'
 import { supportsMacAutoUpdate } from './mac-update-support'
 import { UpdateInstallation } from './update-installation'
+import { log } from './logging'
 
 const { autoUpdater } = electronUpdater
 let releasedGate: UpdateGate | null = null
@@ -49,6 +50,7 @@ class UpdateGate {
 
   async setStatus({ title, detail, progress }: GateStatus): Promise<void> {
     if (this.window.isDestroyed()) return
+    if (title !== 'Загружаем обновление') log.info('[updater] status', { title, detail, progress })
     const normalizedProgress = progress === undefined
       ? null
       : Math.max(0, Math.min(100, Math.round(progress)))
@@ -136,12 +138,13 @@ export async function enforceMandatoryUpdate(): Promise<boolean> {
   autoUpdater.autoInstallOnAppQuit = true
   autoUpdater.autoRunAppAfterInstall = true
   autoUpdater.allowPrerelease = false
-  autoUpdater.logger = console
+  autoUpdater.logger = log
   autoUpdater.on('error', (error) => console.error('[updater]', error))
 
   const gate = new UpdateGate()
   await gate.show()
   const macAutoUpdate = process.platform !== 'darwin' || supportsMacAutoUpdate(app.getPath('exe'))
+  log.info('[updater] automatic installation supported', macAutoUpdate)
 
   while (true) {
     try {

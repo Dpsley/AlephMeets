@@ -17,9 +17,11 @@ import { extname, join } from 'node:path'
 import { appIconPath } from './app-icon'
 import { createAuthStorage } from './auth-storage'
 import { destroyMandatoryUpdateGate, enforceMandatoryUpdate } from './mandatory-updater'
+import { initializeLogging, log } from './logging'
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 app.setName('AlephMeets')
+initializeLogging()
 if (process.platform === 'win32') {
   app.setAppUserModelId(app.isPackaged ? 'com.alephmeets.desktop' : 'com.alephmeets.desktop.dev')
 }
@@ -93,6 +95,7 @@ function finishDisplayRequest(requestId: number, sourceId?: string): void {
 const authStorage = createAuthStorage(
   () => join(app.getPath('userData'), 'auth-tokens.bin'),
   async () => {
+    log.warn('Secure auth storage is unavailable; offering session-only sign-in')
     const options: Electron.MessageBoxOptions = {
       type: 'warning',
       title: 'AlephMeets — хранение сессии',
@@ -110,6 +113,7 @@ const authStorage = createAuthStorage(
     const result = owner && !owner.isDestroyed()
       ? await dialog.showMessageBox(owner, options)
       : await dialog.showMessageBox(options)
+    log.info('Session-only sign-in selected', result.response === 1)
     return result.response === 1
   },
 )
@@ -486,6 +490,7 @@ app.whenReady().then(async () => {
       await authStorage.write(slot, value)
       return null
     } catch (error) {
+      log.error('Auth storage failed', error)
       return { error: error instanceof Error && error.message.startsWith('Вход отменён:')
         ? error.message
         : 'Не удалось сохранить сессию. Проверьте доступ к папке данных AlephMeets и свободное место на диске.' }

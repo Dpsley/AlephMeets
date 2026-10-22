@@ -1,4 +1,5 @@
 import type { Contact, Conversation, ExchangeSettings, Meeting, Message, User } from '../types'
+import { reportApiFailure } from './diagnostics'
 import {
   getAccessToken,
   getRefreshToken,
@@ -55,6 +56,7 @@ async function request<T>(path: string, init?: RequestInit, retryAfterRefresh = 
       headers,
     })
   } catch {
+    reportApiFailure(path, 0, 'network', API_URL)
     throw new ApiError('Не удалось подключиться к API. Проверьте, что сервер запущен.', 0)
   }
   let payload: T & { message?: string }
@@ -62,6 +64,7 @@ async function request<T>(path: string, init?: RequestInit, retryAfterRefresh = 
     payload = await response.json() as T & { message?: string }
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Invalid API response')
   } catch {
+    reportApiFailure(path, response.status, 'invalid-json', API_URL)
     throw new ApiError(
       `Сервер API вернул ${response.ok ? 'неверный ответ' : `HTTP ${response.status}`} вместо JSON. Проверьте адрес API и настройку сервера.`,
       response.status,
@@ -71,7 +74,10 @@ async function request<T>(path: string, init?: RequestInit, retryAfterRefresh = 
     await renewAccessToken()
     return request<T>(path, init, false)
   }
-  if (!response.ok) throw new ApiError(payload.message ?? `HTTP ${response.status}`, response.status)
+  if (!response.ok) {
+    reportApiFailure(path, response.status, 'http', API_URL)
+    throw new ApiError(payload.message ?? `HTTP ${response.status}`, response.status)
+  }
   return payload
 }
 
