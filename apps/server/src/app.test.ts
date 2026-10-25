@@ -3,7 +3,7 @@ import test, { after } from 'node:test'
 import { createApp, EXCHANGE_SYNC_INTERVAL_MS } from './app.js'
 import { pool } from './db.js'
 import { config, type CurrentUser } from './config.js'
-import { decryptIdpPayload } from './idp.js'
+import { decryptIdpPayload, syncAdContactsForUser } from './idp.js'
 
 const testUsers: Record<string, CurrentUser> = {
   dmitry: {
@@ -581,7 +581,7 @@ test('reports presence as online only while the heartbeat is fresh', async () =>
   }
 })
 
-test('loads AD users into contacts for department users', async () => {
+test('returns stored contacts immediately and imports AD profiles in the background', async () => {
   const app = await createTestApp()
   const originalFetch = globalThis.fetch
   const originalConfig = {
@@ -595,6 +595,8 @@ test('loads AD users into contacts for department users', async () => {
   const adUserId = '90000000-0000-4000-8000-000000000010'
   const newAdUserId = '90000000-0000-4000-8000-000000000011'
   let fetchCount = 0
+  let releaseAd: () => void = () => {}
+  const adGate = new Promise<void>((resolve) => { releaseAd = resolve })
 
   Object.assign(config, {
     idpBaseUrl: 'https://api.alephtrade.com/id',
@@ -620,6 +622,7 @@ test('loads AD users into contacts for department users', async () => {
     const body = JSON.parse(String(init?.body)) as { string: string }
     const payload = decryptIdpPayload<{ control_string: string }>(body.string, config.idpEncodeKey)
     assert.match(payload.control_string, /^[0-9a-f]{128}$/)
+    await adGate
     return new Response(JSON.stringify({
       status: true,
       count: 2,
@@ -648,6 +651,15 @@ test('loads AD users into contacts for department users', async () => {
   }
 
   try {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const initial = await Promise.race([
+      app.inject({ method: 'GET', url: '/api/contacts', headers: dmitryAuth }),
+      new Promise<never>((_resolve, reject) => { timeout = setTimeout(() => reject(new Error('Contacts waited for AD')), 1000) }),
+    ]).finally(() => clearTimeout(timeout))
+    assert.equal(initial.statusCode, 200)
+    assert.equal(initial.json().contacts.some((item: { id: string }) => item.id === newAdUserId), false)
+    releaseAd()
+    await syncAdContactsForUser(testUsers.dmitry!)
     const response = await app.inject({ method: 'GET', url: '/api/contacts', headers: dmitryAuth })
     assert.equal(response.statusCode, 200, response.body)
     const contact = response.json().contacts.find((item: { id: string }) => item.id === adUserId)
@@ -667,6 +679,8 @@ test('loads AD users into contacts for department users', async () => {
     assert.equal(cachedResponse.statusCode, 200, cachedResponse.body)
     assert.equal(fetchCount, 1)
   } finally {
+    releaseAd()
+    await syncAdContactsForUser(testUsers.dmitry!).catch(() => {})
     globalThis.fetch = originalFetch
     Object.assign(config, originalConfig)
     testUsers.dmitry!.department = originalDepartment

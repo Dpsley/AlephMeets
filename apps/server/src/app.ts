@@ -60,6 +60,7 @@ import {
   requestSms,
   syncAdContactsForUser,
   verifySms,
+  verifyAlephIdToken,
 } from './idp.js'
 import { sendMeetingMaterialsEmail, type MeetingMaterialLink } from './mail.js'
 
@@ -869,11 +870,13 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     const socketUser = socket.data.user as CurrentUser
     socket.data.userId = socketUser.id
     socket.join(`user:${socketUser.id}`)
+    refreshContactsInBackground(socketUser)
     const disconnectTimer = presenceDisconnectTimers.get(socketUser.id)
     if (disconnectTimer) clearTimeout(disconnectTimer)
     presenceDisconnectTimers.delete(socketUser.id)
     void setPresence(socketUser.id, 'online')
     socket.on('presence:heartbeat', () => {
+      refreshContactsInBackground(socketUser)
       void pool.query('UPDATE users SET last_seen_at = now() WHERE id = $1', [socketUser.id])
     })
     socket.on('conversation:join', async (conversationId: string) => {
@@ -941,6 +944,13 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
   app.post('/api/auth/sms/verify', async (request) => {
     const body = request.body as { phone?: string; code?: string }
     return verifySms(body.phone ?? '', body.code ?? '')
+  })
+
+  app.post('/api/auth/aleph-id', async (request, reply) => {
+    reply.header('Cache-Control', 'no-store')
+    const body = request.body as { token?: unknown } | null
+    if (typeof body?.token !== 'string') return reply.code(400).send({ message: 'Aleph ID token is required.' })
+    return verifyAlephIdToken(body.token)
   })
 
   app.post('/api/auth/refresh', async (request) => {
@@ -1054,6 +1064,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       return created
     })
     if (input.syncCalendar) await syncCurrentExchangeAccount('meeting_created')
+    for (const meeting of meetings) await emitMeetingUpdated(String(meeting.id), { meetingId: meeting.id })
     return reply.code(201).send({ meeting: meetings[0], meetings })
   })
 
@@ -1188,6 +1199,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       [body.status, request.params.id, currentUser.id],
     )
     if (!result.rowCount) return reply.code(404).send({ error: 'meeting_not_found' })
+    await emitMeetingUpdated(request.params.id, { meetingId: request.params.id, status: body.status })
     return { meeting: camelizeRow(result.rows[0] as Record<string, unknown>) }
   })
 
@@ -1525,13 +1537,23 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
     }
   })
 
+  const backgroundContactSyncs = new Map<string, Promise<void>>()
+  const contactSyncCheckedAt = new Map<string, number>()
+  const refreshContactsInBackground = (user: Pick<CurrentUser, 'id' | 'email' | 'department'>): void => {
+    if (backgroundContactSyncs.has(user.id) || Date.now() - (contactSyncCheckedAt.get(user.id) ?? 0) < 60_000) return
+    contactSyncCheckedAt.set(user.id, Date.now())
+    const startedAt = Date.now()
+    const sync = syncAdContactsForUser(user).then((synced) => {
+      app.log.info({ userId: user.id, synced, durationMs: Date.now() - startedAt }, 'AD contact refresh completed')
+      io.to(`user:${user.id}`).emit('contacts:updated', { synced })
+    }).catch((error) => {
+      app.log.warn({ err: error, userId: user.id }, 'AD contact sync failed')
+    }).finally(() => { backgroundContactSyncs.delete(user.id) })
+    backgroundContactSyncs.set(user.id, sync)
+  }
+
   app.get('/api/contacts', async () => {
-    try {
-      const synced = await syncAdContactsForUser(currentUser)
-      if (synced) app.log.info({ userId: currentUser.id, synced }, 'AD contact sync completed')
-    } catch (error) {
-      app.log.warn({ err: error, userId: currentUser.id }, 'AD contact sync failed')
-    }
+    refreshContactsInBackground({ id: currentUser.id, email: currentUser.email, department: currentUser.department })
     const result = await pool.query(
       `SELECT u.id, u.phone, u.email, u.display_name, u.first_name, u.last_name,
               u.department, u.position, u.avatar_url,
@@ -1559,6 +1581,7 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
        RETURNING *`,
       [currentUser.id, contactUser.id, input.alias ?? null],
     )
+    io.to(`user:${currentUser.id}`).emit('contacts:updated', { contactId: contactUser.id })
     return reply.code(201).send({ contact: camelizeRow(result.rows[0] as Record<string, unknown>) })
   })
 

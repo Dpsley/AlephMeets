@@ -15,6 +15,7 @@ import {
   refreshSession,
   userCanLoadAdContacts,
   verifySms,
+  verifyAlephIdToken,
 } from './idp.js'
 
 const testUserId = '10000000-0000-4000-8000-000000000001'
@@ -312,5 +313,44 @@ test('rotates and revokes AlephMeets sessions', async () => {
     await assert.rejects(() => authenticateAccessToken(rotated.accessToken))
   } finally {
     await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [testUserId])
+  }
+})
+
+
+test('exchanges a verified corporate SSO token for the existing Meets account without SMS', async () => {
+  const originalFetch = globalThis.fetch
+  const originalConfig = { idpAccessKey: config.idpAccessKey, idpEncodeKey: config.idpEncodeKey, idpDecodeKey: config.idpDecodeKey }
+  const localId = '90000000-0000-4000-8000-000000000041'
+  const identityId = '90000000-0000-4000-8000-000000000042'
+  const email = 'sso-bridge-fixture@alephtrade.com'
+  Object.assign(config, { idpAccessKey: 'fixture-access', idpEncodeKey: 'fixture-encode', idpDecodeKey: 'fixture-decode' })
+  await pool.query('INSERT INTO users(id,email,display_name,department) VALUES($1,$2,$3,$4)', [localId, email, 'Existing AD user', 'Trading'])
+  let accepted = true
+  const paths: string[] = []
+  globalThis.fetch = async (input, init) => {
+    const path = new URL(String(input)).pathname
+    paths.push(path)
+    assert.ok(path.endsWith('/service/token/validate'))
+    const body = JSON.parse(String(init?.body)) as { string: string }
+    assert.deepEqual(decryptIdpPayload(body.string, config.idpEncodeKey), { token: 'verified-corporate-session-token-fixture' })
+    return new Response(JSON.stringify([encryptIdpPayload({ status: accepted, message: accepted
+      ? { id: identityId, email, name: 'SSO', second_name: 'Fixture', department: identityId } : 'Invalid session' }, config.idpDecodeKey)]),
+      { status: accepted ? 200 : 401, headers: { 'Content-Type': 'application/json' } })
+  }
+  try {
+    const result = await verifyAlephIdToken('verified-corporate-session-token-fixture')
+    assert.equal(result.user.id, localId)
+    assert.equal(result.alephId, identityId)
+    assert.equal(result.user.department, 'Trading')
+    assert.equal((await authenticateAccessToken(result.tokens.accessToken)).id, localId)
+    accepted = false
+    await assert.rejects(() => verifyAlephIdToken('verified-corporate-session-token-fixture'))
+    assert.equal((await pool.query('SELECT count(*)::int AS count FROM auth_sessions WHERE user_id=$1', [localId])).rows[0]?.count, 1)
+    assert.equal(paths.length, 2)
+  } finally {
+    globalThis.fetch = originalFetch
+    Object.assign(config, originalConfig)
+    await pool.query('DELETE FROM auth_sessions WHERE user_id=$1', [localId])
+    await pool.query('DELETE FROM users WHERE id=ANY($1::uuid[])', [[localId, identityId]])
   }
 })

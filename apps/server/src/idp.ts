@@ -488,29 +488,72 @@ async function upsertUserProfile(
   return userId
 }
 
-export async function syncAdContactsForUser(user: CurrentUser): Promise<number> {
-  if (!userCanLoadAdContacts(user)) return 0
-  if (!config.adControlSecret) return 0
-  const directoryUsers = (await loadAdUsers())
-    .map(mapDirectoryUser)
-    .filter((contact): contact is CurrentUser => Boolean(contact))
+const adContactSyncs = new Map<string, Promise<number>>()
+const adContactRevisions = new Map<string, number>()
+let directoryProfileSnapshot: { rows: DirectoryUser[]; ids: string[] } | null = null
+let directoryProfileSync: Promise<{ rows: DirectoryUser[]; ids: string[] }> | null = null
 
+async function upsertDirectoryProfiles(rows: DirectoryUser[]): Promise<string[]> {
+  const profiles = rows.map(mapDirectoryUser).filter((person): person is CurrentUser => Boolean(person))
   return inTransaction(async (client) => {
-    let synced = 0
-    for (const contact of directoryUsers) {
-      const contactUserId = await upsertUserProfile(client, contact)
-      if (contactUserId === user.id) continue
-      const result = await client.query(
-        `INSERT INTO contacts (owner_id, contact_user_id)
-         VALUES ($1,$2)
-         ON CONFLICT DO NOTHING
-         RETURNING contact_user_id`,
-        [user.id, contactUserId],
-      )
-      synced += result.rowCount ?? 0
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('alephmeets-ad-directory'))")
+    const existing = await client.query<{ id: string; email: string | null; phone: string | null }>('SELECT id,email,phone FROM users')
+    const ids = new Set(existing.rows.map((person) => person.id))
+    const emails = new Map(existing.rows.filter((person) => person.email).map((person) => [person.email!.toLowerCase(), person.id]))
+    const phones = new Map(existing.rows.filter((person) => person.phone).map((person) => [person.phone!, person.id]))
+    const records = new Map<string, CurrentUser>()
+    for (const person of profiles) {
+      const id = ids.has(person.id) ? person.id : emails.get(person.email?.toLowerCase() ?? '') ?? person.id
+      const email = person.email && emails.has(person.email) && emails.get(person.email) !== id ? null : person.email
+      const phone = person.phone && phones.has(person.phone) && phones.get(person.phone) !== id ? null : person.phone
+      records.set(id, { ...person, id, email, phone })
+      ids.add(id)
+      if (email) emails.set(email, id)
+      if (phone) phones.set(phone, id)
     }
-    return synced
+    if (records.size) await client.query(
+      `INSERT INTO users (id,email,phone,display_name,first_name,last_name,department,position,avatar_url,timezone,locale)
+       SELECT p.id,p.email,p.phone,p."displayName",NULLIF(p."firstName",''),NULLIF(p."lastName",''),p.department,p.position,p."avatarUrl",p.timezone,p.locale
+       FROM jsonb_to_recordset($1::jsonb) AS p(id uuid,email text,phone text,"displayName" text,"firstName" text,"lastName" text,department text,position text,"avatarUrl" text,timezone text,locale text)
+       ON CONFLICT (id) DO UPDATE SET
+         email=COALESCE(EXCLUDED.email,users.email),phone=COALESCE(EXCLUDED.phone,users.phone),
+         display_name=EXCLUDED.display_name,first_name=EXCLUDED.first_name,last_name=EXCLUDED.last_name,
+         department=COALESCE(EXCLUDED.department,users.department),position=COALESCE(EXCLUDED.position,users.position),
+         avatar_url=COALESCE(EXCLUDED.avatar_url,users.avatar_url),timezone=EXCLUDED.timezone,locale=EXCLUDED.locale`,
+      [JSON.stringify([...records.values()])],
+    )
+    return [...records.keys()]
   })
+}
+
+export async function syncAdContactsForUser(user: Pick<CurrentUser, 'id' | 'email' | 'department'>): Promise<number> {
+  if (!userCanLoadAdContacts(user) || !config.adControlSecret) return 0
+  const active = adContactSyncs.get(user.id)
+  if (active) return active
+  const sync = (async () => {
+    const rows = await loadAdUsers()
+    const revision = adUsersCache?.fetchedAt ?? 0
+    if (adContactRevisions.get(user.id) === revision) return 0
+    if (directoryProfileSnapshot?.rows !== rows) {
+      if (!directoryProfileSync) {
+        directoryProfileSync = upsertDirectoryProfiles(rows)
+          .then((ids) => { directoryProfileSnapshot = { rows, ids }; return directoryProfileSnapshot })
+          .finally(() => { directoryProfileSync = null })
+      }
+      await directoryProfileSync
+    }
+    const ids = directoryProfileSnapshot?.ids ?? []
+    const result = await pool.query(
+      `INSERT INTO contacts (owner_id,contact_user_id)
+       SELECT $1,id FROM users WHERE id=ANY($2::uuid[]) AND id<>$1
+       ON CONFLICT DO NOTHING RETURNING contact_user_id`,
+      [user.id, ids],
+    )
+    adContactRevisions.set(user.id, revision)
+    return result.rowCount ?? 0
+  })().finally(() => { adContactSyncs.delete(user.id) })
+  adContactSyncs.set(user.id, sync)
+  return sync
 }
 
 function mapIdpUser(user: IdpUser, fallbackPhone: string): CurrentUser {
@@ -526,7 +569,7 @@ function mapIdpUser(user: IdpUser, fallbackPhone: string): CurrentUser {
     displayName: [firstName, lastName].filter(Boolean).join(' ') || phone || id,
     firstName,
     lastName,
-    department: user.department?.trim() || null,
+    department: user.department?.trim() && !isUuid(user.department.trim()) ? user.department.trim() : null,
     position: (user.position ?? user.title ?? user.jobtitle ?? user.job_title)?.trim() || null,
     avatarUrl: user.avatar || null,
     timezone: user.time_zone || 'Europe/Moscow',
@@ -671,6 +714,23 @@ export async function verifySms(
   const tokens = await issueSession(user.id)
   await pool.query('DELETE FROM auth_login_challenges WHERE phone = $1', [normalizedPhone])
   return { tokens, user }
+}
+
+/** Exchange an existing corporate SSO session for a normal Meets session. */
+export async function verifyAlephIdToken(token: string): Promise<{ tokens: IdpTokens; user: CurrentUser; alephId: string }> {
+  if (typeof token !== 'string' || token.length < 32 || token.length > 4096) {
+    throw new IdpError('Invalid Aleph ID session.', 400)
+  }
+  const response = await serviceIdpRequest<IdpUser>('/service/token/validate', {
+    method: 'POST', payload: { token },
+  })
+  const identity = response.message
+  if (typeof identity === 'string' || !isUuid(identity.id ?? identity.uuid ?? '')
+    || !/@(?:[a-z0-9-]+\.)*alephtrade\.com$/i.test(identity.email ?? '')) {
+    throw new IdpError('Aleph ID did not confirm a corporate identity.', 403)
+  }
+  const user = await syncLocalUser(mapIdpUser(identity, ''))
+  return { tokens: await issueSession(user.id), user, alephId: identity.id ?? identity.uuid! }
 }
 
 export async function authenticateAccessToken(accessToken: string): Promise<CurrentUser> {
