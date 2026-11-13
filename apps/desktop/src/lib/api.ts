@@ -65,6 +65,28 @@ async function request<T>(path: string, init?: RequestInit, retryAfterRefresh = 
   return payload
 }
 
+async function requestBlob(path: string, init?: RequestInit, retryAfterRefresh = true): Promise<Blob> {
+  const headers = new Headers(init?.headers)
+  const accessToken = getAccessToken()
+  if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`)
+  if (init?.body !== undefined && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
+  let response: Response
+  try {
+    response = await fetch(`${API_URL}${path}`, { ...init, headers })
+  } catch {
+    throw new ApiError('Не удалось подключиться к API. Проверьте, что сервер запущен.', 0)
+  }
+  if (response.status === 401 && retryAfterRefresh && !path.startsWith('/api/auth/')) {
+    await renewAccessToken()
+    return requestBlob(path, init, false)
+  }
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { message?: string }
+    throw new ApiError(payload.message ?? `HTTP ${response.status}`, response.status)
+  }
+  return response.blob()
+}
+
 export const api = {
   requestSms: (phone: string) =>
     request<{ success: boolean }>('/api/auth/sms/request', {
@@ -97,6 +119,16 @@ export const api = {
       `/api/meetings/${id}/token`,
       { method: 'POST' },
     ),
+  meetingAssistantReply: (id: string, text: string, context: string) =>
+    request<{ text: string }>(`/api/meetings/${encodeURIComponent(id)}/assistant/respond`, {
+      method: 'POST',
+      body: JSON.stringify({ text, context }),
+    }),
+  meetingAssistantSpeech: (id: string, text: string) =>
+    requestBlob(`/api/meetings/${encodeURIComponent(id)}/assistant/speech`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    }),
   updateMeetingStatus: (id: string, status: Meeting['status']) =>
     request<{ meeting: Meeting }>(`/api/meetings/${id}/status`, {
       method: 'PATCH',

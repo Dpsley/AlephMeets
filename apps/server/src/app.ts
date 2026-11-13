@@ -44,7 +44,7 @@ import {
   messageInputSchema,
 } from './schemas.js'
 import { camelizeRow, camelizeRows } from './serializers.js'
-import { createAlephaConspect } from './alepha.js'
+import { createAlephaConspect, createAlephaMeetingReply, synthesizeAlephaSpeech } from './alepha.js'
 import {
   attachmentStorageName,
   buildStorageScope,
@@ -1535,6 +1535,62 @@ export async function createApp(dependencies: AppDependencies = {}): Promise<Fas
       roomName: meeting.room_name,
       isHost,
     }
+  })
+
+  app.post<{ Params: IdParams }>('/api/meetings/:id/assistant/respond', async (request, reply) => {
+    const body = request.body as { text?: unknown; context?: unknown } | undefined
+    const text = typeof body?.text === 'string' ? body.text.trim() : ''
+    const context = typeof body?.context === 'string' ? body.context : ''
+    if (!text || text.length > 4_000 || context.length > 16_000) {
+      return reply.code(400).send({ error: 'invalid_assistant_input', message: 'Текст реплики пуст или слишком длинный.' })
+    }
+    const result = await pool.query(
+      `SELECT m.id, m.status, m.host_id,
+              EXISTS(SELECT 1 FROM meeting_attendees a WHERE a.meeting_id=m.id AND a.user_id=$2) AS is_attendee
+       FROM meetings m WHERE m.id=$1`,
+      [request.params.id, currentUser.id],
+    )
+    const meeting = result.rows[0] as { id: string; status: string; host_id: string; is_attendee: boolean } | undefined
+    if (!meeting) return reply.code(404).send({ error: 'meeting_not_found' })
+    if (meeting.host_id !== currentUser.id && !meeting.is_attendee) {
+      return reply.code(403).send({ error: 'meeting_membership_required' })
+    }
+    if (meeting.status !== 'live') {
+      return reply.code(409).send({ error: 'meeting_not_live', message: 'Голосовой помощник доступен во время встречи.' })
+    }
+    const responseText = await createAlephaMeetingReply({
+      meetingId: meeting.id,
+      transcriptText: text,
+      context,
+    })
+    return { text: responseText }
+  })
+
+  app.post<{ Params: IdParams }>('/api/meetings/:id/assistant/speech', async (request, reply) => {
+    const body = request.body as { text?: unknown } | undefined
+    const text = typeof body?.text === 'string' ? body.text.trim() : ''
+    if (!text || text.length > 20_000) {
+      return reply.code(400).send({ error: 'invalid_speech_input', message: 'Текст для озвучивания пуст или слишком длинный.' })
+    }
+    const result = await pool.query(
+      `SELECT m.id, m.status, m.host_id,
+              EXISTS(SELECT 1 FROM meeting_attendees a WHERE a.meeting_id=m.id AND a.user_id=$2) AS is_attendee
+       FROM meetings m WHERE m.id=$1`,
+      [request.params.id, currentUser.id],
+    )
+    const meeting = result.rows[0] as { id: string; status: string; host_id: string; is_attendee: boolean } | undefined
+    if (!meeting) return reply.code(404).send({ error: 'meeting_not_found' })
+    if (meeting.host_id !== currentUser.id && !meeting.is_attendee) {
+      return reply.code(403).send({ error: 'meeting_membership_required' })
+    }
+    if (meeting.status !== 'live') {
+      return reply.code(409).send({ error: 'meeting_not_live', message: 'Голосовой помощник доступен во время встречи.' })
+    }
+    const audio = await synthesizeAlephaSpeech(text)
+    return reply
+      .header('Content-Type', 'audio/wav')
+      .header('Cache-Control', 'no-store')
+      .send(audio)
   })
 
   const backgroundContactSyncs = new Map<string, Promise<void>>()

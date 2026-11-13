@@ -10,7 +10,7 @@ import {
   useRoomContext,
   useTracks,
 } from '@livekit/components-react'
-import { ConnectionState, RoomEvent, Track, RemoteTrackPublication, type LocalTrackPublication, type RemoteParticipant, type RemoteTrack } from 'livekit-client'
+import { ConnectionState, RoomEvent, Track, RemoteTrackPublication, type LocalTrackPublication, type RemoteParticipant, type RemoteTrack, type Room } from 'livekit-client'
 import {
   ArrowLeft,
   Bot,
@@ -108,6 +108,7 @@ type TranscriptionStats = {
 const TRANSCRIBE_WS_URL = import.meta.env.VITE_TRANSCRIBE_WS_URL || 'wss://api.alephtrade.com/agent01/audio_transcribe_ws'
 const TRANSCRIBE_SAMPLE_RATE = 16_000
 const MEETING_REALTIME_TOPIC = 'aleph:meeting-realtime'
+const AI_AUDIO_TRACK_NAME = 'alepha-ai-audio'
 const meetingRealtimeEncoder = new TextEncoder()
 const meetingRealtimeDecoder = new TextDecoder()
 const EMPTY_TRANSCRIPTION_STATS: TranscriptionStats = {
@@ -152,6 +153,48 @@ function transcribeWebSocketUrl(sampleRate: number): string {
   const url = new URL(TRANSCRIBE_WS_URL)
   url.searchParams.set('sample_rate', String(sampleRate))
   return url.toString()
+}
+
+async function publishAssistantAudio(
+  room: Room,
+  audioBlob: Blob,
+  onStopperChange?: (stopper: (() => void) | null) => void,
+): Promise<void> {
+  if (room.state !== ConnectionState.Connected) return
+  const audioContext = new AudioContext()
+  const destination = audioContext.createMediaStreamDestination()
+  const source = audioContext.createBufferSource()
+  const audioBuffer = await audioContext.decodeAudioData(await audioBlob.arrayBuffer())
+  source.buffer = audioBuffer
+  source.connect(destination)
+  source.connect(audioContext.destination)
+  const track = destination.stream.getAudioTracks()[0]
+  if (!track) {
+    await audioContext.close()
+    throw new Error('Не удалось подготовить голос Алефы для встречи.')
+  }
+  let published = false
+  try {
+    await audioContext.resume()
+    await room.localParticipant.publishTrack(track, { name: AI_AUDIO_TRACK_NAME, source: Track.Source.Unknown })
+    published = true
+    onStopperChange?.(() => {
+      try {
+        source.stop()
+      } catch {
+        // The source may have ended naturally before the microphone was toggled off.
+      }
+    })
+    await new Promise<void>((resolve) => {
+      source.onended = () => resolve()
+      source.start()
+    })
+  } finally {
+    onStopperChange?.(null)
+    if (published) await room.localParticipant.unpublishTrack(track, true).catch(() => undefined)
+    else track.stop()
+    await audioContext.close().catch(() => undefined)
+  }
 }
 
 function transcriptTime(value: number): string {
@@ -876,25 +919,31 @@ function CallTranscriber({
     const localSpeakerId = room.localParticipant.identity
     const localSpeakerName = room.localParticipant.name || 'Вы'
 
-    const addRemoteTrack = (track: RemoteTrack, participant: RemoteParticipant): void => {
+    const addRemoteTrack = (
+      track: RemoteTrack,
+      participant: RemoteParticipant,
+      publication?: RemoteTrackPublication,
+    ): void => {
       if (track.kind === Track.Kind.Audio) {
+        if (publication?.trackName === AI_AUDIO_TRACK_NAME) return
         addMediaTrack(track.mediaStreamTrack, participant.identity, participant.name || participant.identity)
       }
     }
 
     const addRemotePublication = (publication: RemoteTrackPublication, participant: RemoteParticipant): void => {
-      if (publication.isSubscribed && publication.track) addRemoteTrack(publication.track, participant)
+      if (publication.isSubscribed && publication.track) addRemoteTrack(publication.track, participant, publication)
     }
 
     const addLocalPublication = (publication: LocalTrackPublication): void => {
+      if (publication.trackName === AI_AUDIO_TRACK_NAME) return
       addMediaTrack(publication.track?.mediaStreamTrack, localSpeakerId, localSpeakerName)
     }
 
     const handleTrackSubscribed = (
       track: RemoteTrack,
-      _publication: RemoteTrackPublication,
+      publication: RemoteTrackPublication,
       participant: RemoteParticipant,
-    ): void => addRemoteTrack(track, participant)
+    ): void => addRemoteTrack(track, participant, publication)
 
     const handleTrackUnsubscribed = (
       track: RemoteTrack,
@@ -937,6 +986,53 @@ function CallTranscriber({
   }, [active, localAudioTrack, onError, onStatsChange, onStatusChange, onTranscript, restartKey, room])
 
   return null
+}
+
+function AssistantAudioRenderer(): React.JSX.Element {
+  const room = useRoomContext()
+  const containerRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    const attachedTracks = new Map<RemoteTrack, HTMLMediaElement>()
+    const attachTrack = (track: RemoteTrack, publication?: RemoteTrackPublication): void => {
+      if (track.kind !== Track.Kind.Audio || publication?.trackName !== AI_AUDIO_TRACK_NAME || attachedTracks.has(track)) return
+      const element = track.attach()
+      element.autoplay = true
+      element.setAttribute('data-alepha-audio', 'true')
+      containerRef.current?.appendChild(element)
+      attachedTracks.set(track, element)
+    }
+    const detachTrack = (track: RemoteTrack): void => {
+      const element = attachedTracks.get(track)
+      if (!element) return
+      track.detach(element)
+      element.remove()
+      attachedTracks.delete(track)
+    }
+    const handleTrackSubscribed = (track: RemoteTrack, publication: RemoteTrackPublication): void => {
+      attachTrack(track, publication)
+    }
+    const handleTrackUnsubscribed = (track: RemoteTrack): void => detachTrack(track)
+
+    room.remoteParticipants.forEach((participant) => {
+      participant.audioTrackPublications.forEach((publication) => {
+        if (publication.isSubscribed && publication.track) attachTrack(publication.track, publication)
+      })
+    })
+    room.on(RoomEvent.TrackSubscribed, handleTrackSubscribed)
+    room.on(RoomEvent.TrackUnsubscribed, handleTrackUnsubscribed)
+    return () => {
+      room.off(RoomEvent.TrackSubscribed, handleTrackSubscribed)
+      room.off(RoomEvent.TrackUnsubscribed, handleTrackUnsubscribed)
+      attachedTracks.forEach((element, track) => {
+        track.detach(element)
+        element.remove()
+      })
+      attachedTracks.clear()
+    }
+  }, [room])
+
+  return <div ref={containerRef} className="meeting-assistant-audio-renderer" aria-hidden="true" />
 }
 
 function CallRecorder({
@@ -1284,9 +1380,32 @@ function MeetingConference({
   const [cameraControlVersion, setCameraControlVersion] = useState(0)
   const transcriptArchiveRef = useRef<TranscriptEntry[]>([])
   const transcriptUploadRef = useRef<Promise<void> | null>(null)
+  const aiAssistantActiveRef = useRef(aiAssistantActive)
+  const assistantSessionRef = useRef(0)
+  const assistantQueueRef = useRef<TranscriptEntry[]>([])
+  const assistantReplyTimerRef = useRef<number | null>(null)
+  const assistantReplyRunningRef = useRef(false)
+  const assistantAudioStopRef = useRef<(() => void) | null>(null)
   const meetingChatMessagesRef = useRef<MeetingChatMessage[]>([])
   const chatOpenRef = useRef(false)
   const sharedWhiteboardItemsRef = useRef<WhiteboardItem[]>(whiteboardItems)
+
+  useEffect(() => {
+    aiAssistantActiveRef.current = aiAssistantActive
+  }, [aiAssistantActive])
+
+  useEffect(() => () => {
+    if (assistantReplyTimerRef.current !== null) window.clearTimeout(assistantReplyTimerRef.current)
+  }, [])
+
+  useEffect(() => {
+    if (aiAssistantActive) return
+    assistantQueueRef.current = []
+    if (assistantReplyTimerRef.current !== null) {
+      window.clearTimeout(assistantReplyTimerRef.current)
+      assistantReplyTimerRef.current = null
+    }
+  }, [aiAssistantActive])
 
   useEffect(() => {
     meetingChatMessagesRef.current = meetingChatMessages
@@ -1388,12 +1507,68 @@ function MeetingConference({
     ))
   }, [])
 
+  const runAssistantReply = useCallback(async (): Promise<void> => {
+    if (
+      assistantReplyRunningRef.current
+      || !assistantQueueRef.current.length
+      || !aiAssistantActiveRef.current
+      || !isOrganizer
+    ) return
+    const batch = assistantQueueRef.current.splice(0)
+    const sessionId = assistantSessionRef.current
+    assistantReplyRunningRef.current = true
+    try {
+      const transcriptText = batch.map((entry) => `${entry.speakerName}: ${entry.text}`).join('\n')
+      const context = transcriptArchiveRef.current
+        .filter((entry) => !batch.some((item) => item.id === entry.id))
+        .slice(-20)
+        .map((entry) => `${entry.speakerName}: ${entry.text}`)
+        .join('\n')
+      const response = await api.meetingAssistantReply(meeting.id, transcriptText, context.slice(-15_000))
+      const text = response.text.trim()
+      if (!text || !aiAssistantActiveRef.current || sessionId !== assistantSessionRef.current) return
+      const entry: TranscriptEntry = {
+        id: `alepha-${crypto.randomUUID()}`,
+        speakerId: 'alepha-ai',
+        speakerName: 'Алефа',
+        text,
+        receivedAt: Date.now(),
+      }
+      storeTranscriptEntry(entry)
+      await publishRealtime({ type: 'transcript:entry', entry })
+      if (!aiAssistantActiveRef.current || sessionId !== assistantSessionRef.current) return
+      const audio = await api.meetingAssistantSpeech(meeting.id, text)
+      if (aiAssistantActiveRef.current && sessionId === assistantSessionRef.current) {
+        await publishAssistantAudio(room, audio, (stopper) => {
+          assistantAudioStopRef.current = stopper
+        })
+      }
+    } catch (reason) {
+      onError(reason instanceof Error ? reason.message : 'Не удалось получить голосовой ответ Алефы.')
+    } finally {
+      assistantReplyRunningRef.current = false
+      if (assistantQueueRef.current.length && aiAssistantActiveRef.current) {
+        assistantReplyTimerRef.current = window.setTimeout(() => {
+          assistantReplyTimerRef.current = null
+          void runAssistantReply()
+        }, 250)
+      }
+    }
+  }, [isOrganizer, meeting.id, onError, publishRealtime, room, storeTranscriptEntry])
+
   const appendTranscript = useCallback((entry: TranscriptEntry): void => {
     storeTranscriptEntry(entry)
     void publishRealtime({ type: 'transcript:entry', entry }).catch((reason) => {
       setTranscriptionError(reason instanceof Error ? reason.message : 'Не удалось передать расшифровку участникам.')
     })
-  }, [publishRealtime, storeTranscriptEntry])
+    if (!isOrganizer || !aiAssistantActiveRef.current) return
+    assistantQueueRef.current.push(entry)
+    if (assistantReplyTimerRef.current !== null) window.clearTimeout(assistantReplyTimerRef.current)
+    assistantReplyTimerRef.current = window.setTimeout(() => {
+      assistantReplyTimerRef.current = null
+      void runAssistantReply()
+    }, 850)
+  }, [isOrganizer, publishRealtime, runAssistantReply, storeTranscriptEntry])
 
   const appendMeetingChatMessage = useCallback((message: MeetingChatMessage): void => {
     setMeetingChatMessages((current) => (
@@ -1459,6 +1634,8 @@ function MeetingConference({
         return
       }
       if (message.type === 'transcript:active') {
+        if (aiAssistantActiveRef.current !== message.active) assistantSessionRef.current += 1
+        aiAssistantActiveRef.current = message.active
         onAiAssistantActiveChange(message.active)
         setTranscriptionStatus(message.active ? 'listening' : 'idle')
         if (message.active) {
@@ -1520,20 +1697,24 @@ function MeetingConference({
   }
 
   const inviteAiAssistant = (): void => {
-    if (aiAssistantActive) {
+    const nextActive = !aiAssistantActive
+    assistantSessionRef.current += 1
+    aiAssistantActiveRef.current = nextActive
+    if (nextActive) {
+      clearTranscript()
+      setTranscriptionError(null)
+      setTranscriptionStatus('connecting')
+      setMeetingChatOpen(false)
+      setWhiteboardOpen(false)
       setTranscriptOpen(true)
-      return
+      setTranscriptionRestart((value) => value + 1)
+    } else {
+      setTranscriptionStatus('idle')
+      assistantAudioStopRef.current?.()
     }
-    clearTranscript()
-    setTranscriptionError(null)
-    setTranscriptionStatus('connecting')
-    setMeetingChatOpen(false)
-    setWhiteboardOpen(false)
-    setTranscriptOpen(true)
-    setTranscriptionRestart((value) => value + 1)
-    onAiAssistantActiveChange(true)
-    void publishRealtime({ type: 'transcript:active', active: true }).catch((reason) => {
-      setTranscriptionError(reason instanceof Error ? reason.message : 'Не удалось включить расшифровку для участников.')
+    onAiAssistantActiveChange(nextActive)
+    void publishRealtime({ type: 'transcript:active', active: nextActive }).catch((reason) => {
+      setTranscriptionError(reason instanceof Error ? reason.message : 'Не удалось обновить состояние Алефы для участников.')
     })
   }
 
@@ -1706,7 +1887,7 @@ function MeetingConference({
                   <Avatar name="АИ" size="large" />
                 </div>
                 <strong>Алефа</strong>
-                <span>Пишет и расшифровывает</span>
+                <span>Слушает и отвечает голосом</span>
               </div>
             )}
           </div>
@@ -1755,11 +1936,10 @@ function MeetingConference({
             <button onClick={toggleTranscript} className={transcriptOpen ? 'active' : ''}>
               <FileText /><span>Дешифровка</span>
             </button>
-            {isOrganizer && callContext && (
-              <button onClick={inviteAiAssistant} className={aiAssistantActive ? 'active' : ''}>
-                <Bot /><span>{aiAssistantActive ? 'Алефа пишет' : 'Позвать Алефу'}</span>
-              </button>
-            )}
+            <button onClick={inviteAiAssistant} className={aiAssistantActive ? 'active' : ''}>
+              {aiAssistantActive ? <Mic /> : <Bot />}
+              <span>{aiAssistantActive ? 'Выключить микрофон Алефы' : 'Позвать Алефу'}</span>
+            </button>
             <button
               onClick={() => {
                 const nextOpen = !whiteboardOpen
@@ -2215,6 +2395,7 @@ export function MeetingPage(): React.JSX.Element {
             whiteboardItems={whiteboardItems}
             onWhiteboardItemsChange={updateWhiteboardItems}
           />
+          <AssistantAudioRenderer />
           <RoomAudioRenderer />
         </LiveKitRoom>
         {deviceNotices.length > 0 && <div className="meeting-notice">{deviceNotices.join(' ')}</div>}
